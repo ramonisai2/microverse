@@ -1,50 +1,66 @@
+# Microverse
 
-# Lepton
+Demo en Rust + wgpu: mundo voxel con cámara libre (WASD + mouse).
 
-A micro voxel engine written in Rust with WGPU and runs on the [Geese Event Framework](https://github.com/DouglasDwyer/geese).
+## Estructura (plan base)
 
-## Screenshots
-
-![Screenshot 2025-03-10 092409](https://github.com/user-attachments/assets/d1fa7fc6-ffaf-416e-ab25-80457dd91aa4)
-![Screenshot 2025-03-09 210615](https://github.com/user-attachments/assets/5935237c-3595-4d89-b756-17d5f4c93751)
-![Screenshot 2025-03-10 092133](https://github.com/user-attachments/assets/00af4719-b72a-414c-9190-90b95e7391fa)
-![Screenshot 2025-03-09 210504](https://github.com/user-attachments/assets/27f6a2a7-dde4-4677-b93e-d5648ca03dac)
-![Screenshot 2025-03-09 205724](https://github.com/user-attachments/assets/525a032c-9cc0-4168-a69c-79f2ff413f4f)
-
-
-## Features
-
-- Cross platform ✔
-- Voxel raytracing ✔
-- Contree chunking (WIP)
-- Voxel World Gen (WIP)
-- Fully modifyable voxel terrain (WIP)
-
-  
-## Roadmap
-
-- Voxel Physics (coming soon)
-- Per-Voxel Path Traced Lighting (soonish)
-- Tutorials for the API
-
-## Documentation
-
-[None Yet](https://Cool_url.com)
-
-
-## Installation
-I believe this project needs to be run on nightly to compile.
-After that just download the source files, then open the terminal and run:
-```bash
-  cargo run
+```
+microvoxel/
+  Cargo.toml          # crate name = microverse
+  README.md
+  src/
+    main.rs           # ventana, loop, input
+    camera.rs         # freecam: WASD + mouse look
+    world.rs          # voxels + microvoxels 16³
+    render.rs         # wgpu mesh + pipeline
+    shader.wgsl       # vertex/fragment + lighting
+    blur.wgsl         # post-process distancia
 ```
 
-## License
+## Modelo de mundo
 
-[MIT](https://choosealicense.com/licenses/mit/)
+- Un **voxel** = 1×1×1 en el mundo.
+- Cada voxel puede ocupar una grilla de **microvoxels** (`16³`, bit-packed).
+- Material `Dirt` (caras laterales marrón jaspeado; cara superior verde jaspeado).
+- El mundo de juego genera columnas de tierra (heightmap); `World::with_dirt_cube()` sigue disponible para un solo cubo.
+- **Reinos** (`src/realms.rs`): parches de 30–150 shunks² (16×16) con capital + aldeas;
+  el resto es salvaje/neutral. Consulta: `realm_at_shunk` / `realm_info`.
+- **Asentamientos** (`src/settlements.rs`): caminos capital↔aldeas, murallas,
+  cuatro puertas y lotes `PrefabEgg`. Las casas apuntan a JSON en
+  `assets/prefabs/` y se editan desde `editor/prefab.html`.
 
+## Cámara libre
 
-## Support
+- **WASD** — movimiento en el plano de mirada
+- **Space / E** subir, **Ctrl / Q** bajar
+- Mouse — rotar (cursor capturado)
+- **Escape** — liberar cursor / salir
 
-Feel free to make open an issue here on github :D
+## Run
+
+```bash
+cargo run
+```
+
+o `run.bat`.
+
+Partida: `saves/microverse.json` (F5, cada 45 s, y al cerrar).
+
+## Editor de entidades (voxel)
+
+Editor HTML (Three.js) con esqueleto (partes), **32 colores** y **10 paletas**
+(`classic`, `pastel`, `earth`, `neon`, `castle`, `ocean`, `sunset`, `forest`, `mono`, `candy`).
+
+1. Abre [`editor/index.html`](editor/index.html) (mejor con `npx serve .` si fallan los módulos).
+2. Elige un editor: bípedo, pezuña, cuadrúpedo, arácnido, pez, medusa u objeto.
+3. Pon **nombre** al archivo, edita con pincel / borrador / bote / gotero, **Export** → `{nombre}.json`.
+4. Copia el export a [`assets/entities/hero.json`](assets/entities/hero.json) y **reinicia** el juego (`run.bat`). Se lee del disco (formato flat o `parts` del editor); no hace falta recompilar.
+
+Formato juego: `{ id, grid, foot_y, palette, voxels: [{x,y,z,c}] }` donde `c` es `0..31`.
+
+Regenerar el héroe procedural por defecto:
+
+```bash
+python tools/export_hero.py
+```
 

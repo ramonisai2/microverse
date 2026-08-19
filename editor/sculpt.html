@@ -1,0 +1,2201 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Editor de Microvoxels — Sculpt</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            overflow: hidden;
+            font-family: 'Segoe UI', sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            user-select: none;
+        }
+        #canvas-container { width: 100vw; height: 100vh; display: block; }
+
+        #top-bar {
+            position: absolute;
+            top: 12px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0, 0, 0, 0.75);
+            backdrop-filter: blur(8px);
+            padding: 8px 16px;
+            border-radius: 40px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            z-index: 30;
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            justify-content: center;
+            align-items: center;
+            font-size: 12px;
+            max-width: 98vw;
+        }
+        #top-bar .part-selector { display: flex; gap: 4px; flex-wrap: wrap; }
+        #top-bar .part-selector button,
+        #top-bar .tool-group button,
+        #top-bar .action-btn {
+            background: rgba(255, 255, 255, 0.06);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            color: #aaa;
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-size: 10px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: 0.2s;
+            white-space: nowrap;
+        }
+        #top-bar .tool-group button,
+        #top-bar .action-btn { font-size: 11px; padding: 4px 12px; color: #ccc; }
+        #top-bar .part-selector button:hover,
+        #top-bar .tool-group button:hover,
+        #top-bar .action-btn:hover {
+            background: rgba(255, 255, 255, 0.15);
+            color: #fff;
+        }
+        #top-bar .part-selector button.active,
+        #top-bar .tool-group button.active-tool,
+        #top-bar .action-btn.active {
+            background: #4a9eff;
+            border-color: #4a9eff;
+            color: #fff;
+            box-shadow: 0 0 15px rgba(74, 158, 255, 0.3);
+        }
+        #top-bar .separator {
+            width: 1px;
+            height: 24px;
+            background: rgba(255, 255, 255, 0.15);
+        }
+        #top-bar .tool-group { display: flex; gap: 4px; }
+        #top-bar input[type="text"] {
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            color: #eee;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-weight: 600;
+            font-size: 11px;
+            width: 120px;
+        }
+        #top-bar a.hub-link {
+            color: #88aaff;
+            text-decoration: none;
+            font-size: 11px;
+            font-weight: 600;
+            padding: 4px 10px;
+        }
+        #top-bar a.hub-link:hover { color: #fff; }
+
+        #transform-panel {
+            position: absolute;
+            bottom: 100px;
+            left: 20px;
+            background: rgba(16, 16, 32, 0.85);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 16px;
+            padding: 14px 18px;
+            z-index: 25;
+            min-width: 220px;
+            display: none;
+            flex-direction: column;
+            gap: 4px;
+            max-height: 70vh;
+            overflow-y: auto;
+        }
+        #transform-panel.visible { display: flex; }
+        #transform-panel .section-title {
+            font-size: 10px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: #88aaff;
+            margin: 4px 0 2px;
+        }
+        #transform-panel .row {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        #transform-panel .row label {
+            font-size: 9px;
+            width: 22px;
+            font-weight: 600;
+            color: #99aacc;
+        }
+        #transform-panel .row input[type="range"] {
+            flex: 1;
+            height: 3px;
+            background: #3a3a5a;
+            border-radius: 2px;
+            -webkit-appearance: none;
+            appearance: none;
+            outline: none;
+            cursor: pointer;
+        }
+        #transform-panel .row input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #4a9eff;
+            border: 2px solid #fff;
+            cursor: pointer;
+        }
+        #transform-panel .row .val {
+            font-size: 9px;
+            min-width: 32px;
+            text-align: right;
+            color: #ccd;
+        }
+        #transform-panel .rot-group {
+            border-top: 1px solid rgba(255, 255, 255, 0.08);
+            padding-top: 4px;
+            margin-top: 4px;
+        }
+        #transform-panel .rot-group .row input[type="range"] { background: #4a3a5a; }
+
+        #palette-wrap {
+            position: absolute;
+            bottom: 16px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 20;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 8px;
+        }
+        #palette-bar {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            background: rgba(0, 0, 0, 0.75);
+            backdrop-filter: blur(6px);
+            padding: 6px 14px;
+            border-radius: 30px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            font-size: 11px;
+        }
+        #palette-bar select {
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            color: #eee;
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-weight: 600;
+            font-size: 11px;
+        }
+        #palette-bar .swatch {
+            width: 22px;
+            height: 22px;
+            border-radius: 5px;
+            border: 2px solid #fff;
+        }
+        #palette {
+            display: grid;
+            grid-template-columns: repeat(16, 28px);
+            gap: 3px;
+            background: rgba(0, 0, 0, 0.75);
+            backdrop-filter: blur(6px);
+            padding: 10px 12px;
+            border-radius: 16px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            justify-content: center;
+        }
+        #palette .color-item {
+            width: 28px;
+            height: 28px;
+            border-radius: 5px;
+            cursor: pointer;
+            border: 2px solid transparent;
+            transition: 0.15s;
+        }
+        #palette .color-item:hover { transform: scale(1.12); }
+        #palette .color-item.selected {
+            border-color: #fff;
+            box-shadow: 0 0 10px rgba(255, 255, 255, 0.45);
+        }
+        #info {
+            position: absolute;
+            bottom: 118px;
+            left: 50%;
+            transform: translateX(-50%);
+            font-size: 10px;
+            background: rgba(0, 0, 0, 0.4);
+            padding: 4px 16px;
+            border-radius: 30px;
+            color: #aaa;
+            z-index: 15;
+            pointer-events: none;
+            white-space: nowrap;
+        }
+        @media (max-width: 850px) {
+            #top-bar { top: 8px; padding: 6px 10px; gap: 4px; }
+            #transform-panel { left: 10px; bottom: 80px; min-width: 150px; }
+            #palette { grid-template-columns: repeat(8, 26px); }
+            #palette .color-item { width: 26px; height: 26px; }
+            #info { bottom: 110px; font-size: 8px; }
+        }
+    </style>
+</head>
+<body>
+    <div id="canvas-container"></div>
+
+    <div id="top-bar">
+        <a class="hub-link" href="index.html">← Editores</a>
+        <div class="separator"></div>
+        <span style="opacity:0.6;font-weight:600;font-size:11px;">Nombre</span>
+        <input type="text" id="entity-name" value="hero" maxlength="48" title="Nombre del archivo / id" />
+        <span id="preset-badge" style="opacity:0.7;font-size:10px;font-weight:700;color:#88aaff;"></span>
+        <div class="separator"></div>
+        <span style="opacity:0.6;font-weight:600;font-size:11px;">Tipo</span>
+        <div class="tool-group" id="kind-selector">
+            <button id="btn-kind-character" class="active-tool" data-kind="character">Criatura</button>
+            <button id="btn-kind-object" data-kind="object">Objeto</button>
+        </div>
+        <div class="separator"></div>
+        <span id="part-label" style="opacity:0.6;font-weight:600;font-size:11px;">Parte</span>
+        <div class="part-selector" id="part-selector"></div>
+        <div id="object-size-wrap" style="display:none;align-items:center;gap:6px;">
+            <span style="opacity:0.6;font-weight:600;font-size:11px;">Tamaño</span>
+            <select id="sel-object-size" title="Tamaño del objeto (XZ)" style="background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.2);color:#eee;padding:4px 10px;border-radius:20px;font-weight:600;font-size:11px;">
+                <option value="8">8×8</option>
+                <option value="16" selected>16×16</option>
+                <option value="24">24×24</option>
+                <option value="32">32×32</option>
+                <option value="48">48×48</option>
+                <option value="64">64×64</option>
+            </select>
+            <select id="sel-object-height" title="Alto (Y)" style="background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.2);color:#eee;padding:4px 10px;border-radius:20px;font-weight:600;font-size:11px;">
+                <option value="8">Y8</option>
+                <option value="16" selected>Y16</option>
+                <option value="24">Y24</option>
+                <option value="32">Y32</option>
+                <option value="48">Y48</option>
+                <option value="64">Y64</option>
+            </select>
+        </div>
+        <div class="separator"></div>
+        <div class="tool-group">
+            <button id="btn-pencil" class="active-tool">Pincel</button>
+            <button id="btn-eraser">Borrador</button>
+            <button id="btn-fill">Bote</button>
+            <button id="btn-eyedrop">Gotero</button>
+        </div>
+        <div class="separator"></div>
+        <button class="action-btn" id="btn-walk">Walk</button>
+        <button class="action-btn" id="btn-new">Nuevo</button>
+        <button class="action-btn" id="btn-reset">Reset</button>
+        <button class="action-btn" id="btn-export">Export</button>
+        <button class="action-btn" id="btn-import">Import</button>
+        <input type="file" id="file-input" accept=".json" style="display:none;" />
+    </div>
+
+    <div id="transform-panel" class="visible">
+        <div class="section-title">Transformación</div>
+        <div class="row"><label>X</label><input type="range" id="pos-x" min="-10" max="10" step="0.1" value="0" /><span class="val" id="pos-x-val">0.0</span></div>
+        <div class="row"><label>Y</label><input type="range" id="pos-y" min="-10" max="10" step="0.1" value="0" /><span class="val" id="pos-y-val">0.0</span></div>
+        <div class="row"><label>Z</label><input type="range" id="pos-z" min="-10" max="10" step="0.1" value="0" /><span class="val" id="pos-z-val">0.0</span></div>
+        <div class="row"><label>SX</label><input type="range" id="scale-x" min="0.5" max="2.0" step="0.05" value="1.0" /><span class="val" id="scale-x-val">1.00</span></div>
+        <div class="row"><label>SY</label><input type="range" id="scale-y" min="0.5" max="2.0" step="0.05" value="1.0" /><span class="val" id="scale-y-val">1.00</span></div>
+        <div class="row"><label>SZ</label><input type="range" id="scale-z" min="0.5" max="2.0" step="0.05" value="1.0" /><span class="val" id="scale-z-val">1.00</span></div>
+        <div class="rot-group">
+            <div class="section-title" style="margin-top:6px;">Rotación (parte activa)</div>
+            <div id="rot-sliders">
+                <div class="row"><label>X</label><input type="range" id="rot-x" min="-180" max="180" value="0" step="1" /><span class="val" id="rot-x-val">0°</span></div>
+                <div class="row"><label>Y</label><input type="range" id="rot-y" min="-180" max="180" value="0" step="1" /><span class="val" id="rot-y-val">0°</span></div>
+                <div class="row"><label>Z</label><input type="range" id="rot-z" min="-180" max="180" value="0" step="1" /><span class="val" id="rot-z-val">0°</span></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Panel de animación -->
+    <div id="anim-panel" style="display:none;position:absolute;bottom:160px;left:50%;transform:translateX(-50%);background:rgba(16,16,32,0.9);backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,0.1);border-radius:16px;padding:14px 18px;z-index:35;min-width:600px;max-width:90vw;max-height:300px;overflow-y:auto;flex-direction:column;gap:8px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+            <span style="font-weight:700;font-size:14px;">🎬 Animación</span>
+            <div style="display:flex;gap:6px;">
+                <button id="anim-btn-play" class="action-btn" style="font-size:16px;padding:0 12px;">▶</button>
+                <button id="anim-btn-stop" class="action-btn" style="font-size:16px;padding:0 12px;">⏹</button>
+                <span style="opacity:0.7;font-size:12px;display:flex;align-items:center;">
+                    Vel: <input type="range" id="anim-speed" min="0.1" max="3" step="0.1" value="1" style="width:60px;background:transparent;" />
+                    <span id="anim-speed-label" style="min-width:30px;">1.0</span>
+                </span>
+                <label style="font-size:11px;display:flex;align-items:center;gap:4px;">
+                    <input type="checkbox" id="anim-loop" checked /> loop
+                </label>
+            </div>
+        </div>
+
+        <!-- Línea de tiempo -->
+        <div id="timeline" style="position:relative;height:40px;background:rgba(0,0,0,0.3);border-radius:8px;overflow:visible;cursor:pointer;">
+            <canvas id="timeline-canvas" width="800" height="40" style="width:100%;height:40px;display:block;border-radius:8px;"></canvas>
+            <!-- Marcador de reproducción -->
+            <div id="playhead" style="position:absolute;top:0;left:0;width:2px;height:40px;background:#ff4444;pointer-events:none;"></div>
+        </div>
+
+        <!-- Lista de fotogramas -->
+        <div id="frame-list" style="display:flex;flex-wrap:wrap;gap:6px;max-height:80px;overflow-y:auto;padding:4px;background:rgba(0,0,0,0.2);border-radius:8px;">
+            <!-- se llena dinámicamente -->
+        </div>
+
+        <!-- Botones y controles -->
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+            <button id="anim-btn-add-key" class="action-btn">➕ Clave</button>
+            <button id="anim-btn-add-tween" class="action-btn">➡️ Movimiento</button>
+            <button id="anim-btn-duplicate" class="action-btn">📋 Duplicar</button>
+            <button id="anim-btn-delete" class="action-btn" style="border-color:#ff4444;color:#ff6666;">🗑️</button>
+            <span style="font-size:11px;opacity:0.7;">Easing:</span>
+            <select id="anim-easing" style="background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.2);color:#eee;padding:2px 8px;border-radius:12px;font-size:11px;">
+                <option value="linear">Lineal</option>
+                <option value="easeIn">Ease In</option>
+                <option value="easeOut">Ease Out</option>
+                <option value="easeInOut">Ease In Out</option>
+                <option value="bounce">Bounce</option>
+                <option value="elastic">Elastic</option>
+            </select>
+            <span style="font-size:11px;opacity:0.7;">Duración:</span>
+            <input type="number" id="anim-tween-duration" value="0.5" step="0.05" min="0.1" max="5" style="width:56px;background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.2);color:#eee;padding:2px 6px;border-radius:12px;font-size:11px;" />
+            <span style="font-size:11px;opacity:0.7;">s</span>
+            <button id="anim-btn-export" class="action-btn">💾 Export Anim</button>
+        </div>
+    </div>
+
+    <div id="palette-wrap">
+        <div id="palette-bar">
+            <span style="opacity:0.6;font-weight:600;">Paleta</span>
+            <select id="sel-palette" title="Paleta"></select>
+            <div id="current-swatch" class="swatch"></div>
+            <span id="color-index">#0</span>
+        </div>
+        <div id="palette"></div>
+    </div>
+    <div id="info">Nombre + Export · B/D/F/I · Walk = preset · 🎬 Anim = timeline (clave / movimiento / easing)</div>
+
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { getPreset } from './presets.js';
+
+        const urlPreset = new URLSearchParams(location.search).get('preset') || 'biped';
+        let currentPreset = getPreset(urlPreset);
+
+        // ------------------------------------------------------------------
+        // 1. 10 palettes × 32 colours (embedded for file://)
+        // ------------------------------------------------------------------
+        const PALETTES = {
+            classic: ["#FDBF8A","#E67E22","#2C3E50","#8B4513","#C0C0C0","#F1C40F","#E74C3C","#ECF0F1","#111111","#8B0000","#4A2E1B","#FF0000","#FF7F00","#FFFF00","#00FF00","#0000FF","#4B0082","#8B00FF","#FF1493","#00FFFF","#32CD32","#FFD700","#808080","#FFFFFF","#000000","#FF69B4","#00BFFF","#7CFC00","#FF8C00","#8A2BE2","#A52A2A","#48D1CC"],
+            pastel: ["#F8D5C2","#F5A26F","#7B8FA1","#C4A484","#D9D9E0","#F7E39A","#F5A3A0","#F0F0F5","#5A5A6A","#C47A7A","#A88B7A","#F7B2B2","#F7C89A","#F7F0A8","#B8E0C8","#A8C4F0","#C8B0E0","#E0B8F0","#F0B8D8","#B0E8E8","#B8E0B0","#F0E0A0","#C0C0C8","#FFFFFF","#6A6A78","#F0C0D8","#A0D0F0","#C8E8A8","#F0C898","#C8A8E0","#D8A090","#A0D8D0"],
+            earth: ["#E8C4A0","#C4783A","#3D4A3A","#6B4423","#A8A090","#C9A227","#8B3A3A","#D8D0C0","#1A1814","#5C2018","#3E2A1A","#8B4513","#A0522D","#CD853F","#556B2F","#2F4F4F","#6B8E23","#8B7355","#BC8F8F","#708090","#228B22","#B8860B","#696969","#F5F5DC","#2F2F2F","#D2691E","#4682B4","#9ACD32","#DAA520","#8B008B","#A52A2A","#5F9EA0"],
+            neon: ["#FFB8E0","#FF6A00","#1A1A40","#5C2A00","#E0E0FF","#FFFF33","#FF003C","#F0FFFF","#0A0A12","#FF0044","#331A00","#FF0040","#FF8000","#FFFF00","#39FF14","#00F0FF","#BF00FF","#FF00FF","#FF1493","#00FFFF","#00FF80","#FFE600","#8888AA","#FFFFFF","#000000","#FF66CC","#00BFFF","#ADFF2F","#FF4500","#7B68EE","#FF6347","#40E0D0"],
+            castle: ["#E8B896","#C45C20","#2A3540","#5C3A22","#B8C0C8","#E6C84A","#A02828","#E8ECF0","#141418","#6A1010","#3A2818","#8B2020","#D47820","#E8D060","#3A7A40","#2A4A80","#5A2A80","#8030A0","#C03070","#40A0B0","#50A050","#D4A820","#707880","#F8F8F8","#101010","#D06090","#4080C0","#60A040","#C06020","#6040A0","#804030","#308080"],
+            ocean: ["#A8D4E8","#4A90A4","#1B3A4B","#2E5A4C","#B8C8D0","#E8D48A","#C45C5C","#E8F0F4","#0A1820","#6A3030","#3A4A40","#1E90FF","#00CED1","#7FFFD4","#20B2AA","#000080","#4169E1","#5F9EA0","#48D1CC","#00BFFF","#40E0D0","#B0E0E6","#708090","#F0FFFF","#0D1B2A","#87CEEB","#4682B4","#98D8C8","#2E8B57","#6A5ACD","#A0522D","#008B8B"],
+            sunset: ["#FFD4A8","#FF8C42","#4A2C3A","#8B4513","#E0C0B0","#FFD700","#FF4500","#FFF5EE","#1A0A10","#8B0000","#5C3A2A","#FF6347","#FF7F50","#FFA500","#FF69B4","#DC143C","#C71585","#FF1493","#FFB6C1","#FFE4B5","#F4A460","#DAA520","#A0522D","#FFFAF0","#2B0A0A","#E9967A","#CD5C5C","#FA8072","#FF8C00","#B22222","#8B008B","#FFDAB9"],
+            forest: ["#C4A882","#8B6914","#2D3A2E","#5C4033","#A8A890","#C9A227","#6B3A3A","#E8E4D8","#0F140F","#4A2020","#3E2A1A","#228B22","#556B2F","#6B8E23","#2E8B57","#006400","#8FBC8F","#9ACD32","#808000","#BC8F8F","#8B7355","#DAA520","#696969","#F5F5DC","#1A1A14","#D2691E","#4682B4","#ADFF2F","#B8860B","#556B2F","#A52A2A","#5F9EA0"],
+            mono: ["#E8E8E8","#B0B0B0","#505050","#707070","#D0D0D0","#F0E8C0","#A0A0A0","#FAFAFA","#101010","#404040","#606060","#FFFFFF","#E0E0E0","#C0C0C0","#909090","#808080","#686868","#585858","#484848","#383838","#282828","#181818","#F5F5F5","#FFFFFF","#000000","#DCDCDC","#A9A9A9","#778899","#708090","#2F4F4F","#696969","#BEBEBE"],
+            candy: ["#FFCCE5","#FF99CC","#6B5B95","#C4A484","#E8E0F0","#FFF59D","#FF6B9D","#FFF0F5","#2A1A2E","#C05070","#A08070","#FF6B6B","#FFA07A","#FFE66D","#88D8B0","#4ECDC4","#A8E6CF","#DDA0DD","#FFB6C1","#87CEFA","#98D8C8","#F7DC6F","#B0A0C0","#FFFFFF","#1A1020","#FF85A2","#7FDBDA","#B5EAD7","#FFDAC1","#C7CEEA","#E2F0CB","#FF9AA2"],
+        };
+        const PALETTE_NAMES = Object.keys(PALETTES);
+        let paletteName = 'classic';
+        let palette = PALETTES.classic;
+        let colorIndex = 0;
+        // Semantic slots on classic (and remapped by index on other palettes).
+        const C = {
+            SKIN: 0, SHIRT: 1, PANTS: 2, BOOTS: 3, METAL: 4,
+            GOLD: 5, CAPE: 6, EYE: 8, MOUTH: 9,
+        };
+        function hexAt(i) {
+            return palette[Math.max(0, Math.min(31, i | 0))] || palette[0];
+        }
+        function nearestIndex(hex) {
+            if (typeof hex === 'number') return Math.max(0, Math.min(31, hex | 0));
+            const t = new THREE.Color(hex);
+            let best = 0, bd = Infinity;
+            for (let i = 0; i < palette.length; i++) {
+                const c = new THREE.Color(palette[i]);
+                const d = (t.r - c.r) ** 2 + (t.g - c.g) ** 2 + (t.b - c.b) ** 2;
+                if (d < bd) { bd = d; best = i; }
+            }
+            return best;
+        }
+
+        // ------------------------------------------------------------------
+        // 2. Scene
+        // ------------------------------------------------------------------
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x1a1a2e);
+
+        const camera = new THREE.PerspectiveCamera(40, container.clientWidth / container.clientHeight, 0.1, 100);
+        camera.position.set(20, 15, 20);
+        camera.lookAt(0, 10, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(container.clientWidth, container.clientHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.target.set(0, 10, 0);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.08;
+
+        scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+        const sun = new THREE.DirectionalLight(0xffeedd, 1.6);
+        sun.position.set(8, 20, 12);
+        sun.castShadow = true;
+        sun.shadow.mapSize.set(1024, 1024);
+        Object.assign(sun.shadow.camera, { left: -15, right: 15, top: 15, bottom: -15, near: 1, far: 40 });
+        scene.add(sun);
+        scene.add(new THREE.DirectionalLight(0x8888ff, 0.3).translateX(-10));
+
+        const groundPlane = new THREE.Mesh(
+            new THREE.PlaneGeometry(80, 80),
+            new THREE.ShadowMaterial({ opacity: 0.4 }),
+        );
+        groundPlane.rotation.x = -Math.PI / 2;
+        groundPlane.position.y = -0.5;
+        groundPlane.receiveShadow = true;
+        groundPlane.name = 'ground';
+        scene.add(groundPlane);
+
+        let gridHelper = new THREE.GridHelper(16, 16, 0x88aaff, 0x334466);
+        gridHelper.position.y = -0.4;
+        scene.add(gridHelper);
+
+        /** Yellow footprint frame — keeps you inside the XZ budget. */
+        let boundsFrame = null;
+        let boundsFill = null;
+        function disposeObject3D(obj) {
+            if (!obj) return;
+            obj.traverse((child) => {
+                if (child.geometry) child.geometry.dispose();
+                if (child.material) {
+                    if (Array.isArray(child.material)) child.material.forEach((m) => m.dispose());
+                    else child.material.dispose();
+                }
+            });
+        }
+
+        function rebuildBoundsMarkers(sizeX, sizeZ) {
+            if (boundsFrame) {
+                scene.remove(boundsFrame);
+                disposeObject3D(boundsFrame);
+                boundsFrame = null;
+            }
+            if (boundsFill) {
+                scene.remove(boundsFill);
+                disposeObject3D(boundsFill);
+                boundsFill = null;
+            }
+            if (gridHelper) {
+                scene.remove(gridHelper);
+                disposeObject3D(gridHelper);
+                gridHelper = null;
+            }
+            const hx = sizeX / 2;
+            const hz = sizeZ / 2;
+            const y = -0.38;
+            const pts = [
+                new THREE.Vector3(-hx, y, -hz),
+                new THREE.Vector3(hx, y, -hz),
+                new THREE.Vector3(hx, y, hz),
+                new THREE.Vector3(-hx, y, hz),
+                new THREE.Vector3(-hx, y, -hz),
+            ];
+            boundsFrame = new THREE.Line(
+                new THREE.BufferGeometry().setFromPoints(pts),
+                new THREE.LineBasicMaterial({ color: 0xffcc44, linewidth: 2 }),
+            );
+            scene.add(boundsFrame);
+
+            // Corner posts so the limit reads in iso view.
+            const postGeo = new THREE.BoxGeometry(0.12, 0.9, 0.12);
+            const postMat = new THREE.MeshStandardMaterial({
+                color: 0xffcc44, emissive: 0x665500, emissiveIntensity: 0.35,
+            });
+            boundsFill = new THREE.Group();
+            for (const [px, pz] of [[-hx, -hz], [hx, -hz], [hx, hz], [-hx, hz]]) {
+                const post = new THREE.Mesh(postGeo, postMat);
+                post.position.set(px, 0.0, pz);
+                boundsFill.add(post);
+            }
+            // Cell ticks every 1 unit on the border (XZ).
+            const tickMat = new THREE.LineBasicMaterial({ color: 0xffee88, transparent: true, opacity: 0.55 });
+            const tickPts = [];
+            for (let x = -hx; x <= hx; x++) {
+                tickPts.push(new THREE.Vector3(x, y, -hz), new THREE.Vector3(x, y, -hz - 0.25));
+                tickPts.push(new THREE.Vector3(x, y, hz), new THREE.Vector3(x, y, hz + 0.25));
+            }
+            for (let z = -hz; z <= hz; z++) {
+                tickPts.push(new THREE.Vector3(-hx, y, z), new THREE.Vector3(-hx - 0.25, y, z));
+                tickPts.push(new THREE.Vector3(hx, y, z), new THREE.Vector3(hx + 0.25, y, z));
+            }
+            boundsFill.add(new THREE.LineSegments(
+                new THREE.BufferGeometry().setFromPoints(tickPts),
+                tickMat,
+            ));
+            scene.add(boundsFill);
+
+            const gSize = Math.max(sizeX, sizeZ);
+            gridHelper = new THREE.GridHelper(gSize, gSize, 0x88aaff, 0x334466);
+            gridHelper.position.y = -0.4;
+            scene.add(gridHelper);
+        }
+        {
+            const g0 = currentPreset.grid || { x: 16, z: 16 };
+            rebuildBoundsMarkers(g0.x || 16, g0.z || 16);
+        }
+
+        // ------------------------------------------------------------------
+        // 3. Parts / voxels — driven by preset (biped, quadruped, fish…)
+        // ------------------------------------------------------------------
+        function loadPresetSkeleton(preset) {
+            const order = [...(preset.partOrder || [])];
+            const cfg = {};
+            for (const name of order) {
+                const p = preset.parts[name];
+                const piv = p?.pivot || { x: 0, y: 0, z: 0 };
+                cfg[name] = {
+                    parent: p?.parent ?? null,
+                    pivot: new THREE.Vector3(piv.x, piv.y, piv.z),
+                };
+            }
+            return { order, cfg };
+        }
+        let PART_CONFIG;
+        let PART_ORDER;
+        {
+            const sk = loadPresetSkeleton(currentPreset);
+            PART_CONFIG = sk.cfg;
+            PART_ORDER = sk.order;
+        }
+
+        function applyCreaturePreset(preset, { keepName = false } = {}) {
+            currentPreset = preset;
+            const sk = loadPresetSkeleton(preset);
+            PART_CONFIG = sk.cfg;
+            PART_ORDER = sk.order;
+            jointRotations = emptyJointRotations();
+            if (!keepName) entityId = preset.defaultName || entityId;
+            syncNameField();
+            partVoxels = generateBaseVoxels();
+            resetTransforms();
+            buildHierarchy();
+            rebuildPartButtons();
+        }
+
+        // ------------------------------------------------------------------
+        // Entity kind: character (skeleton) vs object (flat, no joint rotation)
+        // ------------------------------------------------------------------
+        let entityKind = currentPreset.kind === 'object' ? 'object' : 'character';
+        let entityId = currentPreset.defaultName || 'hero';
+        let walkActive = false;
+        let walkTime = 0;
+        /** Object grid (XZ square + height). */
+        let objectGrid = (currentPreset.kind === 'object' && currentPreset.grid)
+            ? { ...currentPreset.grid }
+            : { x: 16, y: 16, z: 16 };
+        /** Flat voxels for object mode (world/design coords, origin centre XZ, Y≥0). */
+        let objectVoxels = [];
+        const objectRoot = new THREE.Group();
+        objectRoot.visible = false;
+        scene.add(objectRoot);
+
+        function charGrid() {
+            return currentPreset.grid || { x: 16, y: 32, z: 16 };
+        }
+        function charHalfX() { return charGrid().x / 2; }
+        function charHalfZ() { return charGrid().z / 2; }
+        function charHalfXZ() { return Math.max(charHalfX(), charHalfZ()); }
+        function objHalfX() { return objectGrid.x / 2; }
+        function objHalfZ() { return objectGrid.z / 2; }
+
+        function designFromPartLocal(partName, lx, ly, lz) {
+            const pivot = PART_CONFIG[partName]?.pivot || new THREE.Vector3();
+            return {
+                x: pivot.x + lx,
+                y: pivot.y + ly,
+                z: pivot.z + lz,
+            };
+        }
+
+        function inCharacterBounds(partName, lx, ly, lz) {
+            const d = designFromPartLocal(partName, lx, ly, lz);
+            const g = charGrid();
+            return d.x >= -g.x / 2 && d.x < g.x / 2
+                && d.z >= -g.z / 2 && d.z < g.z / 2
+                && d.y >= 0 && d.y < g.y;
+        }
+
+        function syncNameField() {
+            const el = document.getElementById('entity-name');
+            if (el) el.value = entityId;
+            const badge = document.getElementById('preset-badge');
+            if (badge) badge.textContent = currentPreset.label || currentPreset.id;
+        }
+
+        function readEntityName() {
+            const el = document.getElementById('entity-name');
+            const raw = (el?.value || entityId || 'entity').trim();
+            entityId = raw.replace(/[^\w\-]+/g, '_').replace(/^_+|_+$/g, '') || 'entity';
+            if (el) el.value = entityId;
+            return entityId;
+        }
+
+        function rebuildPartButtons() {
+            const host = document.getElementById('part-selector');
+            if (!host) return;
+            host.innerHTML = '';
+            for (const name of PART_ORDER) {
+                const btn = document.createElement('button');
+                btn.dataset.part = name;
+                btn.textContent = currentPreset.partLabels[name] || name;
+                if (name === activePart) btn.classList.add('active');
+                btn.addEventListener('click', () => {
+                    host.querySelectorAll('button').forEach((b) => b.classList.remove('active'));
+                    btn.classList.add('active');
+                    setActivePart(name);
+                    document.getElementById('transform-panel')?.classList.add('visible');
+                    loadTransformSliders();
+                });
+                host.appendChild(btn);
+            }
+        }
+
+        function emptyJointRotations() {
+            const o = {};
+            for (const k of (currentPreset.jointKeys || [])) o[k] = 0;
+            return o;
+        }
+
+        function jointKey(part, axis) {
+            return `${part}${String(axis).toUpperCase()}`;
+        }
+
+        function syncWalkButton() {
+            const btn = document.getElementById('btn-walk');
+            if (!btn) return;
+            const show = entityKind === 'character' && currentPreset.hasWalk;
+            btn.style.display = show ? '' : 'none';
+            if (currentPreset.id === 'fish') btn.textContent = 'Swim';
+            else if (currentPreset.id === 'jellyfish') btn.textContent = 'Pulse';
+            else btn.textContent = 'Walk';
+        }
+
+        function inObjectBounds(x, y, z) {
+            const hx = objHalfX();
+            const hz = objHalfZ();
+            return x >= -hx && x < hx && z >= -hz && z < hz && y >= 0 && y < objectGrid.y;
+        }
+
+        function generateBaseVoxels() {
+            return currentPreset.generateVoxels(C);
+        }
+
+        let partVoxels = generateBaseVoxels();
+        let partTransforms = {};
+        function resetTransforms() {
+            partTransforms = {};
+            for (const name of PART_ORDER) {
+                partTransforms[name] = { pos: { x: 0, y: 0, z: 0 }, scale: { x: 1, y: 1, z: 1 } };
+            }
+        }
+        resetTransforms();
+
+        // ------------------------------------------------------------------
+        // 4. Hierarchy + mesh rebuild
+        // ------------------------------------------------------------------
+        const characterRoot = new THREE.Group();
+        scene.add(characterRoot);
+        const partGroups = {};
+        const partMaterials = {};
+        /** mesh → partName for raycasts */
+        const meshToPart = new Map();
+
+        function rebuildPart(partName) {
+            const voxels = partVoxels[partName];
+            const group = partGroups[partName];
+            if (!group) return;
+
+            // CRITICAL: only remove voxel meshes — never child Groups (head/arms/legs
+            // are parented under torso; wiping group.children orphaned the whole skeleton).
+            const meshes = group.children.filter((c) => c.isInstancedMesh || c.isMesh);
+            for (const c of meshes) {
+                meshToPart.delete(c);
+                if (c.geometry) c.geometry.dispose();
+                if (c.material) {
+                    if (Array.isArray(c.material)) c.material.forEach((m) => m.dispose());
+                    else c.material.dispose();
+                }
+                group.remove(c);
+            }
+
+            const colorMap = new Map();
+            for (const v of voxels) {
+                const ci = (v.c ?? 0) | 0;
+                if (!colorMap.has(ci)) colorMap.set(ci, []);
+                colorMap.get(ci).push(new THREE.Vector3(v.x, v.y, v.z));
+            }
+
+            // BoxGeometry faces are CCW-outward (same convention as Rust FACE_CORNERS).
+            // FrontSide + positive scale — never DoubleSide / mirror (hides winding bugs).
+            const FACE_CORNERS = [
+                // +X
+                { n: [1, 0, 0], c: [[1,0,0],[1,1,0],[1,1,1],[1,0,1]] },
+                // -X
+                { n: [ -1, 0, 0], c: [[0,0,1],[0,1,1],[0,1,0],[0,0,0]] },
+                // +Y
+                { n: [0, 1, 0], c: [[0,1,0],[0,1,1],[1,1,1],[1,1,0]] },
+                // -Y
+                { n: [0, -1, 0], c: [[0,0,0],[1,0,0],[1,0,1],[0,0,1]] },
+                // +Z
+                { n: [0, 0, 1], c: [[0,0,1],[1,0,1],[1,1,1],[0,1,1]] },
+                // -Z
+                { n: [0, 0, -1], c: [[1,0,0],[0,0,0],[0,1,0],[1,1,0]] },
+            ];
+            void FACE_CORNERS; // reference parity with src/hero.rs FACE_CORNERS
+
+            const geo = new THREE.BoxGeometry(0.96, 0.96, 0.96);
+            const dummy = new THREE.Matrix4();
+            const quat = new THREE.Quaternion();
+            const scale = new THREE.Vector3(1, 1, 1);
+            const mats = [];
+
+            for (const [ci, vecs] of colorMap) {
+                if (vecs.length === 0) continue;
+                const colorHex = hexAt(ci);
+                const mat = new THREE.MeshStandardMaterial({
+                    color: colorHex,
+                    roughness: 0.3,
+                    metalness: 0.1,
+                    transparent: false,
+                    depthWrite: true,
+                    side: THREE.FrontSide,
+                });
+                mat.userData.origColor = new THREE.Color(colorHex);
+                mat.userData.colorIndex = ci;
+                const mesh = new THREE.InstancedMesh(geo, mat, vecs.length);
+                mesh.userData.partName = partName;
+                mesh.frustumCulled = false; // keep pickable when zoomed / at angles
+                vecs.forEach((v, i) => {
+                    dummy.compose(v, quat, scale);
+                    mesh.setMatrixAt(i, dummy);
+                });
+                mesh.instanceMatrix.needsUpdate = true;
+                mesh.computeBoundingSphere();
+                mesh.castShadow = true;
+                mesh.receiveShadow = true;
+                group.add(mesh);
+                meshToPart.set(mesh, partName);
+                mats.push(mat);
+            }
+            partMaterials[partName] = mats;
+        }
+
+        function rebuildObjectMeshes() {
+            while (objectRoot.children.length) {
+                const c = objectRoot.children[0];
+                meshToPart.delete(c);
+                if (c.geometry) c.geometry.dispose();
+                if (c.material) {
+                    if (Array.isArray(c.material)) c.material.forEach((m) => m.dispose());
+                    else c.material.dispose();
+                }
+                objectRoot.remove(c);
+            }
+            const colorMap = new Map();
+            for (const v of objectVoxels) {
+                const ci = (v.c ?? 0) | 0;
+                if (!colorMap.has(ci)) colorMap.set(ci, []);
+                colorMap.get(ci).push(new THREE.Vector3(v.x, v.y, v.z));
+            }
+            const geo = new THREE.BoxGeometry(0.96, 0.96, 0.96);
+            const dummy = new THREE.Matrix4();
+            const quat = new THREE.Quaternion();
+            const scale = new THREE.Vector3(1, 1, 1);
+            const mats = [];
+            for (const [ci, vecs] of colorMap) {
+                if (!vecs.length) continue;
+                const colorHex = hexAt(ci);
+                const mat = new THREE.MeshStandardMaterial({
+                    color: colorHex, roughness: 0.3, metalness: 0.1,
+                    side: THREE.FrontSide,
+                });
+                mat.userData.origColor = new THREE.Color(colorHex);
+                const mesh = new THREE.InstancedMesh(geo, mat, vecs.length);
+                mesh.userData.partName = 'object';
+                mesh.frustumCulled = false;
+                vecs.forEach((v, i) => {
+                    dummy.compose(v, quat, scale);
+                    mesh.setMatrixAt(i, dummy);
+                });
+                mesh.instanceMatrix.needsUpdate = true;
+                mesh.computeBoundingSphere();
+                mesh.castShadow = true;
+                mesh.receiveShadow = true;
+                objectRoot.add(mesh);
+                meshToPart.set(mesh, 'object');
+                mats.push(mat);
+            }
+            partMaterials.object = mats;
+        }
+
+        function buildHierarchy() {
+            while (characterRoot.children.length) {
+                characterRoot.remove(characterRoot.children[0]);
+            }
+            for (const k of Object.keys(partGroups)) delete partGroups[k];
+            for (const name of PART_ORDER) {
+                const group = new THREE.Group();
+                group.name = name;
+                group.userData.basePos = new THREE.Vector3();
+                partGroups[name] = group;
+            }
+            for (const name of PART_ORDER) {
+                const group = partGroups[name];
+                const parentName = PART_CONFIG[name].parent;
+                if (parentName && partGroups[parentName]) partGroups[parentName].add(group);
+                else characterRoot.add(group);
+
+                const pivot = PART_CONFIG[name].pivot;
+                if (parentName && PART_CONFIG[parentName]) {
+                    group.userData.basePos.copy(pivot).sub(PART_CONFIG[parentName].pivot);
+                } else {
+                    group.userData.basePos.copy(pivot);
+                }
+                const t = partTransforms[name] || { pos: { x: 0, y: 0, z: 0 }, scale: { x: 1, y: 1, z: 1 } };
+                group.position.copy(group.userData.basePos);
+                group.position.x += t.pos.x;
+                group.position.y += t.pos.y;
+                group.position.z += t.pos.z;
+                group.scale.set(t.scale.x, t.scale.y, t.scale.z);
+                rebuildPart(name);
+            }
+        }
+
+        function updateAllTransforms() {
+            for (const name of PART_ORDER) {
+                const group = partGroups[name];
+                const t = partTransforms[name];
+                if (!group || !t) continue;
+                group.position.copy(group.userData.basePos);
+                group.position.x += t.pos.x;
+                group.position.y += t.pos.y;
+                group.position.z += t.pos.z;
+                group.scale.set(t.scale.x, t.scale.y, t.scale.z);
+            }
+        }
+
+        buildHierarchy();
+
+        // ------------------------------------------------------------------
+        // 5. Active part highlight
+        // ------------------------------------------------------------------
+        let activePart = 'torso';
+
+        function setActivePart(partName) {
+            activePart = partName;
+            if (entityKind === 'object') {
+                updateRotationSlidersVisibility(null);
+                return;
+            }
+            // Dim inactive parts by colour only — InstancedMesh + transparent often
+            // vanishes or breaks picking at distance.
+            for (const name of PART_ORDER) {
+                const mats = partMaterials[name] || [];
+                const isActive = name === activePart;
+                for (const mat of mats) {
+                    if (!mat.userData.origColor) {
+                        mat.userData.origColor = mat.color.clone();
+                    }
+                    mat.transparent = false;
+                    mat.opacity = 1.0;
+                    mat.depthWrite = true;
+                    if (isActive) {
+                        mat.color.copy(mat.userData.origColor);
+                        mat.emissive.setHex(0x000000);
+                    } else {
+                        const gray = new THREE.Color(0x2a2a3a);
+                        mat.color.copy(mat.userData.origColor).lerp(gray, 0.55);
+                        mat.emissive.setHex(0x000000);
+                    }
+                    mat.needsUpdate = true;
+                }
+            }
+            updateRotationSlidersVisibility(partName);
+            updateRotationSlidersValues();
+        }
+
+        function setEntityKind(kind, opts = {}) {
+            const keepVoxels = !!opts.keepVoxels;
+            entityKind = kind === 'object' ? 'object' : 'character';
+            document.getElementById('btn-kind-character').classList.toggle('active-tool', entityKind === 'character');
+            document.getElementById('btn-kind-object').classList.toggle('active-tool', entityKind === 'object');
+            document.getElementById('part-selector').style.display = entityKind === 'character' ? 'flex' : 'none';
+            document.getElementById('part-label').style.display = entityKind === 'character' ? '' : 'none';
+            document.getElementById('object-size-wrap').style.display = entityKind === 'object' ? 'flex' : 'none';
+            const tPanel = document.getElementById('transform-panel');
+            tPanel.classList.toggle('visible', entityKind === 'character');
+            const rotGroup = tPanel.querySelector('.rot-group');
+            if (rotGroup) rotGroup.style.display = entityKind === 'character' ? '' : 'none';
+
+            characterRoot.visible = entityKind === 'character';
+            objectRoot.visible = entityKind === 'object';
+
+            if (entityKind === 'character') {
+                entityId = entityId || currentPreset.defaultName || 'hero';
+                const g = charGrid();
+                rebuildBoundsMarkers(g.x, g.z);
+                controls.target.set(0, Math.min(10, g.y * 0.4), 0);
+                walkActive = false;
+                document.getElementById('btn-walk').classList.remove('active');
+                const fallback = PART_ORDER[0] || 'torso';
+                setActivePart(activePart in PART_CONFIG ? activePart : fallback);
+            } else {
+                if (!entityId || entityId === 'hero') entityId = currentPreset.defaultName || 'object';
+                if (!keepVoxels && objectVoxels.length === 0) {
+                    objectVoxels = [{ x: 0, y: 0, z: 0, c: colorIndex }];
+                }
+                rebuildBoundsMarkers(objectGrid.x, objectGrid.z);
+                rebuildObjectMeshes();
+                activePart = 'object';
+                controls.target.set(0, Math.min(8, objectGrid.y * 0.4), 0);
+                resetJoints();
+            }
+            syncNameField();
+            syncWalkButton();
+            controls.update();
+        }
+
+        // ------------------------------------------------------------------
+        // 6. Joint rotations (generic: part + axis from preset.jointKeys)
+        // ------------------------------------------------------------------
+        let jointRotations = emptyJointRotations();
+
+        function updateJoints() {
+            for (const name of PART_ORDER) {
+                const g = partGroups[name];
+                if (g) g.rotation.set(0, 0, 0);
+            }
+            for (const [key, deg] of Object.entries(jointRotations)) {
+                if (!key || key.length < 2) continue;
+                const axis = key.slice(-1).toLowerCase();
+                const part = key.slice(0, -1);
+                const g = partGroups[part];
+                if (!g || !'xyz'.includes(axis)) continue;
+                g.rotation[axis] = THREE.MathUtils.degToRad(deg || 0);
+            }
+        }
+
+        function resetJoints() {
+            jointRotations = emptyJointRotations();
+            updateJoints();
+            updateRotationSlidersValues();
+        }
+
+        const rotSliders = {
+            x: document.getElementById('rot-x'),
+            y: document.getElementById('rot-y'),
+            z: document.getElementById('rot-z'),
+        };
+        const rotVals = {
+            x: document.getElementById('rot-x-val'),
+            y: document.getElementById('rot-y-val'),
+            z: document.getElementById('rot-z-val'),
+        };
+
+        function updateRotationSlidersVisibility(partName) {
+            const rotGroup = document.querySelector('.rot-group');
+            if (!rotGroup) return;
+            const show = entityKind === 'character' && !!partName && partName !== 'object';
+            rotGroup.style.display = show ? '' : 'none';
+        }
+
+        function updateRotationSlidersValues() {
+            if (!rotSliders.x || entityKind !== 'character' || !activePart || activePart === 'object') return;
+            for (const axis of ['x', 'y', 'z']) {
+                const key = jointKey(activePart, axis);
+                const val = jointRotations[key] || 0;
+                rotSliders[axis].value = val;
+                rotVals[axis].textContent = `${Math.round(val)}°`;
+            }
+        }
+
+        function onRotSliderChange(e) {
+            const axis = e.target.id.replace('rot-', '');
+            if (!'xyz'.includes(axis) || !activePart || activePart === 'object') return;
+            const val = parseFloat(e.target.value);
+            jointRotations[jointKey(activePart, axis)] = val;
+            rotVals[axis].textContent = `${Math.round(val)}°`;
+            updateJoints();
+        }
+        for (const slider of Object.values(rotSliders)) {
+            if (slider) slider.addEventListener('input', onRotSliderChange);
+        }
+
+        // ------------------------------------------------------------------
+        // 7. Pencil / eraser / fill / eyedropper
+        // ------------------------------------------------------------------
+        let tool = 'pencil';
+
+        const cursorMat = new THREE.MeshStandardMaterial({
+            color: 0x88ccff, transparent: true, opacity: 0.35,
+            emissive: 0x4488ff, emissiveIntensity: 0.5, depthWrite: false,
+        });
+        const cursor = new THREE.Mesh(new THREE.BoxGeometry(0.95, 0.95, 0.95), cursorMat);
+        cursor.visible = false;
+        cursor.add(new THREE.LineSegments(
+            new THREE.EdgesGeometry(cursor.geometry),
+            new THREE.LineBasicMaterial({ color: 0x88ccff }),
+        ));
+        scene.add(cursor);
+
+        const raycaster = new THREE.Raycaster();
+        raycaster.far = 500;
+        raycaster.params.Mesh = { threshold: 0.1 };
+        const pointer = new THREE.Vector2();
+        const _instMat = new THREE.Matrix4();
+        const _instPos = new THREE.Vector3();
+
+        function collectActiveMeshes() {
+            const all = [];
+            if (entityKind === 'object') {
+                for (const child of objectRoot.children) {
+                    if (child.isInstancedMesh) all.push(child);
+                }
+                return all;
+            }
+            const g = partGroups[activePart];
+            if (!g) return all;
+            for (const child of g.children) {
+                if (child.isInstancedMesh) all.push(child);
+            }
+            return all;
+        }
+
+        function getIntersects(event) {
+            const rect = renderer.domElement.getBoundingClientRect();
+            pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+            pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+            raycaster.setFromCamera(pointer, camera);
+            return raycaster.intersectObjects(collectActiveMeshes(), false);
+        }
+
+        function activeVoxelList() {
+            return entityKind === 'object' ? objectVoxels : partVoxels[activePart];
+        }
+
+        function refreshActiveMesh() {
+            if (entityKind === 'object') {
+                rebuildObjectMeshes();
+            } else {
+                rebuildPart(activePart);
+                setActivePart(activePart);
+            }
+        }
+
+        function getVoxelUnderCursor(intersect) {
+            if (!intersect || !intersect.object.isInstancedMesh) return null;
+            const partName = intersect.object.userData.partName;
+            if (entityKind === 'object') {
+                if (partName !== 'object') return null;
+            } else if (partName !== activePart) {
+                return null;
+            }
+            if (intersect.instanceId === undefined || intersect.instanceId < 0) return null;
+            intersect.object.getMatrixAt(intersect.instanceId, _instMat);
+            _instPos.setFromMatrixPosition(_instMat);
+            const lx = Math.round(_instPos.x);
+            const ly = Math.round(_instPos.y);
+            const lz = Math.round(_instPos.z);
+            const found = activeVoxelList().find((v) => v.x === lx && v.y === ly && v.z === lz);
+            return found ? { x: lx, y: ly, z: lz, c: found.c } : null;
+        }
+
+        function getTargetPosition(intersect) {
+            const under = getVoxelUnderCursor(intersect);
+            if (!under || !intersect.face) return null;
+            const group = entityKind === 'object' ? objectRoot : partGroups[activePart];
+            const nWorld = intersect.face.normal.clone()
+                .transformDirection(intersect.object.matrixWorld);
+            const invWorld = new THREE.Matrix4().copy(group.matrixWorld).invert();
+            const nLocal = nWorld.clone().transformDirection(invWorld);
+            const nx = Math.round(nLocal.x);
+            const ny = Math.round(nLocal.y);
+            const nz = Math.round(nLocal.z);
+            if (nx === 0 && ny === 0 && nz === 0) return null;
+            const lx = under.x + nx;
+            const ly = under.y + ny;
+            const lz = under.z + nz;
+            if (entityKind === 'object') {
+                if (!inObjectBounds(lx, ly, lz)) return null;
+            } else if (!inCharacterBounds(activePart, lx, ly, lz)) {
+                return null;
+            }
+            return { x: lx, y: ly, z: lz };
+        }
+
+        /** Place on empty ground inside the yellow frame (object mode). */
+        function getGroundTarget(event) {
+            if (entityKind !== 'object') return null;
+            const rect = renderer.domElement.getBoundingClientRect();
+            pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+            pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+            raycaster.setFromCamera(pointer, camera);
+            const hits = raycaster.intersectObject(groundPlane, false);
+            if (!hits.length) return null;
+            const p = hits[0].point;
+            const x = Math.round(p.x);
+            const z = Math.round(p.z);
+            const y = 0;
+            if (!inObjectBounds(x, y, z)) return null;
+            return { x, y, z };
+        }
+
+        function replaceColorInPart(fromC, toC) {
+            if (fromC === toC) return false;
+            let n = 0;
+            for (const v of activeVoxelList()) {
+                if (v.c === fromC) { v.c = toC; n++; }
+            }
+            return n > 0;
+        }
+
+        function floodFillPart(sx, sy, sz, toC) {
+            const voxels = activeVoxelList();
+            const key = (x, y, z) => `${x},${y},${z}`;
+            const map = new Map(voxels.map((v) => [key(v.x, v.y, v.z), v]));
+            const start = map.get(key(sx, sy, sz));
+            if (!start || start.c === toC) return false;
+            const fromC = start.c;
+            const stack = [[sx, sy, sz]];
+            const seen = new Set();
+            const neigh = [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
+            while (stack.length) {
+                const [x, y, z] = stack.pop();
+                const k = key(x, y, z);
+                if (seen.has(k)) continue;
+                seen.add(k);
+                const v = map.get(k);
+                if (!v || v.c !== fromC) continue;
+                v.c = toC;
+                for (const [dx, dy, dz] of neigh) stack.push([x + dx, y + dy, z + dz]);
+            }
+            return seen.size > 0;
+        }
+
+        function onPointerDown(event) {
+            if (event.button !== 0) return;
+            let intersects = getIntersects(event);
+            if (tool === 'pencil' && !intersects.length) {
+                const gpos = getGroundTarget(event);
+                if (gpos) {
+                    const voxels = activeVoxelList();
+                    if (!voxels.some((v) => v.x === gpos.x && v.y === gpos.y && v.z === gpos.z)) {
+                        voxels.push({ x: gpos.x, y: gpos.y, z: gpos.z, c: colorIndex });
+                        refreshActiveMesh();
+                    }
+                }
+                return;
+            }
+            if (!intersects.length) return;
+            const first = intersects[0];
+            if (tool === 'pencil') {
+                const pos = getTargetPosition(first);
+                if (!pos) return;
+                const voxels = activeVoxelList();
+                if (!voxels.some((v) => v.x === pos.x && v.y === pos.y && v.z === pos.z)) {
+                    voxels.push({ x: pos.x, y: pos.y, z: pos.z, c: colorIndex });
+                    refreshActiveMesh();
+                }
+            } else if (tool === 'eraser') {
+                const pos = getVoxelUnderCursor(first);
+                if (!pos) return;
+                const voxels = activeVoxelList();
+                const idx = voxels.findIndex((v) => v.x === pos.x && v.y === pos.y && v.z === pos.z);
+                if (idx !== -1) {
+                    voxels.splice(idx, 1);
+                    refreshActiveMesh();
+                }
+            } else if (tool === 'fill') {
+                const pos = getVoxelUnderCursor(first);
+                if (!pos) return;
+                const changed = event.shiftKey
+                    ? replaceColorInPart(pos.c, colorIndex)
+                    : floodFillPart(pos.x, pos.y, pos.z, colorIndex);
+                if (changed) refreshActiveMesh();
+            } else if (tool === 'eyedrop') {
+                const pos = getVoxelUnderCursor(first);
+                if (!pos) return;
+                setColorIndex(pos.c);
+                setTool('pencil');
+            }
+        }
+
+        function onPointerMove(event) {
+            const intersects = getIntersects(event);
+            let target = null;
+            if (intersects.length) {
+                const first = intersects[0];
+                target = tool === 'pencil' ? getTargetPosition(first) : getVoxelUnderCursor(first);
+            } else if (tool === 'pencil') {
+                target = getGroundTarget(event);
+            }
+            if (!target) { cursor.visible = false; return; }
+            const group = entityKind === 'object' ? objectRoot : partGroups[activePart];
+            const world = group.localToWorld(new THREE.Vector3(target.x, target.y, target.z));
+            cursor.position.copy(world);
+            cursor.visible = true;
+        }
+
+        renderer.domElement.addEventListener('pointerdown', onPointerDown);
+        renderer.domElement.addEventListener('pointermove', onPointerMove);
+
+        // ------------------------------------------------------------------
+        // 8. Palette UI (10 × 32)
+        // ------------------------------------------------------------------
+        const paletteContainer = document.getElementById('palette');
+        const selPalette = document.getElementById('sel-palette');
+        const swatchEl = document.getElementById('current-swatch');
+        const colorIndexEl = document.getElementById('color-index');
+
+        function renderPaletteBoxes() {
+            paletteContainer.innerHTML = '';
+            palette.forEach((hex, index) => {
+                const item = document.createElement('div');
+                item.className = 'color-item' + (index === colorIndex ? ' selected' : '');
+                item.style.backgroundColor = hex;
+                item.title = `#${index} ${hex}`;
+                item.addEventListener('click', () => setColorIndex(index));
+                paletteContainer.appendChild(item);
+            });
+            swatchEl.style.backgroundColor = hexAt(colorIndex);
+            colorIndexEl.textContent = `#${colorIndex}`;
+        }
+
+        function setColorIndex(i) {
+            colorIndex = Math.max(0, Math.min(31, i | 0));
+            renderPaletteBoxes();
+        }
+
+        function setPalette(name) {
+            if (!PALETTES[name]) return;
+            paletteName = name;
+            palette = PALETTES[name];
+            selPalette.value = name;
+            for (const part of PART_ORDER) rebuildPart(part);
+            if (entityKind === 'object') rebuildObjectMeshes();
+            setActivePart(activePart);
+            renderPaletteBoxes();
+        }
+
+        PALETTE_NAMES.forEach((name) => {
+            const opt = document.createElement('option');
+            opt.value = name;
+            opt.textContent = name;
+            selPalette.appendChild(opt);
+        });
+        selPalette.value = 'classic';
+        selPalette.addEventListener('change', () => setPalette(selPalette.value));
+        renderPaletteBoxes();
+
+        // ------------------------------------------------------------------
+        // 9. Part selection + transform sliders
+        // ------------------------------------------------------------------
+        const transformPanel = document.getElementById('transform-panel');
+        const posSliders = {
+            x: document.getElementById('pos-x'),
+            y: document.getElementById('pos-y'),
+            z: document.getElementById('pos-z'),
+        };
+        const scaleSliders = {
+            x: document.getElementById('scale-x'),
+            y: document.getElementById('scale-y'),
+            z: document.getElementById('scale-z'),
+        };
+        const posVals = {
+            x: document.getElementById('pos-x-val'),
+            y: document.getElementById('pos-y-val'),
+            z: document.getElementById('pos-z-val'),
+        };
+        const scaleVals = {
+            x: document.getElementById('scale-x-val'),
+            y: document.getElementById('scale-y-val'),
+            z: document.getElementById('scale-z-val'),
+        };
+
+        function updateTransformDisplay() {
+            posVals.x.textContent = parseFloat(posSliders.x.value).toFixed(1);
+            posVals.y.textContent = parseFloat(posSliders.y.value).toFixed(1);
+            posVals.z.textContent = parseFloat(posSliders.z.value).toFixed(1);
+            scaleVals.x.textContent = parseFloat(scaleSliders.x.value).toFixed(2);
+            scaleVals.y.textContent = parseFloat(scaleSliders.y.value).toFixed(2);
+            scaleVals.z.textContent = parseFloat(scaleSliders.z.value).toFixed(2);
+        }
+
+        function loadTransformSliders() {
+            const t = partTransforms[activePart];
+            if (!t) return;
+            posSliders.x.value = t.pos.x;
+            posSliders.y.value = t.pos.y;
+            posSliders.z.value = t.pos.z;
+            scaleSliders.x.value = t.scale.x;
+            scaleSliders.y.value = t.scale.y;
+            scaleSliders.z.value = t.scale.z;
+            updateTransformDisplay();
+        }
+
+        function applyTransform() {
+            const t = partTransforms[activePart];
+            if (!t) return;
+            t.pos.x = parseFloat(posSliders.x.value);
+            t.pos.y = parseFloat(posSliders.y.value);
+            t.pos.z = parseFloat(posSliders.z.value);
+            t.scale.x = parseFloat(scaleSliders.x.value);
+            t.scale.y = parseFloat(scaleSliders.y.value);
+            t.scale.z = parseFloat(scaleSliders.z.value);
+            updateAllTransforms();
+            updateTransformDisplay();
+            updateJoints();
+        }
+
+        for (const s of Object.values(posSliders)) s.addEventListener('input', applyTransform);
+        for (const s of Object.values(scaleSliders)) s.addEventListener('input', applyTransform);
+
+        document.getElementById('entity-name')?.addEventListener('change', () => readEntityName());
+        document.getElementById('entity-name')?.addEventListener('blur', () => readEntityName());
+
+        // ------------------------------------------------------------------
+        // 10. Tools
+        // ------------------------------------------------------------------
+        const btnPencil = document.getElementById('btn-pencil');
+        const btnEraser = document.getElementById('btn-eraser');
+        const btnFill = document.getElementById('btn-fill');
+        const btnEyedrop = document.getElementById('btn-eyedrop');
+        function setTool(newTool) {
+            tool = newTool;
+            btnPencil.classList.toggle('active-tool', tool === 'pencil');
+            btnEraser.classList.toggle('active-tool', tool === 'eraser');
+            btnFill.classList.toggle('active-tool', tool === 'fill');
+            btnEyedrop.classList.toggle('active-tool', tool === 'eyedrop');
+            const colors = {
+                pencil: [0x88ccff, 0x4488ff],
+                eraser: [0xff6666, 0xff4444],
+                fill: [0x66ffaa, 0x22aa66],
+                eyedrop: [0xffdd66, 0xccaa22],
+            };
+            const [col, em] = colors[tool] || colors.pencil;
+            cursorMat.color.setHex(col);
+            cursorMat.emissive.setHex(em);
+        }
+        btnPencil.addEventListener('click', () => setTool('pencil'));
+        btnEraser.addEventListener('click', () => setTool('eraser'));
+        btnFill.addEventListener('click', () => setTool('fill'));
+        btnEyedrop.addEventListener('click', () => setTool('eyedrop'));
+        document.getElementById('btn-kind-character').addEventListener('click', () => {
+            if (currentPreset.kind === 'object' || PART_ORDER.length === 0) {
+                applyCreaturePreset(getPreset('biped'));
+            }
+            setEntityKind('character');
+        });
+        document.getElementById('btn-kind-object').addEventListener('click', () => setEntityKind('object'));
+        document.getElementById('sel-object-size').addEventListener('change', (e) => {
+            const n = parseInt(e.target.value, 10);
+            objectGrid.x = n;
+            objectGrid.z = n;
+            // Drop voxels outside the new footprint.
+            objectVoxels = objectVoxels.filter((v) => inObjectBounds(v.x, v.y, v.z));
+            rebuildBoundsMarkers(n, n);
+            rebuildObjectMeshes();
+        });
+        document.getElementById('sel-object-height').addEventListener('change', (e) => {
+            objectGrid.y = parseInt(e.target.value, 10);
+            objectVoxels = objectVoxels.filter((v) => inObjectBounds(v.x, v.y, v.z));
+            rebuildObjectMeshes();
+        });
+        document.getElementById('btn-new').addEventListener('click', () => {
+            if (!confirm(entityKind === 'object'
+                ? '¿Vaciar el objeto actual?'
+                : '¿Resetear el personaje al modelo base?')) return;
+            if (entityKind === 'object') {
+                objectVoxels = [{ x: 0, y: 0, z: 0, c: colorIndex }];
+                rebuildObjectMeshes();
+            } else {
+                const fresh = generateBaseVoxels();
+                for (const name of PART_ORDER) partVoxels[name] = fresh[name];
+                for (const name of PART_ORDER) {
+                    partTransforms[name] = { pos: { x: 0, y: 0, z: 0 }, scale: { x: 1, y: 1, z: 1 } };
+                    rebuildPart(name);
+                }
+                resetJoints();
+                updateAllTransforms();
+                setActivePart(PART_ORDER[0] || 'torso');
+            }
+        });
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'b' || e.key === 'B') setTool('pencil');
+            if (e.key === 'd' || e.key === 'D') setTool('eraser');
+            if (e.key === 'f' || e.key === 'F') setTool('fill');
+            if (e.key === 'i' || e.key === 'I' || e.key === 'g' || e.key === 'G') setTool('eyedrop');
+            if (e.key >= '1' && e.key <= '9') setColorIndex(parseInt(e.key, 10) - 1);
+            if (e.key === '0') setColorIndex(9);
+        });
+
+        // ------------------------------------------------------------------
+        // 11. Walk
+        // ------------------------------------------------------------------
+        const btnWalk = document.getElementById('btn-walk');
+        btnWalk.addEventListener('click', () => {
+            walkActive = !walkActive;
+            btnWalk.classList.toggle('active', walkActive);
+        });
+
+        function animateWalk(delta) {
+            if (!walkActive || entityKind !== 'character' || !currentPreset.hasWalk) return;
+            walkTime += delta;
+            if (typeof currentPreset.walk === 'function') {
+                currentPreset.walk(jointRotations, walkTime);
+            }
+            updateJoints();
+            updateRotationSlidersValues();
+        }
+
+        // ------------------------------------------------------------------
+        // 12. Reset
+        // ------------------------------------------------------------------
+        document.getElementById('btn-reset').addEventListener('click', () => {
+            walkActive = false;
+            btnWalk.classList.remove('active');
+            resetJoints();
+            for (const name of PART_ORDER) {
+                partTransforms[name].pos = { x: 0, y: 0, z: 0 };
+                partTransforms[name].scale = { x: 1, y: 1, z: 1 };
+            }
+            updateAllTransforms();
+            loadTransformSliders();
+            setActivePart(activePart);
+        });
+
+        // ------------------------------------------------------------------
+        // 13. Export / import (parts + local voxels + animation)
+        // ------------------------------------------------------------------
+        function exportModel() {
+            const id = readEntityName();
+            let data;
+            if (entityKind === 'object') {
+                data = {
+                    version: '1.0',
+                    kind: 'object',
+                    preset: 'object',
+                    id,
+                    grid: { ...objectGrid },
+                    palette: paletteName,
+                    voxels: objectVoxels.map((v) => ({ x: v.x, y: v.y, z: v.z, c: v.c })),
+                };
+            } else {
+                const g = charGrid();
+                data = {
+                    version: '1.0',
+                    kind: 'character',
+                    preset: currentPreset.id,
+                    id,
+                    grid: { ...g },
+                    torso_y: PART_CONFIG.torso?.pivot?.y ?? 20,
+                    palette: paletteName,
+                    parts: {},
+                    animation: { ...jointRotations },
+                };
+                for (const name of PART_ORDER) {
+                    const cfg = PART_CONFIG[name];
+                    data.parts[name] = {
+                        parent: cfg.parent,
+                        offset: {
+                            x: groupBaseOffset(name).x,
+                            y: groupBaseOffset(name).y,
+                            z: groupBaseOffset(name).z,
+                        },
+                        transform: structuredClone(partTransforms[name]),
+                        voxels: partVoxels[name].map((v) => ({
+                            x: v.x, y: v.y, z: v.z, c: v.c,
+                        })),
+                    };
+                }
+            }
+            const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `${id}.json`;
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+
+        function groupBaseOffset(name) {
+            return partGroups[name].userData.basePos;
+        }
+
+        function importModel(jsonData) {
+            try {
+                const data = JSON.parse(jsonData);
+                // Archivo de animación (fotogramas en segundos + modelo referido).
+                if (data.kind === 'animation' || (Array.isArray(data.frames) && data.model)) {
+                    loadAnimClip(data);
+                    return;
+                }
+                if (data.palette && PALETTES[data.palette]) {
+                    paletteName = data.palette;
+                    palette = PALETTES[data.palette];
+                    selPalette.value = data.palette;
+                }
+                entityId = data.id || entityId;
+                syncNameField();
+
+                const isObject = data.kind === 'object'
+                    || data.preset === 'object'
+                    || (!data.parts && Array.isArray(data.voxels));
+                if (isObject) {
+                    currentPreset = getPreset('object');
+                    const skObj = loadPresetSkeleton(currentPreset);
+                    PART_CONFIG = skObj.cfg;
+                    PART_ORDER = skObj.order;
+                    jointRotations = emptyJointRotations();
+                    if (data.grid) {
+                        objectGrid = {
+                            x: data.grid.x || 16,
+                            y: data.grid.y || 16,
+                            z: data.grid.z || data.grid.x || 16,
+                        };
+                        document.getElementById('sel-object-size').value = String(objectGrid.x);
+                        document.getElementById('sel-object-height').value = String(objectGrid.y);
+                    }
+                    objectVoxels = (data.voxels || []).map((v) => {
+                        let c = 0;
+                        if (typeof v.c === 'number') c = v.c;
+                        else if (v.color) c = nearestIndex(v.color);
+                        return {
+                            x: Math.round(v.x),
+                            y: Math.round(v.y),
+                            z: Math.round(v.z),
+                            c: Math.max(0, Math.min(31, c | 0)),
+                        };
+                    }).filter((v) => inObjectBounds(v.x, v.y, v.z));
+                    setEntityKind('object', { keepVoxels: true });
+                    rebuildObjectMeshes();
+                    renderPaletteBoxes();
+                    return;
+                }
+
+                if (!data.parts) throw new Error('Formato inválido (falta parts o voxels)');
+
+                const presetId = data.preset || 'biped';
+                applyCreaturePreset(getPreset(presetId), { keepName: true });
+                for (const name of PART_ORDER) {
+                    if (!data.parts[name]) continue;
+                    const p = data.parts[name];
+                    partVoxels[name] = (p.voxels || []).map((v) => {
+                        let c = 0;
+                        if (typeof v.c === 'number') c = v.c;
+                        else if (v.color) c = nearestIndex(v.color);
+                        return {
+                            x: Math.round(v.x),
+                            y: Math.round(v.y),
+                            z: Math.round(v.z),
+                            c: Math.max(0, Math.min(31, c | 0)),
+                        };
+                    });
+                    if (p.transform) {
+                        partTransforms[name] = {
+                            pos: { ...p.transform.pos },
+                            scale: { ...p.transform.scale },
+                        };
+                    }
+                    rebuildPart(name);
+                }
+                if (data.animation) Object.assign(jointRotations, data.animation);
+                setEntityKind('character');
+                updateAllTransforms();
+                updateJoints();
+                loadTransformSliders();
+                renderPaletteBoxes();
+                setActivePart(PART_ORDER.includes(activePart) ? activePart : (PART_ORDER[0] || 'torso'));
+            } catch (e) {
+                alert('Error al cargar: ' + e.message);
+            }
+        }
+
+        document.getElementById('btn-export').addEventListener('click', exportModel);
+        document.getElementById('btn-import').addEventListener('click', () => {
+            document.getElementById('file-input').click();
+        });
+        document.getElementById('file-input').addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = (ev) => {
+                importModel(ev.target.result);
+                e.target.value = '';
+            };
+            reader.readAsText(file);
+        });
+
+        // =====================================================================
+        // NUEVO SISTEMA DE ANIMACIÓN (fotogramas clave + movimiento)
+        // =====================================================================
+
+        // Estructura de datos
+        let animData = {
+            frames: [],       // { t: seconds, type: 'key'|'tween', easing: 'linear'|..., duration: seconds, pose: {} }
+            loop: true,
+            duration: 2.0,    // duración total (no se encoge por debajo del mínimo)
+        };
+        let animPlaying = false;
+        let animTime = 0;
+        let selectedFrameIndex = -1;
+        let animSpeed = 1.0;
+        const MIN_TIMELINE_S = 2.0;
+
+        // Funciones de easing
+        function easeLinear(t) { return t; }
+        function easeIn(t) { return t * t; }
+        function easeOut(t) { return 1 - (1 - t) * (1 - t); }
+        function easeInOut(t) { return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2; }
+        function easeBounce(t) {
+            const n1 = 7.5625, d1 = 2.75;
+            if (t < 1 / d1) return n1 * t * t;
+            else if (t < 2 / d1) { t -= 1.5 / d1; return n1 * t * t + 0.75; }
+            else if (t < 2.5 / d1) { t -= 2.25 / d1; return n1 * t * t + 0.9375; }
+            else { t -= 2.625 / d1; return n1 * t * t + 0.984375; }
+        }
+        function easeElastic(t) {
+            const c4 = (2 * Math.PI) / 3;
+            return t === 0 ? 0 : t === 1 ? 1 : Math.pow(2, -10 * t) * Math.sin((t * 10 - 0.75) * c4) + 1;
+        }
+        function getEasing(name) {
+            const map = {
+                linear: easeLinear,
+                easeIn: easeIn,
+                easeOut: easeOut,
+                easeInOut: easeInOut,
+                bounce: easeBounce,
+                elastic: easeElastic,
+            };
+            return map[name] || easeLinear;
+        }
+
+        function lerpPoseMaps(a, b, k) {
+            const out = {};
+            const keys = new Set([
+                ...Object.keys(a || {}),
+                ...Object.keys(b || {}),
+                ...Object.keys(jointRotations || {}),
+            ]);
+            for (const key of keys) {
+                const va = (a && a[key]) || 0;
+                const vb = (b && b[key]) || 0;
+                out[key] = va + (vb - va) * k;
+            }
+            return out;
+        }
+
+        // Ordenar fotogramas por tiempo (la duración solo crece o respeta el mínimo)
+        function sortFrames() {
+            animData.frames.sort((a, b) => a.t - b.t);
+            let end = 0;
+            for (const f of animData.frames) {
+                end = Math.max(end, f.t);
+                if (f.type === 'tween') {
+                    end = Math.max(end, f.t + (Number(f.duration) || 0));
+                }
+            }
+            animData.duration = Math.max(end, animData.duration || 0, MIN_TIMELINE_S);
+        }
+
+        function playheadTime() {
+            const dur = Math.max(animData.duration || MIN_TIMELINE_S, 1e-4);
+            let t = Number(animTime) || 0;
+            if (animData.loop) {
+                t = ((t % dur) + dur) % dur;
+            } else {
+                t = Math.min(Math.max(t, 0), dur);
+            }
+            return t;
+        }
+
+        // Obtener pose interpolada en un tiempo t
+        function getPoseAt(t) {
+            if (!animData.frames.length) return { ...jointRotations };
+            const frames = animData.frames;
+            const dur = Math.max(animData.duration || MIN_TIMELINE_S, 1e-4);
+            if (t >= dur) {
+                if (animData.loop) t = ((t % dur) + dur) % dur;
+                else return { ...(frames[frames.length - 1].pose || {}) };
+            }
+            if (t <= frames[0].t) return { ...(frames[0].pose || {}) };
+
+            for (let i = 0; i < frames.length; i++) {
+                const f0 = frames[i];
+                const f1 = frames[i + 1];
+                if (!f1) {
+                    if (t >= f0.t) {
+                        if (f0.type === 'tween') {
+                            const span = Math.max(Number(f0.duration) || 0.5, 1e-6);
+                            const localT = Math.min((t - f0.t) / span, 1);
+                            const eased = getEasing(f0.easing || 'linear')(localT);
+                            let prevPose = null;
+                            for (let j = i - 1; j >= 0; j--) {
+                                if (frames[j].type === 'key') { prevPose = frames[j].pose; break; }
+                            }
+                            if (!prevPose) return { ...(f0.pose || {}) };
+                            return lerpPoseMaps(prevPose, f0.pose, eased);
+                        }
+                        return { ...(f0.pose || {}) };
+                    }
+                    continue;
+                }
+                if (t >= f0.t && t < f1.t) {
+                    const span = f1.t - f0.t;
+                    if (span <= 1e-8) return { ...(f0.pose || {}) };
+                    let localT = (t - f0.t) / span;
+                    if (f0.type === 'tween') {
+                        localT = getEasing(f0.easing || 'linear')(localT);
+                        let prevPose = null;
+                        for (let j = i - 1; j >= 0; j--) {
+                            if (frames[j].type === 'key') { prevPose = frames[j].pose; break; }
+                        }
+                        if (!prevPose) prevPose = f0.pose;
+                        return lerpPoseMaps(prevPose, f1.pose, localT);
+                    }
+                    return lerpPoseMaps(f0.pose, f1.pose, localT);
+                }
+            }
+            return { ...(frames[frames.length - 1].pose || {}) };
+        }
+
+        // Aplicar pose al personaje
+        function applyPose(pose) {
+            if (!pose) return;
+            Object.assign(jointRotations, pose);
+            updateJoints();
+            updateRotationSlidersValues();
+        }
+
+        // Actualizar la línea de tiempo (canvas)
+        function renderTimeline() {
+            const canvas = document.getElementById('timeline-canvas');
+            if (!canvas) return;
+            const cssW = Math.max(1, Math.floor(canvas.clientWidth || 800));
+            if (canvas.width !== cssW) canvas.width = cssW;
+            const ctx = canvas.getContext('2d');
+            const w = canvas.width, h = canvas.height;
+            ctx.clearRect(0, 0, w, h);
+            const duration = Math.max(animData.duration || MIN_TIMELINE_S, 1e-4);
+            const scale = w / duration;
+            // Dibujar grid
+            ctx.strokeStyle = '#444466';
+            ctx.lineWidth = 0.5;
+            const step = duration > 4 ? 0.5 : 0.2;
+            for (let t = 0; t <= duration + 1e-6; t += step) {
+                const x = t * scale;
+                ctx.beginPath();
+                ctx.moveTo(x, 0);
+                ctx.lineTo(x, h);
+                ctx.stroke();
+            }
+            // Dibujar fotogramas
+            for (let i = 0; i < animData.frames.length; i++) {
+                const f = animData.frames[i];
+                const x = f.t * scale;
+                const isKey = f.type === 'key';
+                const isSelected = (i === selectedFrameIndex);
+                ctx.fillStyle = isKey ? '#4a9eff' : '#ffaa44';
+                if (isSelected) ctx.shadowColor = '#ffffff';
+                else ctx.shadowColor = 'transparent';
+                ctx.shadowBlur = isSelected ? 10 : 0;
+                ctx.beginPath();
+                ctx.arc(x, h / 2, isKey ? 8 : 6, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.shadowBlur = 0;
+                // Etiqueta de tiempo
+                ctx.fillStyle = '#ccd';
+                ctx.font = '9px sans-serif';
+                ctx.textAlign = 'center';
+                ctx.fillText(f.t.toFixed(1), x, 14);
+            }
+            // Playhead (porcentaje del contenedor CSS, no píxeles del canvas interno)
+            const playhead = document.getElementById('playhead');
+            if (playhead) {
+                const pct = (playheadTime() / duration) * 100;
+                playhead.style.left = `${pct}%`;
+            }
+        }
+
+        // Actualizar lista de fotogramas (UI)
+        function updateFrameList() {
+            const list = document.getElementById('frame-list');
+            if (!list) return;
+            list.innerHTML = '';
+            animData.frames.forEach((f, idx) => {
+                const div = document.createElement('div');
+                div.style.cssText = `
+                    padding: 2px 10px;
+                    border-radius: 12px;
+                    background: ${idx === selectedFrameIndex ? '#4a9eff' : 'rgba(255,255,255,0.06)'};
+                    border: 1px solid ${idx === selectedFrameIndex ? '#4a9eff' : 'rgba(255,255,255,0.1)'};
+                    color: ${idx === selectedFrameIndex ? '#fff' : '#aaa'};
+                    font-size: 10px;
+                    cursor: pointer;
+                    display: flex;
+                    align-items: center;
+                    gap: 4px;
+                `;
+                div.textContent = `${f.t.toFixed(1)}s ${f.type === 'key' ? '🔑' : '➡️'}${f.easing ? ' '+f.easing : ''}`;
+                div.addEventListener('click', () => {
+                    selectedFrameIndex = idx;
+                    updateFrameList();
+                    renderTimeline();
+                    // Mostrar la pose de este fotograma
+                    applyPose(f.pose);
+                });
+                list.appendChild(div);
+            });
+        }
+
+        // Añadir fotograma clave (en el tiempo actual)
+        function addKeyframe() {
+            let t = playheadTime();
+            // Si existe un fotograma clave en ese tiempo, reemplazar
+            const existing = animData.frames.findIndex(
+                (f) => f.type === 'key' && Math.abs(f.t - t) < 0.01,
+            );
+            const pose = { ...jointRotations };
+            const newFrame = { t, type: 'key', pose };
+            if (existing >= 0) {
+                animData.frames[existing] = newFrame;
+            } else {
+                animData.frames.push(newFrame);
+            }
+            // Deja margen después del último key para seguir animando
+            animData.duration = Math.max(animData.duration, t + 0.5, MIN_TIMELINE_S);
+            sortFrames();
+            selectedFrameIndex = animData.frames.findIndex((f) => f === newFrame);
+            updateFrameList();
+            renderTimeline();
+        }
+
+        // Añadir fotograma de movimiento (tween)
+        function addTween() {
+            let t = playheadTime();
+            const duration = parseFloat(document.getElementById('anim-tween-duration').value) || 0.5;
+            const easing = document.getElementById('anim-easing').value || 'linear';
+            // Buscar el keyframe anterior más cercano
+            let prevKey = null;
+            for (let i = animData.frames.length - 1; i >= 0; i--) {
+                if (animData.frames[i].type === 'key' && animData.frames[i].t <= t + 1e-6) {
+                    prevKey = animData.frames[i];
+                    break;
+                }
+            }
+            if (!prevKey) {
+                alert('Debe existir al menos un fotograma clave antes del punto actual. Scrub la timeline o añade ➕ Clave primero.');
+                return;
+            }
+            // Evitar apilar un tween exactamente encima de otro fotograma
+            if (animData.frames.some((f) => Math.abs(f.t - t) < 0.01)) {
+                t = t + 0.05;
+            }
+            const pose = { ...prevKey.pose };
+            const newFrame = { t, type: 'tween', duration, easing, pose };
+            animData.frames.push(newFrame);
+            animData.duration = Math.max(animData.duration, t + duration, MIN_TIMELINE_S);
+            sortFrames();
+            selectedFrameIndex = animData.frames.findIndex((f) => f === newFrame);
+            updateFrameList();
+            renderTimeline();
+        }
+
+        // Eliminar fotograma seleccionado
+        function deleteSelectedFrame() {
+            if (selectedFrameIndex < 0 || selectedFrameIndex >= animData.frames.length) return;
+            animData.frames.splice(selectedFrameIndex, 1);
+            selectedFrameIndex = Math.min(selectedFrameIndex, animData.frames.length - 1);
+            sortFrames();
+            updateFrameList();
+            renderTimeline();
+            if (selectedFrameIndex >= 0) {
+                applyPose(animData.frames[selectedFrameIndex].pose);
+            }
+        }
+
+        // Duplicar fotograma seleccionado
+        function duplicateFrame() {
+            if (selectedFrameIndex < 0 || selectedFrameIndex >= animData.frames.length) return;
+            const src = animData.frames[selectedFrameIndex];
+            const newT = src.t + 0.1;
+            const newFrame = {
+                t: newT,
+                type: src.type,
+                duration: src.duration,
+                easing: src.easing,
+                pose: { ...src.pose },
+            };
+            animData.frames.push(newFrame);
+            sortFrames();
+            selectedFrameIndex = animData.frames.findIndex(f => f === newFrame);
+            updateFrameList();
+            renderTimeline();
+            applyPose(newFrame.pose);
+        }
+
+        // Reproducir / pausar
+        function togglePlay() {
+            animPlaying = !animPlaying;
+            document.getElementById('anim-btn-play').textContent = animPlaying ? '⏸' : '▶';
+        }
+
+        function stopAnim() {
+            animPlaying = false;
+            animTime = 0;
+            document.getElementById('anim-btn-play').textContent = '▶';
+            // Aplicar primer fotograma si existe
+            if (animData.frames.length) {
+                applyPose(animData.frames[0].pose);
+            }
+            renderTimeline();
+        }
+
+        // Exportar animación (JSON)
+        function exportAnimation() {
+            if (animData.frames.length < 2) {
+                alert('Necesitas al menos 2 fotogramas para exportar una animación.');
+                return;
+            }
+            const id = readEntityName();
+            const data = {
+                version: '1.0',
+                kind: 'animation',
+                id: `${id}_anim`,
+                model: `assets/entities/${id}.json`,
+                duration_s: Math.round(animData.duration * 10000) / 10000,
+                loop: animData.loop,
+                frames: animData.frames.map(f => ({
+                    t: Math.round(f.t * 10000) / 10000,
+                    type: f.type,
+                    duration: f.type === 'tween' ? Math.round(f.duration * 10000) / 10000 : undefined,
+                    easing: f.type === 'tween' ? f.easing : undefined,
+                    pose: { ...f.pose }
+                }))
+            };
+            const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `${id}_anim.json`;
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+
+        function loadAnimClip(data) {
+            animData.frames = (data.frames || [])
+                .map((f) => ({
+                    t: Number(f.t) || 0,
+                    type: f.type === 'tween' ? 'tween' : 'key',
+                    duration: f.duration != null ? Number(f.duration) : undefined,
+                    easing: f.easing || undefined,
+                    pose: { ...(f.pose || {}) },
+                }))
+                .sort((a, b) => a.t - b.t);
+            if (typeof data.loop === 'boolean') {
+                animData.loop = data.loop;
+                const loopEl = document.getElementById('anim-loop');
+                if (loopEl) loopEl.checked = data.loop;
+            }
+            if (data.duration_s > 0) {
+                animData.duration = Math.max(data.duration_s, MIN_TIMELINE_S);
+            }
+            sortFrames();
+            animTime = 0;
+            animPlaying = false;
+            selectedFrameIndex = animData.frames.length ? 0 : -1;
+            const playBtn = document.getElementById('anim-btn-play');
+            if (playBtn) playBtn.textContent = '▶';
+            updateFrameList();
+            renderTimeline();
+            if (selectedFrameIndex >= 0) {
+                applyPose(animData.frames[selectedFrameIndex].pose);
+            }
+            const panel = document.getElementById('anim-panel');
+            if (panel) panel.style.display = 'flex';
+            alert(`Animación "${data.id || '?'}" cargada (${animData.frames.length} fotogramas, modelo: ${data.model || '?'}).`);
+        }
+
+        // ------------------------------------------------------------------
+        // Eventos del panel de animación
+        // ------------------------------------------------------------------
+        function setupAnimPanel() {
+            // Toggle panel (botón en la barra superior)
+            const animToggle = document.createElement('button');
+            animToggle.className = 'action-btn';
+            animToggle.id = 'btn-anim-toggle';
+            animToggle.textContent = '🎬 Anim';
+            animToggle.style.marginLeft = '8px';
+            document.getElementById('top-bar').appendChild(animToggle);
+            animToggle.addEventListener('click', () => {
+                const panel = document.getElementById('anim-panel');
+                panel.style.display = panel.style.display === 'none' || !panel.style.display ? 'flex' : 'none';
+                if (panel.style.display === 'flex') renderTimeline();
+            });
+
+            // Controles
+            document.getElementById('anim-btn-play').addEventListener('click', togglePlay);
+            document.getElementById('anim-btn-stop').addEventListener('click', stopAnim);
+            document.getElementById('anim-btn-add-key').addEventListener('click', addKeyframe);
+            document.getElementById('anim-btn-add-tween').addEventListener('click', addTween);
+            document.getElementById('anim-btn-duplicate').addEventListener('click', duplicateFrame);
+            document.getElementById('anim-btn-delete').addEventListener('click', deleteSelectedFrame);
+            document.getElementById('anim-btn-export').addEventListener('click', exportAnimation);
+
+            // Velocidad
+            const speedSlider = document.getElementById('anim-speed');
+            const speedLabel = document.getElementById('anim-speed-label');
+            speedSlider.addEventListener('input', () => {
+                animSpeed = parseFloat(speedSlider.value);
+                speedLabel.textContent = animSpeed.toFixed(1);
+            });
+
+            // Loop
+            document.getElementById('anim-loop').addEventListener('change', (e) => {
+                animData.loop = e.target.checked;
+            });
+
+            // Click en la línea de tiempo para mover el cabezal de reproducción
+            const timeline = document.getElementById('timeline');
+            const scrubToEvent = (e) => {
+                const rect = timeline.getBoundingClientRect();
+                const x = Math.min(1, Math.max(0, (e.clientX - rect.left) / Math.max(rect.width, 1)));
+                const duration = Math.max(animData.duration || MIN_TIMELINE_S, 1e-4);
+                animTime = x * duration;
+                if (animData.frames.length) {
+                    applyPose(getPoseAt(animTime));
+                }
+                renderTimeline();
+            };
+            timeline.addEventListener('click', scrubToEvent);
+
+            // Arrastrar el playhead
+            let dragging = false;
+            timeline.addEventListener('mousedown', (e) => {
+                dragging = true;
+                scrubToEvent(e);
+            });
+            window.addEventListener('mousemove', (e) => {
+                if (!dragging) return;
+                scrubToEvent(e);
+            });
+            window.addEventListener('mouseup', () => { dragging = false; });
+
+            // Si se edita un slider de rotación, actualizar el fotograma seleccionado
+            for (const slider of Object.values(rotSliders)) {
+                if (slider) {
+                    slider.addEventListener('input', () => {
+                        if (selectedFrameIndex >= 0 && selectedFrameIndex < animData.frames.length) {
+                            const frame = animData.frames[selectedFrameIndex];
+                            // Actualizar la pose con las rotaciones actuales
+                            for (const axis of ['x', 'y', 'z']) {
+                                const key = jointKey(activePart, axis);
+                                frame.pose[key] = parseFloat(rotSliders[axis].value);
+                            }
+                            updateFrameList();
+                            renderTimeline();
+                        }
+                    });
+                }
+            }
+
+            // Inicializar con un fotograma clave por defecto
+            if (animData.frames.length === 0) {
+                const pose = { ...jointRotations };
+                animData.frames.push({ t: 0, type: 'key', pose });
+                sortFrames();
+                selectedFrameIndex = 0;
+                updateFrameList();
+                renderTimeline();
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // 14. Loop
+        // ------------------------------------------------------------------
+        window.addEventListener('resize', () => {
+            const w = container.clientWidth;
+            const h = container.clientHeight;
+            camera.aspect = w / h;
+            camera.updateProjectionMatrix();
+            renderer.setSize(w, h);
+        });
+
+        const clock = new THREE.Clock();
+        function render() {
+            requestAnimationFrame(render);
+            const rawDt = clock.getDelta();
+            // Animación walk (si está activa, no interferir)
+            if (!animPlaying && walkActive) {
+                animateWalk(rawDt);
+            }
+            // Reproducción de animación
+            if (animPlaying) {
+                const dur = Math.max(animData.duration || MIN_TIMELINE_S, 1e-4);
+                animTime += rawDt * animSpeed;
+                if (animData.loop) {
+                    animTime = ((animTime % dur) + dur) % dur;
+                } else if (animTime >= dur) {
+                    animTime = dur;
+                    animPlaying = false;
+                    document.getElementById('anim-btn-play').textContent = '▶';
+                }
+                applyPose(getPoseAt(animTime));
+                renderTimeline();
+            }
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        try {
+            syncNameField();
+            if (currentPreset.kind === 'object') {
+                if (currentPreset.grid) {
+                    objectGrid = { ...currentPreset.grid };
+                    document.getElementById('sel-object-size').value = String(objectGrid.x);
+                    document.getElementById('sel-object-height').value = String(objectGrid.y);
+                }
+                setEntityKind('object');
+            } else {
+                rebuildPartButtons();
+                setEntityKind('character');
+                loadTransformSliders();
+                updateJoints();
+            }
+            setupAnimPanel();
+        } catch (err) {
+            console.error('Init editor:', err);
+        }
+        render();
+    </script>
+</body>
+</html>

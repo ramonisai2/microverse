@@ -1,1 +1,10 @@
 /target
+/saves
+.aider*
+run_out.txt
+run_err.txt
+run_err_check.txt
+run_live.txt
+run_crash_log.txt
+check_out.txt
+test_out.txt

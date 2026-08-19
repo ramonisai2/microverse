@@ -1,0 +1,320 @@
+RENDER DE CUEVAS Y PREVENCIÓN DE GLITCHES
+==========================================
+
+Objetivo
+--------
+Este documento reúne las reglas que controlan cómo se ve el juego dentro y
+debajo de las cuevas. Deben mantenerse juntas para evitar agujeros, popping,
+techos invisibles, hierba bajo tierra, héroe oculto y cambios bruscos de cámara.
+
+
+1. GENERACIÓN Y TECHO DE LA CUEVA
+---------------------------------
+Archivos principales:
+- src/caves.rs
+- src/world.rs
+
+Flujo:
+1. world.rs rellena las columnas densas.
+2. caves::carve_chunk talla cámaras, pasillos y escaleras.
+3. Después se colocan cofres.
+4. Finalmente se generan árboles y hierba.
+
+Invariantes:
+- Nunca tallar Y <= 0. Y=0 es bedrock.
+- Actualmente también se conserva Y=1.
+- max_carve_y(surface) = surface - 2.
+- Nunca tallar la superficie ni el bloque inmediatamente inferior.
+- Para limitar el tallado se usa terrain_height(x,z), la altura natural.
+- No usar column_height para ese cálculo después de tallar: al perforar una
+  columna, column_height puede bajar hasta el suelo denso de la cueva.
+- Las cámaras demasiado cercanas a la superficie se descartan.
+- El volumen tallado debe mantenerse entre 7% y 13%, con objetivo de 10%.
+
+remove_voxel sobre una celda interior llama a punch_dense_column. Los bloques
+que quedan por encima del hueco pasan a extras y forman el techo visible. No
+deben borrarse ni tratarse como aire durante el render cercano.
+
+
+2. ALTURA NATURAL FRENTE A ALTURA MODIFICADA
+--------------------------------------------
+Regla crítica:
+- terrain_height = superficie natural antes de excavar.
+- column_height = parte densa continua que queda después de excavar.
+
+Usar terrain_height para:
+- Superficie del shader.
+- Fog y profundidad subterránea.
+- Burial/confine.
+- Límite superior del tallado.
+- Colocación superficial de árboles y hierba.
+- Pendiente natural mediante terrain_slope.
+
+Usar column_height para:
+- Estado real de la parte densa de una columna.
+- Operaciones internas de edición y reconstrucción.
+
+Si se usa column_height para el look subterráneo, el shader puede creer que el
+suelo de la cueva es la superficie exterior. Eso apaga el cutaway, cambia el
+fog y puede plantar vegetación dentro de la cueva.
+
+
+3. LOOK SUBTERRÁNEO
+-------------------
+Archivos principales:
+- src/shader.wgsl
+- src/render.rs
+- src/world.rs
+- src/camera.rs
+- src/main.rs
+
+El look no usa un pass exclusivo de cueva. Combina:
+- Fog por altura.
+- Wire/hatch de terreno bajo superficie.
+- Cutaway Bayer alrededor del jugador.
+- Screen-door del héroe ocluido.
+- Cámara HD-2D acercada por confine.
+
+Fog:
+- world::fog_color_for_altitude compara eye_y con terrain_height.
+- Bajo tierra el color progresa hacia [0.01, 0.01, 0.02].
+- El shader reduce el fog aplicado al terreno subterráneo para conservar
+  lectura de paredes.
+
+Cutaway:
+- ENABLE_DIG_CUTAWAY habilita una apertura radial alrededor de hd2d_focus.
+- El recorte usa confine y profundidad bajo la superficie.
+- El borde usa Bayer 8x8 y transición vertical suave.
+- El mismo criterio visual debe servir para tierra, techo y otros oclusores.
+- No añadir otro fade exclusivo para cuevas: el proyecto exige unificar los
+  efectos que permiten ver al jugador detrás de cualquier oclusor.
+
+Héroe ocluido:
+- ENABLE_PLAYER_SCREEN_DOOR muestra la silueta detrás de hojas o terreno.
+- ENABLE_PLAYER_OCCLUDED_BAYER controla el Bayer compartido.
+- El stencil marca donde el héroe ya ganó el depth test.
+- El pass ocluido solo dibuja con stencil 0 para evitar X-ray sobre sí mismo.
+- El depth reset y LessEqual permiten mostrar la silueta tras el oclusor.
+
+
+4. CÁMARA DENTRO DE CUEVAS
+--------------------------
+World::hd2d_confine_factor mide:
+- Profundidad bajo la superficie natural.
+- Techo sobre el jugador.
+- Paredes cercanas.
+
+main.rs pasa confine a camera::follow_hd2d_framed.
+Al aumentar confine, la cámara se acerca hasta la distancia confinada.
+
+Invariantes anti-glitch:
+- El streaming y el LOD deben seguir camera.hd2d_focus(), no la posición de la
+  lente que se acerca y se aleja.
+- mesh_stream_origin implementa esta regla.
+- Si el streaming siguiera la lente, el pull-in de cueva podría descargar o
+  cambiar de LOD chunks visibles y producir agujeros de 16x16.
+
+
+5. MESH, CULLING Y LOD
+----------------------
+Archivo principal:
+- src/render.rs
+
+Render cercano y medio, bands 0-2:
+- greedy_mesh_solid_dirt genera caras de sólidos.
+- Los techos conservados en extras participan en el mesh.
+- Material::Chest también se incluye como sólido.
+- Los minerales y el cofre usan su color propio.
+
+Render lejano, band 3:
+- heightmap_mesh_chunk crea un HLOD de superficie con faldones.
+- HLOD representa la cáscara exterior y usa terrain_height mediante
+  hlod_column_height. No usa column_height post-punch.
+- Esto mantiene sellada la tapa natural de cuevas lejanas y evita que parezcan
+  pozos abiertos cuando el techo real está almacenado en extras.
+- Test: far_hlod_keeps_natural_lid_after_column_is_punched.
+
+Culling:
+- Las caras internas entre sólidos no se dibujan.
+- Un vecino Reserved se trata como sólido horizontalmente para no mostrar una
+  pared/wire temporal mientras el chunk termina de generarse.
+- Al descargar un chunk se marcan vecinos para remesh y sellar caras compartidas.
+
+
+6. STREAMING Y REMESH
+---------------------
+Archivo principal:
+- src/world.rs
+- src/render.rs
+
+Estados:
+- Reserved: reservado, todavía no listo.
+- Filled: generado.
+- PendingUnload: conserva contenido durante el periodo de gracia.
+
+Reglas:
+- Las ediciones del jugador usan dirty_edits y tienen prioridad alta.
+- Los cambios de streaming usan dirty_stream.
+- Un remesh suave conserva el mesh GPU anterior hasta subir el reemplazo.
+- stream_keep_dist y UNLOAD_GRACE_FRAMES evitan descargar chunks visibles.
+- El Chunk Guardian prioriza huecos en el anillo de mesh.
+- Al descargar, los vecinos se remeshean para no dejar caras abiertas.
+
+Síntomas si esto se rompe:
+- Agujeros cuadrados de 16x16.
+- Bloques fantasma después de excavar.
+- Wireframe visible en bordes de chunks.
+- Popping al acercarse o alejarse dentro de una cámara.
+
+
+7. COFRES RESERVADOS
+--------------------
+Archivos:
+- src/caves.rs
+- src/world.rs
+- src/render.rs
+- src/items.rs
+
+Reglas:
+- Material::Chest es sólido.
+- Voxel::chest se guarda en extras.
+- Se coloca en el centro del suelo de aproximadamente 20% de las cámaras.
+- Debe quedar aire en el bloque superior.
+- Se renderiza mediante el greedy mesh con color [0.55, 0.32, 0.12].
+- Se puede romper con coste similar a madera.
+- Todavía no existe UI, apertura ni loot.
+
+
+8. ORDEN DE DIBUJO IMPORTANTE
+-----------------------------
+Orden conceptual:
+1. Terreno y techo.
+2. Héroe sólido, marcando stencil.
+3. Héroe ocluido donde stencil == 0.
+4. Hierba.
+5. Ghost de escalera.
+
+Cambiar este orden puede causar:
+- Héroe completamente oculto.
+- Screen-door sobre las partes ya visibles.
+- Hierba dibujada delante incorrectamente.
+- Ghost tapado por terreno.
+
+
+9. TESTS QUE PROTEGEN LAS CUEVAS
+--------------------------------
+src/caves.rs:
+- chamber_nodes_are_deterministic
+- carve_never_touches_bedrock_band
+- carved_volume_near_target
+- reserved_chest_appears_in_extras
+
+También son relevantes los tests de:
+- Streaming y descarga de chunks en src/world.rs.
+- Vecinos Reserved y agujeros del anillo de mesh.
+- Culling, winding, caras internas y HLOD en src/render.rs.
+
+Cobertura todavía recomendable:
+- Test visual/snapshot del cutaway Bayer bajo tierra.
+- Test del stencil y screen-door del héroe.
+- Test de transición de cámara y LOD al entrar/salir de una cueva.
+
+
+10. CHECKLIST ANTES DE CAMBIAR EL RENDER DE CUEVAS
+--------------------------------------------------
+[ ] El límite de tallado sigue usando terrain_height.
+[ ] Y=0 y Y=1 permanecen sólidos.
+[ ] La superficie y surface-1 no se tallan.
+[ ] Árboles y hierba se colocan en la superficie natural.
+[ ] Fog, burial y cutaway usan la superficie natural.
+[ ] Streaming/LOD siguen hd2d_focus, no la lente.
+[ ] Los techos en extras aparecen en el greedy mesh.
+[ ] Los chunks Reserved no abren caras temporales.
+[ ] El héroe visible y el ocluido respetan stencil.
+[ ] Árboles y terreno comparten el mismo efecto de oclusión.
+[ ] El cofre conserva aire encima y color propio.
+[ ] Los cuatro tests de caves pasan.
+[ ] HLOD mantiene la tapa natural mediante hlod_column_height.
+[ ] Cutaway: radio acotado por confine (no burbuja global detrás del héroe).
+[ ] Atmósfera de cueva: fog slate progresivo, sin negro absoluto.
+[ ] Techo más frío/oscuro que el suelo (misma textura, distinto mood).
+
+
+11. FLAGS RELACIONADOS
+----------------------
+- ENABLE_CAVES
+- ENABLE_DIG_CUTAWAY
+- ENABLE_PLAYER_SCREEN_DOOR
+- ENABLE_PLAYER_OCCLUDED_BAYER
+- ENABLE_HD2D
+- DEBUG_CHUNK_STREAM
+- DEBUG_HERO_FACE_CUBE
+- DEBUG_HERO_CAMERA_FACES
+
+
+12. ATMÓSFERA SUBTERRÁNEA UNIFICADA (experiencia)
+------------------------------------------------
+Una sola curva de profundidad (eye bajo terrain_height) gobierna:
+
+- fog_color_for_altitude: SURFACE → CAVE_SHALLOW → CAVE_DEEP (slate, nunca
+  [0.01,0.01,0.02]).
+- shade_lit: cool tint + desaturación + atenuación (~58% piso); techo
+  (n.y < -0.5) más frío/oscuro; suelo (n.y > 0.5) ligeramente más cálido.
+- fog denser ≈ depth² (fog_boost = 1 + cave_t² * 1.6).
+- Rango visible por aire: claro hasta 8 bloques; fog progresivo hasta ocultar
+  cámaras conectadas a 24 bloques. La roca maciza sigue ocultando con depth.
+
+13. MÁSCARA DE CUEVAS (estilo Minecraft)
+---------------------------------------
+Problema: desde un pozo/cutaway se veía todo el grafo de cámaras (rayos X).
+
+Fix visual-only (no cambia worldgen):
+1. fog_color se recalcula con eye_y de los pies tras el override HD-2D
+   (antes quedaba verde pradera y el void se veía mint).
+2. shade_lit: máscara radial desde focus_xz —
+   - 0–8 bloques: visible
+   - 8–14: degradado amplio a roca virtual
+   - >~14 + fragmento bajo superficie + jugador enterrado: discard
+   El descarte usa umbral 0.985 para que no aparezca un círculo duro.
+3. Clear/fog subterráneo oscurece rápido (depth ~2.5 ya es slate).
+
+NO es flood-fill de conectividad (las cámaras están muy conectadas; marcar
+toda la red visible). Es oclusión aparente: solo la burbuja local.
+
+REVERSIÓN máscara: quitar el bloque mask_t/discard en shade_lit y el
+recalc de fog_rgb tras feet en render.rs.
+- dig_cutaway_open: confine SHRINKS the radius
+  (`radius * mix(1.0, 0.35, conf)` — more walled-in → tighter window).
+- y_gate is LID-ONLY (opens above the eye). Do NOT open a mid-body slab of
+  side walls: that terrain wins depth vs the hero → solid pass fails →
+  occluded Bayer punches holes in the face/chest (looks “permanent” outdoors).
+- Screen-door del héroe (árbol/techo) sigue unificado; cutaway de terreno no
+  debe pelear depth a la altura del cuerpo.
+
+No añadir un pass “solo cueva” separado del cutaway/árbol: misma burbuja,
+mismo Bayer, misma silueta de héroe.
+
+REVERSIÓN CUTAWAY (si vuelve el glitch de caras)
+-----------------------------------------------
+Si reaparecen bandas Bayer en el héroe al aire libre:
+1. Confirmar que apply_dig_cutaway usa y_gate = smoothstep(-0.35, 1.85, h)
+   (NO la banda -0.65..2.60 que abre paredes).
+2. Como kill-switch: ENABLE_DIG_CUTAWAY = false en world.rs (cutaway off;
+   screen-door del héroe y atmósfera de cueva siguen activos).
+3. Radio: mantener mix(1.0, 0.35, conf) (shrink). No volver a mix(0.35, 1.0, conf).
+
+
+RESUMEN DEL PIPELINE
+--------------------
+Columnas densas
+  -> carve_chunk hasta surface-2
+  -> punch_dense_column conserva el techo en extras
+  -> cofres
+  -> árboles/hierba en terrain_height
+  -> greedy mesh cercano con techos y cofres
+  -> HLOD lejano sellado con terrain_height
+  -> uniforms con surface_y natural, confine y focus_xz
+  -> terreno + atmósfera por profundidad + cutaway local
+  -> héroe sólido + screen-door unificado
+  -> fog subterráneo progresivo
+  -> streaming y LOD centrados en el focus.

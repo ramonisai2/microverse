@@ -1,0 +1,2003 @@
+WORLD GEN + STREAMING + MESH CACHE — extract for disappearing shunk bug
+Source of truth: src/world.rs + src/render.rs
+
+MAPA RAPIDO:
+  A) stream_around_timed_look — Reserved/commit/unload/grace
+  B) unload_chunk — borra heights+extras; dirty neighbors
+  C) commit_generated_chunk — Filled + columns
+  D) ensure_mesh_cached — no dibuja si !chunk_filled
+  E) neighbors_ready_for_mesh — espera Reserved
+  F) mesh_ring_holes — guardian del anillo visible
+  G) stream_keep_dist / unload / load (HD2D)
+
+================================================================================
+CONSTANTS + STREAM RADII  (C:\Users\ramonisai\Projects\microvoxel\src\world.rs : 46-230)
+================================================================================
+
+   46|/// A shunk is one 16Ã—16 column chunk (matches mesh chunk XZ).
+   47|pub const SHUNK_SIZE: i32 = 16;
+   48|/// Contiguous shunks on each axis â†’ [`SHUNK_GRID`]Â² total (3Ã—3 = 9).
+   49|pub const SHUNK_GRID: i32 = 3;
+   50|/// Extra blocks beyond the shunk grid on each axis.
+   51|pub const WORLD_SURFACE_EXTRA: i32 = 0;
+   52|/// Mesh chunk size in X and Z (blocks) â€” one shunk = one mesh chunk.
+   53|pub const MESH_CHUNK_SIZE: i32 = 16;
+   54|/// Vertical section height inside a column chunk (blocks).
+   55|pub const CHUNK_SECTION_HEIGHT: i32 = 32;
+   56|/// Stacked Y sections per column â†’ world ceiling (2 Ã— 32 = 64).
+   57|pub const CHUNK_SECTIONS_Y: i32 = 2;
+   58|/// Absolute world height in blocks (`CHUNK_SECTION_HEIGHT * CHUNK_SECTIONS_Y`).
+   59|pub const WORLD_MAX_HEIGHT: i32 = CHUNK_SECTION_HEIGHT * CHUNK_SECTIONS_Y; // 64
+   60|/// Inclusive max block Y (`0..=WORLD_MAX_Y`).
+   61|pub const WORLD_MAX_Y: i32 = WORLD_MAX_HEIGHT - 1;
+   62|/// Procedural dirt-top ceiling (max column height).
+   63|pub const TERRAIN_MAX_HEIGHT: i32 = 64;
+   64|/// Typical / average surface height (noise â‰ˆ 0 lands here).
+   65|pub const TERRAIN_AVG_HEIGHT: i32 = 20;
+   66|/// Valley floor (noise â‰ˆ -1); keeps dips above bedrock.
+   67|pub const TERRAIN_VALLEY_HEIGHT: i32 = 8;
+   68|/// When true, chunks stream in/out around the camera (infinite world).
+   69|pub const ENABLE_STREAMING: bool = true;
+   70|/// View distance in shunks (mesh chunks of [`SHUNK_SIZE`]).
+   71|/// HD-2D grass detail only reaches ~45 blocks; 6 keeps a short horizon without over-gen.
+   72|pub const VIEW_DISTANCE_SHUNKS: i32 = 6;
+   73|/// Max mesh view distance in blocks (streaming bubble).
+   74|pub const VIEW_DISTANCE: f32 = (VIEW_DISTANCE_SHUNKS * SHUNK_SIZE) as f32; // 96
+   75|/// Canonical dig / place reach (blocks). Prefer [`crate::mining::MAX_REACH`].
+   76|pub const EDIT_REACH: f32 = 8.0;
+   77|/// Base Perlin sampling scale (smaller â‡’ broader, gentler hills).
+   78|pub const PERLIN_SCALE: f64 = 0.005;
+   79|/// Height amplitude multiplier on Perlin (`1` = full valleyâ†”peak swing).
+   80|pub const PERLIN_AMPLITUDE: f32 = 0.35;
+   81|/// Slope (block Î”h) used to thin grass on steep columns.
+   82|pub const ROCK_SLOPE: f32 = 1.6;
+   83|/// Base chance a flat column stays bare (no grass tuft). Slopes raise this further.
+   84|/// High bare rate leaves open dirt for trees and sparse meadow patches.
+   85|pub const GRASS_BARE_CHANCE: f32 = 0.82;
+   86|/// Coherent barren patch size (blocks). Power-of-two keeps div cheap.
+   87|const GRASS_BARE_CELL: i32 = 8;
+   88|
+   89|pub fn world_blocks() -> i32 {
+   90|    SHUNK_GRID * SHUNK_SIZE + WORLD_SURFACE_EXTRA
+   91|}
+   92|
+   93|/// Section index along Y for a block coordinate.
+   94|#[allow(dead_code)]
+   95|pub fn chunk_section_y(y: i32) -> i32 {
+   96|    y.div_euclid(CHUNK_SECTION_HEIGHT)
+   97|}
+   98|
+   99|/// Chunk key for a world position: `(cx, cy, cz)` with size 16Ã—32Ã—16.
+  100|#[allow(dead_code)]
+  101|pub fn chunk_coord(pos: IVec3) -> (i32, i32, i32) {
+  102|    (
+  103|        pos.x.div_euclid(MESH_CHUNK_SIZE),
+  104|        chunk_section_y(pos.y),
+  105|        pos.z.div_euclid(MESH_CHUNK_SIZE),
+  106|    )
+  107|}
+  108|
+  109|/// Grass blade fade: shorten from the top starting at 60, gone by 65.
+  110|pub const GRASS_BLADE_FADE_START: f32 = 60.0;
+  111|pub const GRASS_BLADE_FADE_END: f32 = 65.0;
+  112|/// Practical max stem height in micros (generator uses up to ~6).
+  113|pub const GRASS_BLADE_MAX_HEIGHT: usize = 6;
+  114|
+  115|/// Beyond this cameraâ†”block distance, dirt uses a flat brown (no tone detail).
+  116|pub const DIRT_TONE_MAX_DIST: f32 = VIEW_DISTANCE;
+  117|/// Within this distance, dirt keeps full geometric face detail (high res).
+  118|pub const DIRT_HIRES_MAX_DIST: f32 = VIEW_DISTANCE * 0.45;
+  119|/// Polished / greedy soft until this distance.
+  120|pub const DIRT_POLISHED_MAX_DIST: f32 = VIEW_DISTANCE * 0.70;
+  121|/// Squared LOD thresholds (avoid `sqrt` in the mesh hot path).
+  122|pub const DIRT_HIRES_MAX_DIST_SQ: f32 = DIRT_HIRES_MAX_DIST * DIRT_HIRES_MAX_DIST;
+  123|pub const DIRT_POLISHED_MAX_DIST_SQ: f32 = DIRT_POLISHED_MAX_DIST * DIRT_POLISHED_MAX_DIST;
+  124|#[allow(dead_code)]
+  125|pub const DIRT_TONE_MAX_DIST_SQ: f32 = DIRT_TONE_MAX_DIST * DIRT_TONE_MAX_DIST;
+  126|/// Heightmap HLOD from here until the mesh cut (must be < [`DIRT_MESH_MAX_DIST`]).
+  127|pub const DIRT_HEIGHTMAP_MAX_DIST: f32 = VIEW_DISTANCE * 0.88;
+  128|pub const DIRT_HEIGHTMAP_MAX_DIST_SQ: f32 = DIRT_HEIGHTMAP_MAX_DIST * DIRT_HEIGHTMAP_MAX_DIST;
+  129|/// Beyond this, dirt is not meshed at all (aligned with [`VIEW_DISTANCE`]).
+  130|pub const DIRT_MESH_MAX_DIST: f32 = VIEW_DISTANCE;
+  131|#[allow(dead_code)]
+  132|pub const DIRT_MESH_MAX_DIST_SQ: f32 = DIRT_MESH_MAX_DIST * DIRT_MESH_MAX_DIST;
+  133|
+  134|/// HD-2D: dirt mesh cut at 64; greedy merge for nearly all frustum chunks.
+  135|pub const HD2D_DIRT_MESH_DIST: f32 = 64.0;
+  136|pub const HD2D_DIRT_HIRES_DIST: f32 = 22.0;
+  137|pub const HD2D_DIRT_POLISHED_DIST: f32 = 48.0;
+  138|/// HLOD only in the last few blocks before the cut.
+  139|pub const HD2D_DIRT_HEIGHTMAP_DIST: f32 = 58.0;
+  140|
+  141|/// Active dirt mesh cut (HD-2D uses a tighter bubble).
+  142|#[inline]
+  143|pub fn dirt_mesh_max_dist() -> f32 {
+  144|    if ENABLE_HD2D {
+  145|        HD2D_DIRT_MESH_DIST
+  146|    } else {
+  147|        DIRT_MESH_MAX_DIST
+  148|    }
+  149|}
+  150|
+  151|#[inline]
+  152|pub fn dirt_mesh_max_dist_sq() -> f32 {
+  153|    let d = dirt_mesh_max_dist();
+  154|    d * d
+  155|}
+  156|
+  157|#[inline]
+  158|pub fn dirt_hires_max_dist_sq() -> f32 {
+  159|    if ENABLE_HD2D {
+  160|        HD2D_DIRT_HIRES_DIST * HD2D_DIRT_HIRES_DIST
+  161|    } else {
+  162|        DIRT_HIRES_MAX_DIST_SQ
+  163|    }
+  164|}
+  165|
+  166|#[inline]
+  167|pub fn dirt_polished_max_dist_sq() -> f32 {
+  168|    if ENABLE_HD2D {
+  169|        HD2D_DIRT_POLISHED_DIST * HD2D_DIRT_POLISHED_DIST
+  170|    } else {
+  171|        DIRT_POLISHED_MAX_DIST_SQ
+  172|    }
+  173|}
+  174|
+  175|#[inline]
+  176|pub fn dirt_heightmap_max_dist_sq() -> f32 {
+  177|    if ENABLE_HD2D {
+  178|        HD2D_DIRT_HEIGHTMAP_DIST * HD2D_DIRT_HEIGHTMAP_DIST
+  179|    } else {
+  180|        DIRT_HEIGHTMAP_MAX_DIST_SQ
+  181|    }
+  182|}
+  183|/// Stream-load radius (blocks); unload a bit farther to avoid thrash.
+  184|pub const STREAM_LOAD_DIST: f32 = VIEW_DISTANCE + MESH_CHUNK_SIZE as f32;
+  185|pub const STREAM_UNLOAD_DIST: f32 = VIEW_DISTANCE + MESH_CHUNK_SIZE as f32 * 2.5;
+  186|
+  187|/// Extra chunk ring beyond the mesh cut â€” gen cushion so the frustum never sits on Empty.
+  188|const STREAM_SAFETY_RING_CHUNKS: i32 = 1;
+  189|/// Frames to keep voxels after leaving the unload ring (neighbors remesh / swap-ready).
+  190|const UNLOAD_GRACE_FRAMES: u32 = 12;
+  191|
+  192|/// Active stream radii â€” HD-2D tracks the dirt mesh bubble, not the old 96-block view.
+  193|#[inline]
+  194|pub fn stream_load_dist() -> f32 {
+  195|    if ENABLE_HD2D {
+  196|        // Mesh cut + safety ring (never generate only what you see).
+  197|        HD2D_DIRT_MESH_DIST + MESH_CHUNK_SIZE as f32 * STREAM_SAFETY_RING_CHUNKS as f32
+  198|    } else {
+  199|        STREAM_LOAD_DIST
+  200|    }
+  201|}
+  202|
+  203|#[inline]
+  204|pub fn stream_unload_dist() -> f32 {
+  205|    if ENABLE_HD2D {
+  206|        // Farther than load so chunks stay until replacement ring is filled.
+  207|        HD2D_DIRT_MESH_DIST + MESH_CHUNK_SIZE as f32 * (STREAM_SAFETY_RING_CHUNKS as f32 + 1.5)
+  208|    } else {
+  209|        STREAM_UNLOAD_DIST
+  210|    }
+  211|}
+  212|
+  213|/// Never drop voxels inside this radius â€” prevents visible 16Ã—16 holes.
+  214|#[inline]
+  215|pub fn stream_keep_dist() -> f32 {
+  216|    dirt_mesh_max_dist() + MESH_CHUNK_SIZE as f32
+  217|}
+  218|/// Soft CPU budget for streaming work inside one render frame.
+  219|pub const FRAME_STREAM_BUDGET_MS: u64 = 6;
+  220|/// HD-2D: slightly more budget so Reservedâ†’Filled keeps up with the diorama.
+  221|pub const HD2D_FRAME_STREAM_BUDGET_MS: u64 = 10;
+  222|/// Max chunks whose FBM we kick off in one frame (parallel `par_iter`).
+  223|const MAX_GEN_KICK_PER_FRAME: usize = 8;
+  224|const HD2D_MAX_GEN_KICK_PER_FRAME: usize = 12;
+  225|/// Max chunks inserted into the world hashmap per frame (sequential commit).
+  226|const MAX_COMMIT_PER_FRAME: usize = 4;
+  227|const HD2D_MAX_COMMIT_PER_FRAME: usize = 8;
+  228|/// Don't pile up too much precomputed terrain waiting to commit.
+  229|const PENDING_SOFT_CAP: usize = 24;
+  230|/// Bias missing-chunk sort toward look direction (Minecraft-style preload).
+
+================================================================================
+mesh_chunk_coord / chunk_dist  (C:\Users\ramonisai\Projects\microvoxel\src\world.rs : 287-310)
+================================================================================
+
+  287|pub fn mesh_chunk_coord(x: i32, z: i32) -> (i32, i32) {
+  288|    (x.div_euclid(MESH_CHUNK_SIZE), z.div_euclid(MESH_CHUNK_SIZE))
+  289|}
+  290|
+  291|/// World-space center of a mesh chunk (XZ). Y stays near ground for AABBs.
+  292|pub fn mesh_chunk_center(cx: i32, cz: i32) -> Vec3 {
+  293|    let s = MESH_CHUNK_SIZE as f32;
+  294|    Vec3::new((cx as f32 + 0.5) * s, 1.0, (cz as f32 + 0.5) * s)
+  295|}
+  296|
+  297|/// Horizontal (XZ) distanceÂ² camera â†’ chunk center. LOD/view must ignore camera
+  298|/// height so flying above tall columns does not blank the whole mesh.
+  299|pub fn chunk_dist_sq_xz(camera_pos: Vec3, cx: i32, cz: i32) -> f32 {
+  300|    let c = mesh_chunk_center(cx, cz);
+  301|    let dx = camera_pos.x - c.x;
+  302|    let dz = camera_pos.z - c.z;
+  303|    dx * dx + dz * dz
+  304|}
+  305|
+  306|/// World-space center of one 16Ã—32Ã—16 section.
+  307|#[allow(dead_code)]
+  308|pub fn mesh_section_center(cx: i32, cy: i32, cz: i32) -> Vec3 {
+  309|    let sx = MESH_CHUNK_SIZE as f32;
+  310|    let sy = CHUNK_SECTION_HEIGHT as f32;
+
+================================================================================
+HEIGHT / TERRACE / generate_chunk_columns  (C:\Users\ramonisai\Projects\microvoxel\src\world.rs : 489-665)
+================================================================================
+
+  489|pub fn smoothed_column_height_f(x: i32, z: i32) -> f32 {
+  490|    let mut s = 0.0f32;
+  491|    let mut n = 0.0f32;
+  492|    for dz in -1i32..=1 {
+  493|        for dx in -1i32..=1 {
+  494|            let w = if dx == 0 && dz == 0 { 4.0 } else { 1.0 };
+  495|            s += terrain_height_f(x + dx, z + dz) * w;
+  496|            n += w;
+  497|        }
+  498|    }
+  499|    (s / n).clamp(TERRAIN_VALLEY_HEIGHT as f32, TERRAIN_MAX_HEIGHT as f32)
+  500|}
+  501|
+  502|pub fn smoothed_column_height(x: i32, z: i32) -> i32 {
+  503|    smoothed_column_height_f(x, z).round() as i32
+  504|}
+  505|
+  506|/// Classify slope from local gradient + stable hash (keeps some cliffs/canyons).
+  507|pub fn terrain_slope_kind(x: i32, z: i32) -> TerrainSlope {
+  508|    let h = smoothed_column_height_f(x, z);
+  509|    let mut max_d = 0.0f32;
+  510|    for (dx, dz) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+  511|        let d = (h - smoothed_column_height_f(x + dx, z + dz)).abs();
+  512|        max_d = max_d.max(d);
+  513|    }
+  514|    slope_kind_from_delta(max_d, x, z)
+  515|}
+  516|
+  517|fn terrace_style_at(x: i32, z: i32) -> TerraceStyle {
+  518|    match mix_seed(WORLD_SEED ^ 0x57A1_7001, x as u32, z as u32) % 4 {
+  519|        0 => TerraceStyle::Straight,
+  520|        1 => TerraceStyle::Zigzag,
+  521|        2 => TerraceStyle::Diagonal,
+  522|        _ => TerraceStyle::Wide,
+  523|    }
+  524|}
+  525|
+  526|/// Whether sample `(dx,dz)` contributes to the stair cone (style variation).
+  527|fn terrace_sample_ok(style: TerraceStyle, dx: i32, dz: i32, phase: i32) -> bool {
+  528|    match style {
+  529|        TerraceStyle::Wide | TerraceStyle::Diagonal => true,
+  530|        TerraceStyle::Straight => dx == 0 || dz == 0,
+  531|        TerraceStyle::Zigzag => {
+  532|            let d = dx.abs().max(dz.abs());
+  533|            let prefer_x = ((phase + d) & 1) == 0;
+  534|            if prefer_x {
+  535|                dx.abs() >= dz.abs()
+  536|            } else {
+  537|                dz.abs() >= dx.abs()
+  538|            }
+  539|        }
+  540|    }
+  541|}
+  542|
+  543|fn fill_raw_height_tile(x0: i32, z0: i32, w: i32) -> Vec<f32> {
+  544|    let mut raw = vec![0.0f32; (w * w) as usize];
+  545|    for lz in 0..w {
+  546|        for lx in 0..w {
+  547|            raw[(lz * w + lx) as usize] = terrain_height_f(x0 + lx, z0 + lz);
+  548|        }
+  549|    }
+  550|    raw
+  551|}
+  552|
+  553|fn blur3_round_tile(raw: &[f32], w: i32) -> Vec<i32> {
+  554|    let mut out = vec![0i32; (w * w) as usize];
+  555|    for z in 0..w {
+  556|        for x in 0..w {
+  557|            let mut s = 0.0f32;
+  558|            let mut n = 0.0f32;
+  559|            for dz in -1..=1 {
+  560|                for dx in -1..=1 {
+  561|                    let nx = x + dx;
+  562|                    let nz = z + dz;
+  563|                    if nx < 0 || nz < 0 || nx >= w || nz >= w {
+  564|                        continue;
+  565|                    }
+  566|                    let wt = if dx == 0 && dz == 0 { 4.0 } else { 1.0 };
+  567|                    s += raw[(nz * w + nx) as usize] * wt;
+  568|                    n += wt;
+  569|                }
+  570|            }
+  571|            out[(z * w + x) as usize] = (s / n)
+  572|                .round()
+  573|                .clamp(TERRAIN_VALLEY_HEIGHT as f32, TERRAIN_MAX_HEIGHT as f32)
+  574|                as i32;
+  575|        }
+  576|    }
+  577|    out
+  578|}
+  579|
+  580|fn slope_kind_at_smooth(smooth: &[i32], w: i32, lx: i32, lz: i32, x: i32, z: i32) -> TerrainSlope {
+  581|    let h = smooth[(lz * w + lx) as usize] as f32;
+  582|    let mut max_d = 0.0f32;
+  583|    for (dx, dz) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+  584|        let nx = lx + dx;
+  585|        let nz = lz + dz;
+  586|        if nx < 0 || nz < 0 || nx >= w || nz >= w {
+  587|            continue;
+  588|        }
+  589|        max_d = max_d.max((h - smooth[(nz * w + nx) as usize] as f32).abs());
+  590|    }
+  591|    slope_kind_from_delta(max_d, x, z)
+  592|}
+  593|
+  594|fn height_from_smooth_cell(
+  595|    smooth: &[i32],
+  596|    w: i32,
+  597|    lx: i32,
+  598|    lz: i32,
+  599|    x: i32,
+  600|    z: i32,
+  601|) -> i32 {
+  602|    let kind = slope_kind_at_smooth(smooth, w, lx, lz, x, z);
+  603|    let raw = smooth[(lz * w + lx) as usize];
+  604|    let h = match kind {
+  605|        TerrainSlope::Cliff | TerrainSlope::Canyon => raw,
+  606|        TerrainSlope::Walkable | TerrainSlope::Gentle => {
+  607|            cone_terrace_from_grid(smooth, w, lx, lz, x, z, TERRACE_RADIUS, false)
+  608|        }
+  609|        TerrainSlope::Mountain => {
+  610|            let roll = mix_seed(WORLD_SEED ^ 0xB007_A155, x as u32, z as u32) % 100;
+  611|            if roll < 58 {
+  612|                cone_terrace_from_grid(smooth, w, lx, lz, x, z, TERRACE_RADIUS, true)
+  613|            } else {
+  614|                let mild = cone_terrace_from_grid(smooth, w, lx, lz, x, z, 2, false);
+  615|                if (mild - raw).abs() <= 1 {
+  616|                    mild
+  617|                } else {
+  618|                    raw
+  619|                }
+  620|            }
+  621|        }
+  622|    };
+  623|    h.clamp(TERRAIN_VALLEY_HEIGHT, TERRAIN_MAX_HEIGHT)
+  624|}
+  625|
+  626|/// Raise low columns into 1-block dirt stairs toward nearby high ground (cone dilation).
+  627|fn cone_terrace_height(x: i32, z: i32, radius: i32, styled: bool) -> i32 {
+  628|    let pad = radius;
+  629|    let w = 2 * pad + 1;
+  630|    let raw = fill_raw_height_tile(x - pad, z - pad, w);
+  631|    let smooth = blur3_round_tile(&raw, w);
+  632|    cone_terrace_from_grid(&smooth, w, pad, pad, x, z, radius, styled)
+  633|        .clamp(TERRAIN_VALLEY_HEIGHT, TERRAIN_MAX_HEIGHT)
+  634|}
+  635|
+  636|/// Final surface height: walkable stairs on hills, raw walls on cliffs/canyons.
+  637|pub fn terraced_column_height(x: i32, z: i32) -> i32 {
+  638|    let pad = TERRACE_RADIUS;
+  639|    let w = 2 * pad + 1;
+  640|    let raw = fill_raw_height_tile(x - pad, z - pad, w);
+  641|    let smooth = blur3_round_tile(&raw, w);
+  642|    height_from_smooth_cell(&smooth, w, pad, pad, x, z)
+  643|}
+  644|
+  645|/// Pure column heights for one mesh chunk (no world mutation â€” rayon-safe).
+  646|fn generate_chunk_columns(cx: i32, cz: i32) -> Vec<(i32, i32, i32)> {
+  647|    let x0 = cx * MESH_CHUNK_SIZE;
+  648|    let z0 = cz * MESH_CHUNK_SIZE;
+  649|    let pad = TERRACE_RADIUS;
+  650|    let w = MESH_CHUNK_SIZE + 2 * pad;
+  651|    // One Perlin sample per padded cell + one 3Ã—3 blur â€” not 25Ã— samples per cell.
+  652|    let raw = fill_raw_height_tile(x0 - pad, z0 - pad, w);
+  653|    let smooth = blur3_round_tile(&raw, w);
+  654|
+  655|    let mut out = Vec::with_capacity((MESH_CHUNK_SIZE * MESH_CHUNK_SIZE) as usize);
+  656|    for z in z0..z0 + MESH_CHUNK_SIZE {
+  657|        for x in x0..x0 + MESH_CHUNK_SIZE {
+  658|            let lx = x - x0 + pad;
+  659|            let lz = z - z0 + pad;
+  660|            out.push((x, z, height_from_smooth_cell(&smooth, w, lx, lz, x, z)));
+  661|        }
+  662|    }
+  663|    out
+  664|}
+  665|
+
+================================================================================
+STONE PATCH  (C:\Users\ramonisai\Projects\microvoxel\src\world.rs : 901-930)
+================================================================================
+
+  901|/// Noise threshold at the surface: only Perlin peaks become stone outcrops.
+  902|pub const STONE_SURFACE_THRESH: f32 = 0.55;
+  903|/// Noise threshold deep underground: most cells are stone.
+  904|pub const STONE_DEEP_THRESH: f32 = -0.45;
+  905|/// Depth below the column top where the threshold reaches [`STONE_DEEP_THRESH`].
+  906|pub const STONE_DEPTH_FULL: f32 = 12.0;
+  907|
+  908|/// Signed patch field in roughly `[-1, 1]` â€” contiguous blobs via low-freq 2D noise.
+  909|fn stone_patch_field(x: i32, y: i32, z: i32) -> f32 {
+  910|    use noise::NoiseFn;
+  911|    let p = terrain_perlin();
+  912|    // Broad 2D patches for surface outcrops; mild Y warp for underground veins.
+  913|    let n2 = p.get([x as f64 * 0.055 + 17.3, z as f64 * 0.055 - 9.1]);
+  914|    let n3 = p.get([x as f64 * 0.14, y as f64 * 0.09 + 3.7, z as f64 * 0.14]);
+  915|    (n2 * 0.72 + n3 * 0.28).clamp(-1.0, 1.0) as f32
+  916|}
+  917|
+  918|/// Deterministic stone vs dirt for a dense column cell (`y` in `0..=column_top`).
+  919|/// Rare patches at the surface; probability rises smoothly with depth.
+  920|pub fn column_cell_is_stone(x: i32, y: i32, z: i32, column_top: i32) -> bool {
+  921|    if y < 0 || y > column_top {
+  922|        return false;
+  923|    }
+  924|    let depth = (column_top - y) as f32;
+  925|    let t = (depth / STONE_DEPTH_FULL).clamp(0.0, 1.0);
+  926|    let ease = t * t * (3.0 - 2.0 * t);
+  927|    let thresh =
+  928|        STONE_SURFACE_THRESH + (STONE_DEEP_THRESH - STONE_SURFACE_THRESH) * ease;
+  929|    stone_patch_field(x, y, z) > thresh
+  930|}
+
+================================================================================
+ChunkState + World + new()  (C:\Users\ramonisai\Projects\microvoxel\src\world.rs : 1172-1320)
+================================================================================
+
+ 1172|/// Voxel chunk lifecycle (renderer only draws [`Filled`] / [`PendingUnload`]).
+ 1173|#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ 1174|enum ChunkState {
+ 1175|    /// Gen kicked; columns not committed yet â€” never draw / never unload-punch.
+ 1176|    Reserved,
+ 1177|    /// Voxels ready to mesh and draw.
+ 1178|    Filled,
+ 1179|    /// Outside unload ring but kept until grace elapses (swap-then-drop).
+ 1180|    PendingUnload,
+ 1181|}
+ 1182|
+ 1183|/// Shared solid-dirt voxel for dense columns (avoids storing one entry per block).
+ 1184|fn solid_dirt_ref() -> &'static Voxel {
+ 1185|    use std::sync::OnceLock;
+ 1186|    static V: OnceLock<Voxel> = OnceLock::new();
+ 1187|    V.get_or_init(Voxel::dirt)
+ 1188|}
+ 1189|
+ 1190|fn solid_stone_ref() -> &'static Voxel {
+ 1191|    use std::sync::OnceLock;
+ 1192|    static V: OnceLock<Voxel> = OnceLock::new();
+ 1193|    V.get_or_init(Voxel::stone)
+ 1194|}
+ 1195|
+ 1196|pub struct World {
+ 1197|    /// Loaded mesh chunks (reserved or filled).
+ 1198|    loaded_chunks: FxHashMap<(i32, i32), ChunkState>,
+ 1199|    /// Dense dirt column tops: solid dirt implied for `y = 0..=height`.
+ 1200|    heights: FxHashMap<(i32, i32), i32>,
+ 1201|    /// Sparse voxels that are not implied by [`heights`] (grass, edits, floats).
+ 1202|    extras: FxHashMap<IVec3, Voxel>,
+ 1203|    /// Cached `(min_h, max_h)` per mesh chunk â€” invalidated on height edits.
+ 1204|    height_bounds: FxHashMap<(i32, i32), (i32, i32)>,
+ 1205|    /// Running material totals (HUD); updated in set/remove/unload.
+ 1206|    dirt_count: usize,
+ 1207|    grass_count: usize,
+ 1208|    /// Core generated surface size (tests / HUD); streaming can go beyond.
+ 1209|    extent: i32,
+ 1210|    /// Hard remesh: player edits (must drop VRAM mesh).
+ 1211|    dirty_edits: FxHashSet<(i32, i32)>,
+ 1212|    /// Soft remesh: streaming fill (VRAM cache may keep the old mesh).
+ 1213|    dirty_stream: FxHashSet<(i32, i32)>,
+ 1214|    /// FBM results waiting to be inserted (amortized across frames).
+ 1215|    pending_chunks: VecDeque<(i32, i32, Vec<(i32, i32, i32)>)>,
+ 1216|    /// Chunks that already received a grass planting pass (within gen radius).
+ 1217|    grass_ready: FxHashSet<(i32, i32)>,
+ 1218|    /// Frames a chunk has spent in [`ChunkState::PendingUnload`] before drop.
+ 1219|    unload_grace: FxHashMap<(i32, i32), u32>,
+ 1220|}
+ 1221|
+ 1222|impl World {
+ 1223|    pub fn new() -> Self {
+ 1224|        Self {
+ 1225|            loaded_chunks: FxHashMap::default(),
+ 1226|            heights: FxHashMap::default(),
+ 1227|            extras: FxHashMap::default(),
+ 1228|            height_bounds: FxHashMap::default(),
+ 1229|            dirt_count: 0,
+ 1230|            grass_count: 0,
+ 1231|            extent: 0,
+ 1232|            dirty_edits: FxHashSet::default(),
+ 1233|            dirty_stream: FxHashSet::default(),
+ 1234|            pending_chunks: VecDeque::new(),
+ 1235|            grass_ready: FxHashSet::default(),
+ 1236|            unload_grace: FxHashMap::default(),
+ 1237|        }
+ 1238|    }
+ 1239|
+ 1240|    #[inline]
+ 1241|    fn inc_material(&mut self, material: Material) {
+ 1242|        match material {
+ 1243|            Material::Dirt | Material::Stone | Material::Wood | Material::Leaves => {
+ 1244|                self.dirt_count += 1
+ 1245|            }
+ 1246|            Material::Grass => self.grass_count += 1,
+ 1247|        }
+ 1248|    }
+ 1249|
+ 1250|    #[inline]
+ 1251|    fn dec_material(&mut self, material: Material) {
+ 1252|        match material {
+ 1253|            Material::Dirt | Material::Stone | Material::Wood | Material::Leaves => {
+ 1254|                self.dirt_count = self.dirt_count.saturating_sub(1)
+ 1255|            }
+ 1256|            Material::Grass => self.grass_count = self.grass_count.saturating_sub(1),
+ 1257|        }
+ 1258|    }
+ 1259|
+ 1260|    /// Infinite world: empty, then warm the load circle around `spawn` (Minecraft-style preload).
+ 1261|    pub fn with_infinite(spawn: Vec3) -> Self {
+ 1262|        let mut world = Self::new();
+ 1263|        // Long budget + many passes so the first frame already has terrain ahead.
+ 1264|        for _ in 0..STARTUP_PRELOAD_PASSES {
+ 1265|            world.stream_around_timed(spawn, Duration::from_millis(25));
+ 1266|        }
+ 1267|        world.dirty_edits.clear();
+ 1268|        world.dirty_stream.clear();
+ 1269|        world
+ 1270|    }
+ 1271|
+ 1272|    /// Contiguous [`SHUNK_GRID`]Â² shunks (3Ã—3 = 9 Ã— 16Ã—16): terraced walkable hills.
+ 1273|    pub fn with_shunk() -> Self {
+ 1274|        let mut world = Self::new();
+ 1275|        let extent = world_blocks();
+ 1276|        world.extent = extent;
+ 1277|        // Same column path as streaming (padded cone per chunk).
+ 1278|        for cz in 0..SHUNK_GRID {
+ 1279|            for cx in 0..SHUNK_GRID {
+ 1280|                let columns = generate_chunk_columns(cx, cz);
+ 1281|                for &(x, z, h) in &columns {
+ 1282|                    if !world.heights.contains_key(&(x, z)) {
+ 1283|                        world.set_column_dirt(x, z, h);
+ 1284|                    }
+ 1285|                }
+ 1286|            }
+ 1287|        }
+ 1288|        for z in 0..extent {
+ 1289|            for x in 0..extent {
+ 1290|                let Some(h) = world.column_height(x, z) else {
+ 1291|                    continue;
+ 1292|                };
+ 1293|                let slope = world.column_slope_at(x, z);
+ 1294|                // Stone outcrops: no grass carpet / trees on the lid.
+ 1295|                if column_cell_is_stone(x, h, z, h) {
+ 1296|                    continue;
+ 1297|                }
+ 1298|                if ENABLE_TREES && column_grows_tree(x, z, slope) {
+ 1299|                    world.plant_tree_at(x, z, h);
+ 1300|                    continue;
+ 1301|                }
+ 1302|                if ENABLE_GRASS && column_grows_grass(x, z, slope) {
+ 1303|                    let grass_pos = IVec3::new(x, h + 1, z);
+ 1304|                    let grass_seed = block_seed_at(grass_pos, GRASS_SEED);
+ 1305|                    world.set_voxel(
+ 1306|                        grass_pos,
+ 1307|                        Voxel::grass_from_seed_sloped(grass_seed, slope),
+ 1308|                    );
+ 1309|                }
+ 1310|            }
+ 1311|        }
+ 1312|        world.dirty_edits.clear();
+ 1313|        world.dirty_stream.clear();
+ 1314|        for cz in 0..SHUNK_GRID {
+ 1315|            for cx in 0..SHUNK_GRID {
+ 1316|                world.grass_ready.insert((cx, cz));
+ 1317|            }
+ 1318|        }
+ 1319|        world
+ 1320|    }
+
+================================================================================
+ensure/commit/seed_grass  (C:\Users\ramonisai\Projects\microvoxel\src\world.rs : 1686-1881)
+================================================================================
+
+ 1686|    pub fn ensure_chunk(&mut self, cx: i32, cz: i32) {
+ 1687|        if self.chunk_filled(cx, cz) {
+ 1688|            return;
+ 1689|        }
+ 1690|        self.loaded_chunks
+ 1691|            .entry((cx, cz))
+ 1692|            .or_insert(ChunkState::Reserved);
+ 1693|        let columns = generate_chunk_columns(cx, cz);
+ 1694|        self.commit_generated_chunk(cx, cz, &columns, true);
+ 1695|    }
+ 1696|
+ 1697|    /// Insert precomputed columns â€” O(columns), not O(blocks).
+ 1698|    /// `plant_grass`: false when the chunk is outside [`GRASS_GEN_MAX_DIST`].
+ 1699|    fn commit_generated_chunk(
+ 1700|        &mut self,
+ 1701|        cx: i32,
+ 1702|        cz: i32,
+ 1703|        columns: &[(i32, i32, i32)],
+ 1704|        plant_grass: bool,
+ 1705|    ) {
+ 1706|        self.loaded_chunks.insert((cx, cz), ChunkState::Filled);
+ 1707|        for &(x, z, h) in columns {
+ 1708|            if self.heights.contains_key(&(x, z)) {
+ 1709|                continue;
+ 1710|            }
+ 1711|            self.set_column_dirt(x, z, h);
+ 1712|            let slope = self.column_slope_at(x, z);
+ 1713|            if column_cell_is_stone(x, h, z, h) {
+ 1714|                continue;
+ 1715|            }
+ 1716|            if ENABLE_TREES && column_grows_tree(x, z, slope) {
+ 1717|                self.plant_tree_at(x, z, h);
+ 1718|                continue;
+ 1719|            }
+ 1720|            if ENABLE_GRASS && plant_grass {
+ 1721|                if column_grows_grass(x, z, slope) {
+ 1722|                    let grass_pos = IVec3::new(x, h + 1, z);
+ 1723|                    let grass_seed = block_seed_at(grass_pos, GRASS_SEED);
+ 1724|                    self.set_voxel(
+ 1725|                        grass_pos,
+ 1726|                        Voxel::grass_from_seed_sloped(grass_seed, slope),
+ 1727|                    );
+ 1728|                }
+ 1729|            }
+ 1730|        }
+ 1731|        if ENABLE_GRASS && plant_grass {
+ 1732|            self.grass_ready.insert((cx, cz));
+ 1733|        }
+ 1734|        for dz in -1..=1 {
+ 1735|            for dx in -1..=1 {
+ 1736|                self.dirty_stream.insert((cx + dx, cz + dz));
+ 1737|            }
+ 1738|        }
+ 1739|        let bounds = self.compute_chunk_height_bounds(cx, cz);
+ 1740|        self.height_bounds.insert((cx, cz), bounds);
+ 1741|    }
+ 1742|
+ 1743|    /// Plant grass on one filled chunk that entered the gen radius.
+ 1744|    fn seed_chunk_grass(&mut self, cx: i32, cz: i32) {
+ 1745|        if !ENABLE_GRASS || self.grass_ready.contains(&(cx, cz)) {
+ 1746|            return;
+ 1747|        }
+ 1748|        let x0 = cx * MESH_CHUNK_SIZE;
+ 1749|        let z0 = cz * MESH_CHUNK_SIZE;
+ 1750|        for z in z0..z0 + MESH_CHUNK_SIZE {
+ 1751|            for x in x0..x0 + MESH_CHUNK_SIZE {
+ 1752|                let Some(h) = self.column_height(x, z) else {
+ 1753|                    continue;
+ 1754|                };
+ 1755|                if column_cell_is_stone(x, h, z, h) {
+ 1756|                    continue;
+ 1757|                }
+ 1758|                let slope = self.column_slope_at(x, z);
+ 1759|                if ENABLE_TREES && column_grows_tree(x, z, slope) {
+ 1760|                    self.plant_tree_at(x, z, h);
+ 1761|                    continue;
+ 1762|                }
+ 1763|                if !column_grows_grass(x, z, slope) {
+ 1764|                    continue;
+ 1765|                }
+ 1766|                let grass_pos = IVec3::new(x, h + 1, z);
+ 1767|                if self.extras.contains_key(&grass_pos) {
+ 1768|                    continue;
+ 1769|                }
+ 1770|                let grass_seed = block_seed_at(grass_pos, GRASS_SEED);
+ 1771|                self.set_voxel(
+ 1772|                    grass_pos,
+ 1773|                    Voxel::grass_from_seed_sloped(grass_seed, slope),
+ 1774|                );
+ 1775|            }
+ 1776|        }
+ 1777|        self.grass_ready.insert((cx, cz));
+ 1778|        self.dirty_stream.insert((cx, cz));
+ 1779|    }
+ 1780|
+ 1781|    /// Fill grass on nearby chunks that were committed bare (camera walked in).
+ 1782|    fn seed_grass_near(&mut self, camera_pos: Vec3, start: Instant, budget: Duration) {
+ 1783|        if !ENABLE_GRASS {
+ 1784|            return;
+ 1785|        }
+ 1786|        let mut candidates: Vec<(i32, i32, i32)> = Vec::new();
+ 1787|        for &(cx, cz) in self.loaded_chunks.keys() {
+ 1788|            if self.grass_ready.contains(&(cx, cz)) {
+ 1789|                continue;
+ 1790|            }
+ 1791|            if !self.chunk_filled(cx, cz) {
+ 1792|                continue;
+ 1793|            }
+ 1794|            let d2 = chunk_dist_sq_xz(camera_pos, cx, cz);
+ 1795|            if d2 > GRASS_GEN_MAX_DIST_SQ {
+ 1796|                continue;
+ 1797|            }
+ 1798|            candidates.push((d2 as i32, cx, cz));
+ 1799|        }
+ 1800|        candidates.sort_unstable_by_key(|&(d, _, _)| d);
+ 1801|        let mut seeded = 0usize;
+ 1802|        for &(_, cx, cz) in candidates.iter().take(MAX_GRASS_SEED_CHUNKS_PER_FRAME) {
+ 1803|            self.seed_chunk_grass(cx, cz);
+ 1804|            seeded += 1;
+ 1805|            if seeded >= 1 && start.elapsed() >= budget {
+ 1806|                break;
+ 1807|            }
+ 1808|        }
+ 1809|    }
+ 1810|
+ 1811|    fn column_slope_at(&self, x: i32, z: i32) -> f32 {
+ 1812|        let h = self
+ 1813|            .column_height(x, z)
+ 1814|            .unwrap_or_else(|| terrain_height(x, z)) as f32;
+ 1815|        let mut max_d = 0.0f32;
+ 1816|        for (dx, dz) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+ 1817|            let nh = self
+ 1818|                .column_height(x + dx, z + dz)
+ 1819|                .unwrap_or_else(|| terrain_height(x + dx, z + dz)) as f32;
+ 1820|            max_d = max_d.max((h - nh).abs());
+ 1821|        }
+ 1822|        max_d
+ 1823|    }
+ 1824|
+ 1825|    /// Place a thin microvoxel trunk (`2..=6` tall) plus a small leaf canopy.
+ 1826|    fn plant_tree_at(&mut self, x: i32, z: i32, surface_h: i32) {
+ 1827|        let trunk_h = tree_trunk_height(x, z);
+ 1828|        let top_y = surface_h + trunk_h;
+ 1829|        if top_y + 2 > WORLD_MAX_Y {
+ 1830|            return;
+ 1831|        }
+ 1832|        for dy in 1..=trunk_h {
+ 1833|            self.set_voxel(IVec3::new(x, surface_h + dy, z), Voxel::wood_trunk());
+ 1834|        }
+ 1835|        let extent = self.extent;
+ 1836|        let in_world = |lx: i32, lz: i32| -> bool {
+ 1837|            if extent <= 0 {
+ 1838|                true
+ 1839|            } else {
+ 1840|                lx >= 0 && lz >= 0 && lx < extent && lz < extent
+ 1841|            }
+ 1842|        };
+ 1843|        // Compact canopy around the top of the trunk.
+ 1844|        let canopy_y = top_y + 1;
+ 1845|        for dz in -2..=2i32 {
+ 1846|            for dx in -2..=2i32 {
+ 1847|                let r2 = dx * dx + dz * dz;
+ 1848|                if r2 > 5 {
+ 1849|                    continue;
+ 1850|                }
+ 1851|                let lx = x + dx;
+ 1852|                let lz = z + dz;
+ 1853|                if !in_world(lx, lz) {
+ 1854|                    continue;
+ 1855|                }
+ 1856|                let pos = IVec3::new(lx, canopy_y, lz);
+ 1857|                if self.get_voxel(pos).is_some() {
+ 1858|                    continue;
+ 1859|                }
+ 1860|                self.set_voxel(pos, Voxel::leaves());
+ 1861|            }
+ 1862|        }
+ 1863|        // Second thinner ring one block higher.
+ 1864|        for dz in -1..=1i32 {
+ 1865|            for dx in -1..=1i32 {
+ 1866|                if dx.abs() + dz.abs() > 1 {
+ 1867|                    continue;
+ 1868|                }
+ 1869|                let lx = x + dx;
+ 1870|                let lz = z + dz;
+ 1871|                if !in_world(lx, lz) {
+ 1872|                    continue;
+ 1873|                }
+ 1874|                let pos = IVec3::new(lx, canopy_y + 1, lz);
+ 1875|                if self.get_voxel(pos).is_some() {
+ 1876|                    continue;
+ 1877|                }
+ 1878|                self.set_voxel(pos, Voxel::leaves());
+ 1879|            }
+ 1880|        }
+ 1881|    }
+
+================================================================================
+stream_around_timed_look + unload_chunk  (C:\Users\ramonisai\Projects\microvoxel\src\world.rs : 1883-2133)
+================================================================================
+
+ 1883|    /// Load chunks near the camera; unload far ones (infinite world streaming).
+ 1884|    /// Soft-budgets CPU so one frame cannot hitch on a huge gen/commit spike.
+ 1885|    /// No-op when [`ENABLE_STREAMING`] is false or [`DEBUG_FACE_VISIBILITY`] is on.
+ 1886|    pub fn stream_around(&mut self, camera_pos: Vec3) {
+ 1887|        self.stream_around_look(camera_pos, Vec3::ZERO);
+ 1888|    }
+ 1889|
+ 1890|    /// Like [`stream_around`], but prioritizes chunks in `look_xz` (flat forward).
+ 1891|    pub fn stream_around_look(&mut self, camera_pos: Vec3, look_xz: Vec3) {
+ 1892|        let budget = if cfg!(test) {
+ 1893|            Duration::from_millis(200)
+ 1894|        } else if ENABLE_HD2D {
+ 1895|            Duration::from_millis(HD2D_FRAME_STREAM_BUDGET_MS)
+ 1896|        } else {
+ 1897|            Duration::from_millis(FRAME_STREAM_BUDGET_MS)
+ 1898|        };
+ 1899|        self.stream_around_timed_look(camera_pos, look_xz, budget);
+ 1900|    }
+ 1901|
+ 1902|    /// Same as [`stream_around`] with an explicit CPU budget (isotropic).
+ 1903|    pub fn stream_around_timed(&mut self, camera_pos: Vec3, budget: Duration) {
+ 1904|        self.stream_around_timed_look(camera_pos, Vec3::ZERO, budget);
+ 1905|    }
+ 1906|
+ 1907|    /// Stream with optional look-dir preload (Minecraft-style: fill ahead of travel/view).
+ 1908|    pub fn stream_around_timed_look(
+ 1909|        &mut self,
+ 1910|        camera_pos: Vec3,
+ 1911|        look_xz: Vec3,
+ 1912|        budget: Duration,
+ 1913|    ) {
+ 1914|        use rayon::prelude::*;
+ 1915|
+ 1916|        // Face-debug scene must stay a single cube; keep streaming in unit tests.
+ 1917|        if !ENABLE_STREAMING || (DEBUG_FACE_VISIBILITY && !cfg!(test)) {
+ 1918|            return;
+ 1919|        }
+ 1920|        let start = Instant::now();
+ 1921|        let cx = camera_pos.x.floor() as i32;
+ 1922|        let cz = camera_pos.z.floor() as i32;
+ 1923|        let c0 = mesh_chunk_coord(cx, cz);
+ 1924|        let look = {
+ 1925|            let flat = Vec3::new(look_xz.x, 0.0, look_xz.z);
+ 1926|            let len = flat.length();
+ 1927|            if len > 1e-3 {
+ 1928|                flat / len
+ 1929|            } else {
+ 1930|                Vec3::ZERO
+ 1931|            }
+ 1932|        };
+ 1933|
+ 1934|        let max_gen = if ENABLE_HD2D {
+ 1935|            HD2D_MAX_GEN_KICK_PER_FRAME
+ 1936|        } else {
+ 1937|            MAX_GEN_KICK_PER_FRAME
+ 1938|        };
+ 1939|        let max_commit = if ENABLE_HD2D {
+ 1940|            HD2D_MAX_COMMIT_PER_FRAME
+ 1941|        } else {
+ 1942|            MAX_COMMIT_PER_FRAME
+ 1943|        };
+ 1944|
+ 1945|        let mesh_r = ((stream_keep_dist() / MESH_CHUNK_SIZE as f32).ceil() as i32) + 1;
+ 1946|        let mesh_r_sq = mesh_r * mesh_r;
+ 1947|
+ 1948|        // 1) Kick a small FBM batch if the pending queue is hungry.
+ 1949|        // Same Euclidean metric as unload (Chebyshev square caused corner thrash).
+ 1950|        // Mesh-ring holes get a huge score boost (Chunk Guardian preload).
+ 1951|        if self.pending_chunks.len() < PENDING_SOFT_CAP {
+ 1952|            let load_r = ((stream_load_dist() / MESH_CHUNK_SIZE as f32).ceil() as i32) + 1;
+ 1953|            let load_r_sq = load_r * load_r;
+ 1954|            let mut missing = Vec::new();
+ 1955|            for dz in -load_r..=load_r {
+ 1956|                for dx in -load_r..=load_r {
+ 1957|                    let d2 = dx * dx + dz * dz;
+ 1958|                    if d2 > load_r_sq {
+ 1959|                        continue;
+ 1960|                    }
+ 1961|                    let key = (c0.0 + dx, c0.1 + dz);
+ 1962|                    // Revive pending-unload if the player walked back.
+ 1963|                    if self.loaded_chunks.get(&key) == Some(&ChunkState::PendingUnload) {
+ 1964|                        self.loaded_chunks.insert(key, ChunkState::Filled);
+ 1965|                        self.unload_grace.remove(&key);
+ 1966|                    }
+ 1967|                    if !self.loaded_chunks.contains_key(&key) {
+ 1968|                        // Lower score = sooner: mesh holes first, then near, then look.
+ 1969|                        let align = if look != Vec3::ZERO {
+ 1970|                            (dx as f32 * look.x + dz as f32 * look.z).max(0.0)
+ 1971|                        } else {
+ 1972|                            0.0
+ 1973|                        };
+ 1974|                        let hole_boost = if d2 <= mesh_r_sq { -1.0e6 } else { 0.0 };
+ 1975|                        let score = d2 as f32
+ 1976|                            - STREAM_LOOK_PRELOAD_BIAS * align * load_r as f32
+ 1977|                            + hole_boost;
+ 1978|                        missing.push(((score * 1000.0) as i32, d2, key.0, key.1));
+ 1979|                    }
+ 1980|                }
+ 1981|            }
+ 1982|            missing.sort_by_key(|&(score, d2, _, _)| (score, d2));
+ 1983|
+ 1984|            let batch: Vec<(i32, i32)> = missing
+ 1985|                .into_iter()
+ 1986|                .take(max_gen)
+ 1987|                .map(|(_, _, kx, kz)| (kx, kz))
+ 1988|                .filter(|&(kx, kz)| !self.loaded_chunks.contains_key(&(kx, kz)))
+ 1989|                .collect();
+ 1990|
+ 1991|            if !batch.is_empty() {
+ 1992|                for &(kx, kz) in &batch {
+ 1993|                    self.loaded_chunks
+ 1994|                        .insert((kx, kz), ChunkState::Reserved);
+ 1995|                }
+ 1996|                let generated: Vec<(i32, i32, Vec<(i32, i32, i32)>)> = batch
+ 1997|                    .par_iter()
+ 1998|                    .map(|&(kx, kz)| (kx, kz, generate_chunk_columns(kx, kz)))
+ 1999|                    .collect();
+ 2000|                for item in generated {
+ 2001|                    self.pending_chunks.push_back(item);
+ 2002|                }
+ 2003|            }
+ 2004|        }
+ 2005|
+ 2006|        // 2) Commit pending columns â€” mesh-ring holes first, then nearest.
+ 2007|        if !self.pending_chunks.is_empty() {
+ 2008|            let mut pending: Vec<_> = self.pending_chunks.drain(..).collect();
+ 2009|            pending.sort_by_key(|&(kx, kz, _)| {
+ 2010|                let d = chunk_dist_sq_xz(camera_pos, kx, kz);
+ 2011|                let dx = kx - c0.0;
+ 2012|                let dz = kz - c0.1;
+ 2013|                let in_mesh = dx * dx + dz * dz <= mesh_r_sq;
+ 2014|                (if in_mesh { 0u8 } else { 1 }, d.to_bits())
+ 2015|            });
+ 2016|            self.pending_chunks.extend(pending);
+ 2017|        }
+ 2018|        let mut committed = 0usize;
+ 2019|        while committed < max_commit {
+ 2020|            let Some((kx, kz, columns)) = self.pending_chunks.pop_front() else {
+ 2021|                break;
+ 2022|            };
+ 2023|            if !self.loaded_chunks.contains_key(&(kx, kz)) {
+ 2024|                continue;
+ 2025|            }
+ 2026|            let plant_grass = chunk_dist_sq_xz(camera_pos, kx, kz) <= GRASS_GEN_MAX_DIST_SQ;
+ 2027|            self.commit_generated_chunk(kx, kz, &columns, plant_grass);
+ 2028|            committed += 1;
+ 2029|            if committed >= 1 && start.elapsed() >= budget {
+ 2030|                break;
+ 2031|            }
+ 2032|        }
+ 2033|
+ 2034|        // 3) Unload far chunks â€” never drop the keep/mesh ring; grace then swap-drop.
+ 2035|        let unload_r = ((stream_unload_dist() / MESH_CHUNK_SIZE as f32).ceil() as i32) + 1;
+ 2036|        let unload_r_sq = unload_r * unload_r;
+ 2037|        let keep_r_sq = mesh_r_sq;
+ 2038|        let _keep_r = mesh_r;
+ 2039|        let candidates: Vec<(i32, i32)> = self.loaded_chunks.keys().copied().collect();
+ 2040|        let mut to_drop = Vec::new();
+ 2041|        for key in candidates {
+ 2042|            let dx = key.0 - c0.0;
+ 2043|            let dz = key.1 - c0.1;
+ 2044|            let d2 = dx * dx + dz * dz;
+ 2045|            // Absolute rule: never punch a hole inside the visible/keep ring.
+ 2046|            if d2 <= keep_r_sq {
+ 2047|                if self.loaded_chunks.get(&key) == Some(&ChunkState::PendingUnload) {
+ 2048|                    self.loaded_chunks.insert(key, ChunkState::Filled);
+ 2049|                    self.unload_grace.remove(&key);
+ 2050|                }
+ 2051|                continue;
+ 2052|            }
+ 2053|            if d2 <= unload_r_sq {
+ 2054|                // Still inside hysteresis â€” cancel any pending unload.
+ 2055|                if self.loaded_chunks.get(&key) == Some(&ChunkState::PendingUnload) {
+ 2056|                    self.loaded_chunks.insert(key, ChunkState::Filled);
+ 2057|                    self.unload_grace.remove(&key);
+ 2058|                }
+ 2059|                continue;
+ 2060|            }
+ 2061|            match self.loaded_chunks.get(&key).copied() {
+ 2062|                Some(ChunkState::Reserved) => {
+ 2063|                    // Drop abandoned reservations immediately (no voxels yet).
+ 2064|                    to_drop.push(key);
+ 2065|                }
+ 2066|                Some(ChunkState::Filled) => {
+ 2067|                    self.loaded_chunks
+ 2068|                        .insert(key, ChunkState::PendingUnload);
+ 2069|                    self.unload_grace.insert(key, 0);
+ 2070|                }
+ 2071|                Some(ChunkState::PendingUnload) => {
+ 2072|                    let g = self.unload_grace.entry(key).or_insert(0);
+ 2073|                    *g = g.saturating_add(1);
+ 2074|                    if *g >= UNLOAD_GRACE_FRAMES {
+ 2075|                        to_drop.push(key);
+ 2076|                    }
+ 2077|                }
+ 2078|                None => {}
+ 2079|            }
+ 2080|        }
+ 2081|        for key in to_drop {
+ 2082|            self.unload_chunk(key.0, key.1);
+ 2083|        }
+ 2084|
+ 2085|        // 4) Plant grass on bare chunks that entered the gen radius.
+ 2086|        self.seed_grass_near(camera_pos, start, budget);
+ 2087|    }
+ 2088|
+ 2089|    fn unload_chunk(&mut self, cx: i32, cz: i32) {
+ 2090|        self.pending_chunks
+ 2091|            .retain(|&(px, pz, _)| px != cx || pz != cz);
+ 2092|        self.grass_ready.remove(&(cx, cz));
+ 2093|        self.unload_grace.remove(&(cx, cz));
+ 2094|        if self.loaded_chunks.remove(&(cx, cz)).is_none() {
+ 2095|            return;
+ 2096|        }
+ 2097|        let x0 = cx * MESH_CHUNK_SIZE;
+ 2098|        let z0 = cz * MESH_CHUNK_SIZE;
+ 2099|        for z in z0..z0 + MESH_CHUNK_SIZE {
+ 2100|            for x in x0..x0 + MESH_CHUNK_SIZE {
+ 2101|                if let Some(h) = self.heights.remove(&(x, z)) {
+ 2102|                    self.dirt_count = self.dirt_count.saturating_sub((h + 1) as usize);
+ 2103|                }
+ 2104|            }
+ 2105|        }
+ 2106|        let doomed: Vec<IVec3> = self
+ 2107|            .extras
+ 2108|            .keys()
+ 2109|            .copied()
+ 2110|            .filter(|pos| mesh_chunk_coord(pos.x, pos.z) == (cx, cz))
+ 2111|            .collect();
+ 2112|        for pos in doomed {
+ 2113|            if let Some(v) = self.extras.remove(&pos) {
+ 2114|                self.dec_material(v.material);
+ 2115|            }
+ 2116|        }
+ 2117|        self.dirty_edits.remove(&(cx, cz));
+ 2118|        self.dirty_stream.remove(&(cx, cz));
+ 2119|        self.height_bounds.remove(&(cx, cz));
+ 2120|        // Neighbors still have culled shared faces â€” remesh so they seal the void
+ 2121|        // instead of leaving a see-through 16Ã—16 hole.
+ 2122|        for dz in -1..=1 {
+ 2123|            for dx in -1..=1 {
+ 2124|                if dx == 0 && dz == 0 {
+ 2125|                    continue;
+ 2126|                }
+ 2127|                let n = (cx + dx, cz + dz);
+ 2128|                if self.chunk_filled(n.0, n.1) {
+ 2129|                    self.dirty_stream.insert(n);
+ 2130|                }
+ 2131|            }
+ 2132|        }
+ 2133|    }
+
+================================================================================
+chunk helpers  (C:\Users\ramonisai\Projects\microvoxel\src\world.rs : 2370-2485)
+================================================================================
+
+ 2370|                }
+ 2371|            }
+ 2372|        }
+ 2373|        for (pos, v) in &self.extras {
+ 2374|            if mesh_chunk_coord(pos.x, pos.z) == (cx, cz) {
+ 2375|                visit(pos, v);
+ 2376|            }
+ 2377|        }
+ 2378|    }
+ 2379|
+ 2380|    pub fn has_chunk(&self, cx: i32, cz: i32) -> bool {
+ 2381|        self.loaded_chunks.contains_key(&(cx, cz))
+ 2382|    }
+ 2383|
+ 2384|    /// True when voxels exist and may be drawn (Filled or PendingUnload grace).
+ 2385|    pub fn chunk_filled(&self, cx: i32, cz: i32) -> bool {
+ 2386|        self.loaded_chunks.get(&(cx, cz)).is_some_and(|s| {
+ 2387|            matches!(s, ChunkState::Filled | ChunkState::PendingUnload)
+ 2388|        })
+ 2389|    }
+ 2390|
+ 2391|    /// Gen in flight â€” wait before meshing neighbors / never draw.
+ 2392|    pub fn chunk_reserved(&self, cx: i32, cz: i32) -> bool {
+ 2393|        self.loaded_chunks
+ 2394|            .get(&(cx, cz))
+ 2395|            .is_some_and(|s| *s == ChunkState::Reserved)
+ 2396|    }
+ 2397|
+ 2398|    /// 4-neighbors are safe for meshing: wait only on in-flight [`Reserved`] gen.
+ 2399|    /// Missing neighbors are OK (face cull seals the edge); requiring them Filled
+ 2400|    /// deadlocked the first frame until the whole load ring committed.
+ 2401|    pub fn neighbors_ready_for_mesh(&self, _origin: Vec3, cx: i32, cz: i32) -> bool {
+ 2402|        for (dx, dz) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+ 2403|            if self.chunk_reserved(cx + dx, cz + dz) {
+ 2404|                return false;
+ 2405|            }
+ 2406|        }
+ 2407|        true
+ 2408|    }
+ 2409|
+ 2410|    /// Chunk Guardian: keys in the keep/mesh ring that are missing or still Reserved.
+ 2411|    pub fn mesh_ring_holes(&self, origin: Vec3) -> Vec<(i32, i32)> {
+ 2412|        let gx = origin.x.floor() as i32;
+ 2413|        let gz = origin.z.floor() as i32;
+ 2414|        let c0 = mesh_chunk_coord(gx, gz);
+ 2415|        let keep_r = ((stream_keep_dist() / MESH_CHUNK_SIZE as f32).ceil() as i32) + 1;
+ 2416|        let keep_r_sq = keep_r * keep_r;
+ 2417|        let mut holes = Vec::new();
+ 2418|        for dz in -keep_r..=keep_r {
+ 2419|            for dx in -keep_r..=keep_r {
+ 2420|                if dx * dx + dz * dz > keep_r_sq {
+ 2421|                    continue;
+ 2422|                }
+ 2423|                let key = (c0.0 + dx, c0.1 + dz);
+ 2424|                if !self.chunk_filled(key.0, key.1) {
+ 2425|                    holes.push(key);
+ 2426|                }
+ 2427|            }
+ 2428|        }
+ 2429|        holes
+ 2430|    }
+ 2431|
+ 2432|    /// Height continuity on the shared edge with a filled neighbor (deterministic gen).
+ 2433|    pub fn border_heights_match(&self, cx: i32, cz: i32, nx: i32, nz: i32) -> bool {
+ 2434|        if !self.chunk_filled(cx, cz) || !self.chunk_filled(nx, nz) {
+ 2435|            return true;
+ 2436|        }
+ 2437|        let x0 = cx * MESH_CHUNK_SIZE;
+ 2438|        let z0 = cz * MESH_CHUNK_SIZE;
+ 2439|        let nx0 = nx * MESH_CHUNK_SIZE;
+ 2440|        let nz0 = nz * MESH_CHUNK_SIZE;
+ 2441|        if nx == cx + 1 && nz == cz {
+ 2442|            // East edge of self vs west edge of neighbor.
+ 2443|            let x = x0 + MESH_CHUNK_SIZE - 1;
+ 2444|            let xn = nx0;
+ 2445|            for i in 0..MESH_CHUNK_SIZE {
+ 2446|                let z = z0 + i;
+ 2447|                let h = self.heights.get(&(x, z)).copied();
+ 2448|                let hn = self.heights.get(&(xn, z)).copied();
+ 2449|                // Adjacent columns need not match; shared *face* uses each column.
+ 2450|                // Continuity = both sides have a defined surface (no missing column).
+ 2451|                if h.is_none() || hn.is_none() {
+ 2452|                    return false;
+ 2453|                }
+ 2454|                let _ = (h, hn);
+ 2455|            }
+ 2456|            return true;
+ 2457|        }
+ 2458|        if nx == cx - 1 && nz == cz {
+ 2459|            return self.border_heights_match(nx, nz, cx, cz);
+ 2460|        }
+ 2461|        if nz == cz + 1 && nx == cx {
+ 2462|            let z = z0 + MESH_CHUNK_SIZE - 1;
+ 2463|            let zn = nz0;
+ 2464|            for i in 0..MESH_CHUNK_SIZE {
+ 2465|                let x = x0 + i;
+ 2466|                if self.heights.get(&(x, z)).is_none() || self.heights.get(&(x, zn)).is_none() {
+ 2467|                    return false;
+ 2468|                }
+ 2469|            }
+ 2470|            return true;
+ 2471|        }
+ 2472|        if nz == cz - 1 && nx == cx {
+ 2473|            return self.border_heights_match(nx, nz, cx, cz);
+ 2474|        }
+ 2475|        true
+ 2476|    }
+ 2477|
+ 2478|    pub fn loaded_chunk_count(&self) -> usize {
+ 2479|        self.loaded_chunks.len()
+ 2480|    }
+ 2481|}
+ 2482|
+ 2483|#[cfg(test)]
+ 2484|mod shunk_distance_tests {
+ 2485|    use super::*;
+
+================================================================================
+STREAMING TESTS  (C:\Users\ramonisai\Projects\microvoxel\src\world.rs : 2485-2920)
+================================================================================
+
+ 2485|    use super::*;
+ 2486|    use glam::Vec3;
+ 2487|
+ 2488|    #[test]
+ 2489|    fn stream_around_generates_and_unloads() {
+ 2490|        if !ENABLE_STREAMING {
+ 2491|            let mut world = World::new();
+ 2492|            world.stream_around(Vec3::new(4.0, 5.0, 4.0));
+ 2493|            assert!(
+ 2494|                !world.has_chunk(0, 0),
+ 2495|                "streaming disabled: single-shunk world stays empty until with_shunk()"
+ 2496|            );
+ 2497|            return;
+ 2498|        }
+ 2499|        let mut world = World::new();
+ 2500|        for _ in 0..8 {
+ 2501|            world.stream_around(Vec3::new(4.0, 5.0, 4.0));
+ 2502|        }
+ 2503|        assert!(world.has_chunk(0, 0));
+ 2504|        assert!(world.column_height(0, 0).is_some());
+ 2505|
+ 2506|        // Unload uses PendingUnload + grace frames â€” need enough ticks far away.
+ 2507|        for _ in 0..(UNLOAD_GRACE_FRAMES as usize + 24) {
+ 2508|            world.stream_around(Vec3::new(2000.0, 5.0, 2000.0));
+ 2509|        }
+ 2510|        assert!(!world.has_chunk(0, 0));
+ 2511|        let tc = mesh_chunk_coord(2000, 2000);
+ 2512|        assert!(world.has_chunk(tc.0, tc.1));
+ 2513|        assert!(world.column_height(tc.0 * MESH_CHUNK_SIZE, tc.1 * MESH_CHUNK_SIZE).is_some());
+ 2514|    }
+ 2515|
+ 2516|    #[test]
+ 2517|    fn center_distance_at_known_point() {
+ 2518|        if ENABLE_STREAMING {
+ 2519|            // Infinite: standing on the surface â†’ near-zero aabb distance.
+ 2520|            let gx = 8i32;
+ 2521|            let gz = 8i32;
+ 2522|            let y = terrain_height(gx, gz) as f32 + 1.0;
+ 2523|            let on_surface = Vec3::new(gx as f32 + 0.5, y, gz as f32 + 0.5);
+ 2524|            let d = measure_shunk_distance(on_surface);
+ 2525|            assert!(d.to_aabb < 0.1);
+ 2526|            return;
+ 2527|        }
+ 2528|        let center = shunk_center();
+ 2529|        let d = measure_shunk_distance(center);
+ 2530|        assert!(d.to_center < 1e-4);
+ 2531|        assert!(d.to_aabb < 1e-4);
+ 2532|    }
+ 2533|
+ 2534|    #[test]
+ 2535|    fn world_is_nine_contiguous_shunks() {
+ 2536|        assert_eq!(SHUNK_GRID, 3);
+ 2537|        assert_eq!(world_blocks(), SHUNK_GRID * SHUNK_SIZE);
+ 2538|        assert_eq!(TERRAIN_MAX_HEIGHT, 64);
+ 2539|        assert_eq!(TERRAIN_AVG_HEIGHT, 20);
+ 2540|        let world = World::with_shunk();
+ 2541|        let columns = (world_blocks() * world_blocks()) as usize;
+ 2542|        assert_eq!(world.heights.len(), columns);
+ 2543|        // 3Ã—3 mesh chunks covering 0..48.
+ 2544|        for cz in 0..SHUNK_GRID {
+ 2545|            for cx in 0..SHUNK_GRID {
+ 2546|                assert!(
+ 2547|                    world.has_chunk(cx, cz),
+ 2548|                    "missing shunk chunk ({cx},{cz})"
+ 2549|                );
+ 2550|            }
+ 2551|        }
+ 2552|        assert!(!world.has_chunk(SHUNK_GRID, 0));
+ 2553|        assert!(!world.has_chunk(0, SHUNK_GRID));
+ 2554|        let (dirt, grass) = world.voxel_counts();
+ 2555|        if ENABLE_GRASS {
+ 2556|            // Bare patches are common â€” expect well under one tuft per column.
+ 2557|            assert!(grass > 0, "some grass should still grow");
+ 2558|            assert!(
+ 2559|                grass < columns,
+ 2560|                "bare zones should skip some columns ({grass} >= {columns})"
+ 2561|            );
+ 2562|            assert!(
+ 2563|                (grass as f32) < columns as f32 * 0.40,
+ 2564|                "grass cover too dense: {grass}/{columns}"
+ 2565|            );
+ 2566|        } else {
+ 2567|            assert_eq!(grass, 0);
+ 2568|        }
+ 2569|        assert!(dirt >= columns);
+ 2570|        let max_h = world.heights.values().copied().max().unwrap_or(0);
+ 2571|        assert!(max_h <= TERRAIN_MAX_HEIGHT);
+ 2572|        let mut all_dirt_solid = true;
+ 2573|        let mut trees = 0usize;
+ 2574|        world.for_each_voxel(|_, v| {
+ 2575|            if v.material == Material::Dirt && !v.is_fully_solid() {
+ 2576|                all_dirt_solid = false;
+ 2577|            }
+ 2578|            if v.material == Material::Wood {
+ 2579|                trees += 1;
+ 2580|            }
+ 2581|        });
+ 2582|        assert!(all_dirt_solid);
+ 2583|        if ENABLE_TREES {
+ 2584|            assert!(trees > 0, "expected at least one trunk segment");
+ 2585|        }
+ 2586|    }
+ 2587|
+ 2588|    #[test]
+ 2589|    fn aabb_distance_outside() {
+ 2590|        if ENABLE_STREAMING {
+ 2591|            let gx = 0i32;
+ 2592|            let gz = 0i32;
+ 2593|            let surface_y = terrain_height(gx, gz) as f32 + 1.0;
+ 2594|            let above = Vec3::new(0.5, surface_y + 10.0, 0.5);
+ 2595|            let d = measure_shunk_distance(above);
+ 2596|            assert!((d.to_aabb - 10.0).abs() < 0.2);
+ 2597|            return;
+ 2598|        }
+ 2599|        let d = measure_shunk_distance(Vec3::new(-3.0, 0.5, 2.0));
+ 2600|        assert!((d.to_aabb - 3.0).abs() < 1e-3);
+ 2601|        assert!(d.to_center > d.to_aabb);
+ 2602|    }
+ 2603|
+ 2604|    #[test]
+ 2605|    fn infinite_streaming_loads_around_camera() {
+ 2606|        assert!(ENABLE_STREAMING);
+ 2607|        let mut world = World::new();
+ 2608|        for _ in 0..8 {
+ 2609|            world.stream_around(Vec3::new(8.0, 40.0, 8.0));
+ 2610|        }
+ 2611|        assert!(world.loaded_chunk_count() > 0);
+ 2612|        assert!(world.has_chunk(0, 0));
+ 2613|        assert!(world.column_height(0, 0).is_some());
+ 2614|        for _ in 0..(UNLOAD_GRACE_FRAMES as usize + 24) {
+ 2615|            world.stream_around(Vec3::new(4000.0, 40.0, 4000.0));
+ 2616|        }
+ 2617|        assert!(!world.has_chunk(0, 0));
+ 2618|        let tc = mesh_chunk_coord(4000, 4000);
+ 2619|        assert!(world.has_chunk(tc.0, tc.1));
+ 2620|        assert!(world.column_height(tc.0 * MESH_CHUNK_SIZE, tc.1 * MESH_CHUNK_SIZE).is_some());
+ 2621|    }
+ 2622|
+ 2623|    /// Load/unload both use Euclidean chunk radius (hysteresis: load < unload).
+ 2624|    #[test]
+ 2625|    fn streaming_bubble_math() {
+ 2626|        let load_r = ((stream_load_dist() / MESH_CHUNK_SIZE as f32).ceil() as i32) + 1;
+ 2627|        let unload_r = ((stream_unload_dist() / MESH_CHUNK_SIZE as f32).ceil() as i32) + 1;
+ 2628|        let keep_r = ((stream_keep_dist() / MESH_CHUNK_SIZE as f32).ceil() as i32) + 1;
+ 2629|        assert_eq!(VIEW_DISTANCE_SHUNKS, 6);
+ 2630|        assert_eq!(VIEW_DISTANCE, 96.0);
+ 2631|        if ENABLE_HD2D {
+ 2632|            let expect_load =
+ 2633|                HD2D_DIRT_MESH_DIST + MESH_CHUNK_SIZE as f32 * STREAM_SAFETY_RING_CHUNKS as f32;
+ 2634|            let expect_unload = HD2D_DIRT_MESH_DIST
+ 2635|                + MESH_CHUNK_SIZE as f32 * (STREAM_SAFETY_RING_CHUNKS as f32 + 1.5);
+ 2636|            assert!((stream_load_dist() - expect_load).abs() < 0.1);
+ 2637|            assert!((stream_unload_dist() - expect_unload).abs() < 0.1);
+ 2638|            assert!(stream_keep_dist() <= stream_load_dist());
+ 2639|            assert!(keep_r <= load_r);
+ 2640|        } else {
+ 2641|            assert_eq!(load_r, 8);
+ 2642|            assert_eq!(unload_r, 10);
+ 2643|        }
+ 2644|        assert!(load_r < unload_r, "hysteresis band avoids thrash");
+ 2645|        let load_r_sq = load_r * load_r;
+ 2646|        let unload_r_sq = unload_r * unload_r;
+ 2647|        let mut loadable = 0i32;
+ 2648|        let mut thrash = 0i32;
+ 2649|        for dz in -load_r..=load_r {
+ 2650|            for dx in -load_r..=load_r {
+ 2651|                let d2 = dx * dx + dz * dz;
+ 2652|                if d2 > load_r_sq {
+ 2653|                    continue;
+ 2654|                }
+ 2655|                loadable += 1;
+ 2656|                if d2 > unload_r_sq {
+ 2657|                    thrash += 1;
+ 2658|                }
+ 2659|            }
+ 2660|        }
+ 2661|        // Safety ring expands the load disk vs the old mesh-only bubble.
+ 2662|        assert!(loadable > 100, "load disk too small: {loadable}");
+ 2663|        assert_eq!(thrash, 0, "Euclidean load must sit inside unload circle");
+ 2664|    }
+ 2665|
+ 2666|    #[test]
+ 2667|    fn grass_only_generated_near_camera() {
+ 2668|        if !ENABLE_STREAMING || !ENABLE_GRASS {
+ 2669|            return;
+ 2670|        }
+ 2671|        let cam = Vec3::new(8.0, 40.0, 8.0);
+ 2672|        let mut world = World::new();
+ 2673|        for _ in 0..80 {
+ 2674|            world.stream_around(cam);
+ 2675|        }
+ 2676|        // Near chunk must be grass-ready; a far loaded chunk must not.
+ 2677|        assert!(world.grass_ready.contains(&(0, 0)));
+ 2678|        let far = world
+ 2679|            .loaded_chunks
+ 2680|            .keys()
+ 2681|            .copied()
+ 2682|            .filter(|&(cx, cz)| chunk_dist_sq_xz(cam, cx, cz) > GRASS_GEN_MAX_DIST_SQ)
+ 2683|            .collect::<Vec<_>>();
+ 2684|        assert!(!far.is_empty(), "expected some dirt-only far chunks");
+ 2685|        for (cx, cz) in far {
+ 2686|            assert!(
+ 2687|                !world.grass_ready.contains(&(cx, cz)),
+ 2688|                "chunk ({cx},{cz}) beyond grass gen radius should stay bare"
+ 2689|            );
+ 2690|        }
+ 2691|        assert_eq!(GRASS_GEN_MAX_DIST, 80.0);
+ 2692|    }
+ 2693|
+ 2694|    #[test]
+ 2695|    fn blur_ramps_across_view_bubble() {
+ 2696|        assert_eq!(blur_amount_for_distance(0.0), 0.0);
+ 2697|        assert_eq!(blur_amount_for_distance(BLUR_START_DIST - 0.1), 0.0);
+ 2698|        assert!((blur_amount_for_distance(BLUR_START_DIST) - BLUR_START_AMOUNT).abs() < 1e-4);
+ 2699|        assert!((blur_amount_for_distance(BLUR_END_DIST) - BLUR_MAX_AMOUNT).abs() < 1e-4);
+ 2700|        assert!((blur_amount_for_distance(BLUR_END_DIST + 10.0) - BLUR_MAX_AMOUNT).abs() < 1e-4);
+ 2701|        let mid = (BLUR_START_DIST + BLUR_END_DIST) * 0.5;
+ 2702|        let expected =
+ 2703|            BLUR_START_AMOUNT + 0.5 * (BLUR_MAX_AMOUNT - BLUR_START_AMOUNT);
+ 2704|        assert!((blur_amount_for_distance(mid) - expected).abs() < 1e-3);
+ 2705|    }
+ 2706|
+ 2707|    #[test]
+ 2708|    fn chunk_section_layout_is_16x32x16_stack2() {
+ 2709|        assert_eq!(MESH_CHUNK_SIZE, 16);
+ 2710|        assert_eq!(CHUNK_SECTION_HEIGHT, 32);
+ 2711|        assert_eq!(CHUNK_SECTIONS_Y, 2);
+ 2712|        assert_eq!(WORLD_MAX_HEIGHT, 64);
+ 2713|        assert_eq!(chunk_coord(IVec3::new(15, 31, 15)), (0, 0, 0));
+ 2714|        assert_eq!(chunk_coord(IVec3::new(16, 32, 16)), (1, 1, 1));
+ 2715|        assert_eq!(chunk_coord(IVec3::new(0, 63, 0)), (0, 1, 0));
+ 2716|    }
+ 2717|
+ 2718|    #[test]
+ 2719|    fn grass_lod_shortens_then_seals_carpet() {
+ 2720|        let near = GrassLod::for_distance(10.0);
+ 2721|        assert!(!near.solid_carpet);
+ 2722|        assert_eq!(near.max_blade_y, Some(MICROVOXEL_RES - 1));
+ 2723|
+ 2724|        let at_60 = GrassLod::for_distance(60.0);
+ 2725|        assert!(at_60.solid_carpet);
+ 2726|        assert_eq!(at_60.max_blade_y, Some(GRASS_BLADE_MAX_HEIGHT - 1));
+ 2727|
+ 2728|        let at_62 = GrassLod::for_distance(62.0);
+ 2729|        assert!(at_62.solid_carpet);
+ 2730|        assert_eq!(at_62.max_blade_y, Some(GRASS_BLADE_MAX_HEIGHT - 3));
+ 2731|
+ 2732|        let at_65 = GrassLod::for_distance(65.0);
+ 2733|        assert!(at_65.solid_carpet);
+ 2734|        assert!(at_65.max_blade_y.is_none());
+ 2735|    }
+ 2736|
+ 2737|    #[test]
+ 2738|    fn walkable_columns_step_at_most_one() {
+ 2739|        // Full chebyshev cone is 1-Lipschitz â€” hills stay climbable without jumping.
+ 2740|        let mut checked = 0usize;
+ 2741|        for z in 0..24 {
+ 2742|            for x in 0..24 {
+ 2743|                let h = cone_terrace_height(x, z, TERRACE_RADIUS, false);
+ 2744|                for (dx, dz) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+ 2745|                    let nh = cone_terrace_height(x + dx, z + dz, TERRACE_RADIUS, false);
+ 2746|                    assert!(
+ 2747|                        (h - nh).abs() <= WALKABLE_STEP,
+ 2748|                        "cone step ({x},{z})={h} vs ({nx},{nz})={nh}",
+ 2749|                        nx = x + dx,
+ 2750|                        nz = z + dz,
+ 2751|                        nh = nh
+ 2752|                    );
+ 2753|                }
+ 2754|                checked += 1;
+ 2755|            }
+ 2756|        }
+ 2757|        assert_eq!(checked, 24 * 24);
+ 2758|    }
+ 2759|
+ 2760|    #[test]
+ 2761|    fn cliff_kind_skips_terrace_fill() {
+ 2762|        // Cliff/Canyon columns keep smoothed raw height (no cone fill).
+ 2763|        let cols = generate_chunk_columns(2, -1);
+ 2764|        let mut cliffs = 0usize;
+ 2765|        for &(x, z, h) in &cols {
+ 2766|            if matches!(
+ 2767|                terrain_slope_kind(x, z),
+ 2768|                TerrainSlope::Cliff | TerrainSlope::Canyon
+ 2769|            ) {
+ 2770|                assert_eq!(h, smoothed_column_height(x, z));
+ 2771|                cliffs += 1;
+ 2772|            }
+ 2773|        }
+ 2774|        // Soft worlds may have zero cliffs in one chunk â€” property still holds vacuously.
+ 2775|        let _ = cliffs;
+ 2776|    }
+ 2777|
+ 2778|    #[test]
+ 2779|    fn streamed_columns_match_terraced_height() {
+ 2780|        let cols = generate_chunk_columns(0, 0);
+ 2781|        assert_eq!(cols.len(), (MESH_CHUNK_SIZE * MESH_CHUNK_SIZE) as usize);
+ 2782|        // Interior cells share the same local blur+cone neighborhood as the
+ 2783|        // single-column path; chunk edges can differ by pad clamping.
+ 2784|        for &(x, z, h) in &cols {
+ 2785|            if (2..14).contains(&x) && (2..14).contains(&z) {
+ 2786|                assert_eq!(h, terraced_column_height(x, z), "at ({x},{z})");
+ 2787|            }
+ 2788|        }
+ 2789|    }
+ 2790|
+ 2791|    #[test]
+ 2792|    fn terrace_raises_when_raw_neighbor_is_steeper_than_one() {
+ 2793|        // Find a column whose smoothed neighborhood drops >1; cone should fill stairs.
+ 2794|        let mut raised = 0usize;
+ 2795|        for z in 0..32 {
+ 2796|            for x in 0..32 {
+ 2797|                let raw = smoothed_column_height(x, z);
+ 2798|                let mut steep_raw = false;
+ 2799|                for (dx, dz) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+ 2800|                    if (smoothed_column_height(x + dx, z + dz) - raw).abs() > 1 {
+ 2801|                        steep_raw = true;
+ 2802|                        break;
+ 2803|                    }
+ 2804|                }
+ 2805|                if !steep_raw {
+ 2806|                    continue;
+ 2807|                }
+ 2808|                let terraced = cone_terrace_height(x, z, TERRACE_RADIUS, false);
+ 2809|                // At least one of the pair should be closer to walkable after terrace.
+ 2810|                for (dx, dz) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+ 2811|                    let nr = smoothed_column_height(x + dx, z + dz);
+ 2812|                    if (nr - raw).abs() <= 1 {
+ 2813|                        continue;
+ 2814|                    }
+ 2815|                    let nt = cone_terrace_height(x + dx, z + dz, TERRACE_RADIUS, false);
+ 2816|                    assert!(
+ 2817|                        (terraced - nt).abs() <= WALKABLE_STEP,
+ 2818|                        "terrace should flatten steep raw edge at ({x},{z})"
+ 2819|                    );
+ 2820|                    raised += 1;
+ 2821|                }
+ 2822|            }
+ 2823|        }
+ 2824|        // If the soft field has no >1 raw edges in this window, cone is still Lipschitz (other test).
+ 2825|        let _ = raised;
+ 2826|    }
+ 2827|
+ 2828|    #[test]
+ 2829|    fn never_unload_inside_keep_ring() {
+ 2830|        if !ENABLE_STREAMING {
+ 2831|            return;
+ 2832|        }
+ 2833|        let mut world = World::new();
+ 2834|        let origin = Vec3::new(8.0, 20.0, 8.0);
+ 2835|        for _ in 0..16 {
+ 2836|            world.stream_around(origin);
+ 2837|        }
+ 2838|        assert!(world.chunk_filled(0, 0));
+ 2839|        for _ in 0..8 {
+ 2840|            world.stream_around(origin + Vec3::new(8.0, 0.0, 0.0));
+ 2841|        }
+ 2842|        assert!(
+ 2843|            world.chunk_filled(0, 0),
+ 2844|            "keep ring must retain filled voxels"
+ 2845|        );
+ 2846|    }
+ 2847|
+ 2848|    #[test]
+ 2849|    fn pending_unload_then_drop_after_grace() {
+ 2850|        if !ENABLE_STREAMING {
+ 2851|            return;
+ 2852|        }
+ 2853|        let mut world = World::new();
+ 2854|        for _ in 0..12 {
+ 2855|            world.stream_around(Vec3::new(8.0, 20.0, 8.0));
+ 2856|        }
+ 2857|        assert!(world.has_chunk(0, 0));
+ 2858|        let mut saw_pending = false;
+ 2859|        for _ in 0..(UNLOAD_GRACE_FRAMES as usize + 16) {
+ 2860|            world.stream_around(Vec3::new(5000.0, 20.0, 5000.0));
+ 2861|            if world
+ 2862|                .loaded_chunks
+ 2863|                .get(&(0, 0))
+ 2864|                .is_some_and(|s| *s == ChunkState::PendingUnload)
+ 2865|            {
+ 2866|                saw_pending = true;
+ 2867|            }
+ 2868|            if !world.has_chunk(0, 0) {
+ 2869|                break;
+ 2870|            }
+ 2871|        }
+ 2872|        assert!(
+ 2873|            !world.has_chunk(0, 0),
+ 2874|            "chunk must drop after unload grace (saw_pending={saw_pending})"
+ 2875|        );
+ 2876|    }
+ 2877|
+ 2878|    #[test]
+ 2879|    fn neighbors_ready_waits_on_reserved() {
+ 2880|        let mut world = World::new();
+ 2881|        world
+ 2882|            .loaded_chunks
+ 2883|            .insert((0, 0), ChunkState::Filled);
+ 2884|        world
+ 2885|            .loaded_chunks
+ 2886|            .insert((1, 0), ChunkState::Reserved);
+ 2887|        let origin = Vec3::new(8.0, 10.0, 8.0);
+ 2888|        assert!(!world.neighbors_ready_for_mesh(origin, 0, 0));
+ 2889|        world
+ 2890|            .loaded_chunks
+ 2891|            .insert((1, 0), ChunkState::Filled);
+ 2892|        assert!(world.neighbors_ready_for_mesh(origin, 0, 0));
+ 2893|    }
+ 2894|
+ 2895|    #[test]
+ 2896|    fn mesh_ring_holes_lists_missing() {
+ 2897|        let world = World::new();
+ 2898|        let holes = world.mesh_ring_holes(Vec3::new(8.0, 10.0, 8.0));
+ 2899|        assert!(!holes.is_empty());
+ 2900|        assert!(holes.contains(&(0, 0)));
+ 2901|    }
+ 2902|
+ 2903|    #[test]
+ 2904|    fn border_heights_match_when_both_filled() {
+ 2905|        let mut world = World::new();
+ 2906|        let a = generate_chunk_columns(0, 0);
+ 2907|        let b = generate_chunk_columns(1, 0);
+ 2908|        world.commit_generated_chunk(0, 0, &a, false);
+ 2909|        world.commit_generated_chunk(1, 0, &b, false);
+ 2910|        assert!(world.border_heights_match(0, 0, 1, 0));
+ 2911|    }
+ 2912|}
+ 2913|
+ 2914|#[cfg(test)]
+ 2915|mod column_edit_tests {
+ 2916|    use super::*;
+ 2917|
+ 2918|    #[test]
+ 2919|    fn stone_more_likely_deeper_than_surface() {
+ 2920|        let mut surface = 0u32;
+
+================================================================================
+mesh_stream_origin  (C:\Users\ramonisai\Projects\microvoxel\src\render.rs : 150-156)
+================================================================================
+
+  150|fn mesh_stream_origin(camera: &Camera) -> Vec3 {
+  151|    if crate::world::ENABLE_HD2D {
+  152|        camera.hd2d_focus()
+  153|    } else {
+  154|        camera.position
+  155|    }
+  156|}
+
+================================================================================
+ensure_mesh_cached / rebuild / evict / budget  (C:\Users\ramonisai\Projects\microvoxel\src\render.rs : 1485-1850)
+================================================================================
+
+ 1485|    fn rebuild_chunk(&mut self, world: &World, camera: &Camera, cx: i32, cz: i32) {
+ 1486|        let origin = mesh_stream_origin(camera);
+ 1487|        let state_key = chunk_state_key(camera, cx, cz);
+ 1488|        let grass_key = grass_state_key(origin, cx, cz);
+ 1489|        let (vertices, indices, grass) =
+ 1490|            if chunk_distance_band(crate::world::chunk_dist_sq_xz(origin, cx, cz)) >= 4 {
+ 1491|                (Vec::new(), Vec::new(), Vec::new())
+ 1492|            } else {
+ 1493|                build_chunk_mesh(world, cx, cz, camera.position, origin)
+ 1494|            };
+ 1495|        let gpu = upload_chunk_gpu(&self.device, &vertices, &indices, &grass);
+ 1496|        self.chunk_meshes.insert(
+ 1497|            (cx, cz),
+ 1498|            ChunkMeshEntry {
+ 1499|                state_key,
+ 1500|                grass_key,
+ 1501|                gpu,
+ 1502|                last_used: self.frame_index,
+ 1503|                hole_since: None,
+ 1504|            },
+ 1505|        );
+ 1506|    }
+ 1507|
+ 1508|    /// Drop least-recently-used meshes that are no longer in the loaded world.
+ 1509|    /// Never evict meshes still in the frustum / keep ring (fallback until new Ready).
+ 1510|    fn evict_vram_cache(&mut self, world: &World) {
+ 1511|        let visible: rustc_hash::FxHashSet<(i32, i32)> =
+ 1512|            self.visible_chunks.iter().copied().collect();
+ 1513|        while self.chunk_meshes.len() > MAX_VRAM_CHUNK_MESHES {
+ 1514|            let victim = self
+ 1515|                .chunk_meshes
+ 1516|                .iter()
+ 1517|                .filter(|(&(cx, cz), _)| {
+ 1518|                    !visible.contains(&(cx, cz)) && !world.chunk_filled(cx, cz)
+ 1519|                })
+ 1520|                .min_by_key(|(_, e)| e.last_used)
+ 1521|                .map(|(&k, _)| k)
+ 1522|                .or_else(|| {
+ 1523|                    // Second choice: unloaded + not visible (grace already elapsed).
+ 1524|                    self.chunk_meshes
+ 1525|                        .iter()
+ 1526|                        .filter(|(&(cx, cz), _)| {
+ 1527|                            !visible.contains(&(cx, cz)) && !world.has_chunk(cx, cz)
+ 1528|                        })
+ 1529|                        .min_by_key(|(_, e)| e.last_used)
+ 1530|                        .map(|(&k, _)| k)
+ 1531|                });
+ 1532|            let Some(key) = victim else {
+ 1533|                break;
+ 1534|            };
+ 1535|            self.chunk_meshes.remove(&key);
+ 1536|        }
+ 1537|    }
+ 1538|
+ 1539|    fn ensure_mesh_cached(&mut self, camera: &Camera, world: &mut World) {
+ 1540|        use crate::world::dirt_mesh_max_dist;
+ 1541|        use rayon::prelude::*;
+ 1542|        use rustc_hash::FxHashSet;
+ 1543|        use std::time::{Duration, Instant};
+ 1544|
+ 1545|        self.frame_index = self.frame_index.wrapping_add(1);
+ 1546|
+ 1547|        // Stream around focus in HD-2D so lens confine/pull-in does not thrash chunks.
+ 1548|        let look = camera.forward();
+ 1549|        let origin = mesh_stream_origin(camera);
+ 1550|        world.stream_around_look(origin, look);
+ 1551|        // Keep unloaded chunk meshes in VRAM (LRU); only evict when over budget.
+ 1552|        self.evict_vram_cache(world);
+ 1553|
+ 1554|        // Player edits: keep GPU mesh until replacement uploads (never hole-punch).
+ 1555|        // Prioritize these so solid ghost meshes don't linger >1 frame near the dig.
+ 1556|        for (cx, cz) in world.take_dirty_edits() {
+ 1557|            if let Some(entry) = self.chunk_meshes.get_mut(&(cx, cz)) {
+ 1558|                entry.state_key = 0;
+ 1559|            }
+ 1560|            self.chunk_rebuild_queue.insert((cx, cz));
+ 1561|            self.edit_priority.insert((cx, cz));
+ 1562|        }
+ 1563|
+ 1564|        let grass_origin = grass_density_origin(camera);
+ 1565|        let near = world.chunk_coords_near(origin, dirt_mesh_max_dist());
+ 1566|        let visible = cull_chunks(camera, world, &near);
+ 1567|        let visible_set: FxHashSet<(i32, i32)> = visible.iter().copied().collect();
+ 1568|
+ 1569|        // Streaming dirties: queue rebuild but KEEP the old GPU mesh until the new
+ 1570|        // one uploads â€” removing first punched 16Ã—16 holes (wireframe neighbor walls).
+ 1571|        for (cx, cz) in world.take_dirty_stream() {
+ 1572|            let hot = (-1..=1).any(|dx| {
+ 1573|                (-1..=1).any(|dz| visible_set.contains(&(cx + dx, cz + dz)))
+ 1574|            });
+ 1575|            if let Some(entry) = self.chunk_meshes.get_mut(&(cx, cz)) {
+ 1576|                entry.state_key = 0; // invalidate so LOD can't look "clean" while queued
+ 1577|            }
+ 1578|            if hot {
+ 1579|                self.chunk_rebuild_queue.insert((cx, cz));
+ 1580|            }
+ 1581|        }
+ 1582|
+ 1583|        for &(cx, cz) in &visible {
+ 1584|            // Reserved-but-empty chunks must not draw a stale VRAM mesh.
+ 1585|            if !world.chunk_filled(cx, cz) {
+ 1586|                continue;
+ 1587|            }
+ 1588|            let want = chunk_state_key(camera, cx, cz);
+ 1589|            let want_grass = grass_state_key(grass_origin, cx, cz);
+ 1590|            let missing_gpu = self
+ 1591|                .chunk_meshes
+ 1592|                .get(&(cx, cz))
+ 1593|                .map(|e| e.gpu.is_none())
+ 1594|                .unwrap_or(true);
+ 1595|            if missing_gpu {
+ 1596|                let entry = self.chunk_meshes.entry((cx, cz)).or_insert(ChunkMeshEntry {
+ 1597|                    state_key: 0,
+ 1598|                    grass_key: 0,
+ 1599|                    gpu: None,
+ 1600|                    last_used: self.frame_index,
+ 1601|                    hole_since: Some(self.frame_index),
+ 1602|                });
+ 1603|                if entry.hole_since.is_none() {
+ 1604|                    entry.hole_since = Some(self.frame_index);
+ 1605|                }
+ 1606|            }
+ 1607|            let dirty = match self.chunk_meshes.get(&(cx, cz)) {
+ 1608|                Some(e) => {
+ 1609|                    e.gpu.is_none() || e.state_key != want || e.grass_key != want_grass
+ 1610|                }
+ 1611|                None => true,
+ 1612|            };
+ 1613|            if dirty {
+ 1614|                self.chunk_rebuild_queue.insert((cx, cz));
+ 1615|            } else if let Some(e) = self.chunk_meshes.get_mut(&(cx, cz)) {
+ 1616|                e.last_used = self.frame_index;
+ 1617|                e.hole_since = None;
+ 1618|            }
+ 1619|        }
+ 1620|
+ 1621|        // Chunk Guardian: force mesh-ring holes + long-missing GPU to the front.
+ 1622|        let ring_holes = world.mesh_ring_holes(origin);
+ 1623|        let mesh_ring_has_holes = !ring_holes.is_empty();
+ 1624|        for (cx, cz) in &ring_holes {
+ 1625|            if world.chunk_filled(*cx, *cz) {
+ 1626|                self.chunk_rebuild_queue.insert((*cx, *cz));
+ 1627|                self.edit_priority.insert((*cx, *cz));
+ 1628|            }
+ 1629|        }
+ 1630|        for &(cx, cz) in &visible {
+ 1631|            if !world.chunk_filled(cx, cz) {
+ 1632|                continue;
+ 1633|            }
+ 1634|            let stuck = self.chunk_meshes.get(&(cx, cz)).and_then(|e| {
+ 1635|                if e.gpu.is_some() {
+ 1636|                    None
+ 1637|                } else {
+ 1638|                    e.hole_since
+ 1639|                }
+ 1640|            });
+ 1641|            if let Some(since) = stuck {
+ 1642|                if self.frame_index.saturating_sub(since) >= 2 {
+ 1643|                    self.chunk_rebuild_queue.insert((cx, cz));
+ 1644|                    self.edit_priority.insert((cx, cz));
+ 1645|                }
+ 1646|            }
+ 1647|        }
+ 1648|
+ 1649|        // Rebuild frustum chunks first (nearest last for pop), drop off-screen leftovers.
+ 1650|        // Prefer: player edits / guardian holes â†’ missing GPU mesh â†’ LOD upgrades.
+ 1651|        let mut ordered: Vec<(i32, i32)> = self
+ 1652|            .chunk_rebuild_queue
+ 1653|            .iter()
+ 1654|            .copied()
+ 1655|            .filter(|k| visible_set.contains(k) || self.edit_priority.contains(k))
+ 1656|            .collect();
+ 1657|        ordered.sort_by_key(|&(cx, cz)| {
+ 1658|            let d = crate::world::chunk_dist_sq_xz(origin, cx, cz);
+ 1659|            let missing = self
+ 1660|                .chunk_meshes
+ 1661|                .get(&(cx, cz))
+ 1662|                .map(|e| e.gpu.is_none())
+ 1663|                .unwrap_or(true);
+ 1664|            let edit_pri = if self.edit_priority.contains(&(cx, cz)) {
+ 1665|                0i64
+ 1666|            } else {
+ 1667|                1
+ 1668|            };
+ 1669|            let hole_pri = if missing { 0i64 } else { 1 };
+ 1670|            -((edit_pri << 41) + (hole_pri << 40) + (d * 1000.0) as i64)
+ 1671|        });
+ 1672|        self.chunk_rebuild_queue.clear();
+ 1673|
+ 1674|        let mesh_budget_ms = if crate::world::ENABLE_HD2D {
+ 1675|            // Extra ms while dig edits or guardian holes are pending.
+ 1676|            if self.edit_priority.is_empty() && !mesh_ring_has_holes {
+ 1677|                FRAME_MESH_BUDGET_MS + 2
+ 1678|            } else {
+ 1679|                FRAME_MESH_BUDGET_MS + 6
+ 1680|            }
+ 1681|        } else if mesh_ring_has_holes {
+ 1682|            FRAME_MESH_BUDGET_MS + 3
+ 1683|        } else {
+ 1684|            FRAME_MESH_BUDGET_MS
+ 1685|        };
+ 1686|        let mesh_budget = Duration::from_millis(mesh_budget_ms);
+ 1687|        let mesh_start = Instant::now();
+ 1688|        let mut rebuilt_count = 0usize;
+ 1689|        // Feed rayon with up to min(cap, 16) chunks per par_iter burst.
+ 1690|        let batch_cap = self.chunk_rebuilds_per_frame.min(16);
+ 1691|
+ 1692|        // Amortize: parallel batches sized to cores, stop when the frame budget is spent.
+ 1693|        while rebuilt_count < self.chunk_rebuilds_per_frame
+ 1694|            && mesh_start.elapsed() < mesh_budget
+ 1695|        {
+ 1696|            let mut batch = Vec::new();
+ 1697|            let mut deferred = Vec::new();
+ 1698|            while batch.len() < batch_cap
+ 1699|                && rebuilt_count + batch.len() < self.chunk_rebuilds_per_frame
+ 1700|            {
+ 1701|                let Some((cx, cz)) = ordered.pop() else {
+ 1702|                    break;
+ 1703|                };
+ 1704|                if !world.chunk_filled(cx, cz) {
+ 1705|                    continue;
+ 1706|                }
+ 1707|                // Beyond mesh distance: keep any prior mesh, do not rebuild to empty.
+ 1708|                if chunk_distance_band(crate::world::chunk_dist_sq_xz(origin, cx, cz)) >= 4 {
+ 1709|                    continue;
+ 1710|                }
+ 1711|                // Neighbor gate: wait for Reserved neighbors in the load ring.
+ 1712|                // Keep old GPU mesh meanwhile (fallback) â€” never hole-punch.
+ 1713|                if !world.neighbors_ready_for_mesh(origin, cx, cz) {
+ 1714|                    deferred.push((cx, cz));
+ 1715|                    continue;
+ 1716|                }
+ 1717|                let want = chunk_state_key(camera, cx, cz);
+ 1718|                let want_grass = grass_state_key(grass_origin, cx, cz);
+ 1719|                if self.chunk_meshes.get(&(cx, cz)).is_some_and(|e| {
+ 1720|                    e.gpu.is_some() && e.state_key == want && e.grass_key == want_grass
+ 1721|                }) {
+ 1722|                    continue;
+ 1723|                }
+ 1724|                batch.push((cx, cz));
+ 1725|            }
+ 1726|            // Re-queue chunks waiting on neighbors.
+ 1727|            ordered.extend(deferred);
+ 1728|            if batch.is_empty() {
+ 1729|                break;
+ 1730|            }
+ 1731|
+ 1732|            let rebuilt: Vec<_> = batch
+ 1733|                .par_iter()
+ 1734|                .map(|&(cx, cz)| {
+ 1735|                    let state_key = chunk_state_key(camera, cx, cz);
+ 1736|                    let grass_key = grass_state_key(grass_origin, cx, cz);
+ 1737|                    let (vertices, indices, grass) =
+ 1738|                        build_chunk_mesh(world, cx, cz, camera.position, grass_origin);
+ 1739|                    ((cx, cz), state_key, grass_key, vertices, indices, grass)
+ 1740|                })
+ 1741|                .collect();
+ 1742|
+ 1743|            for (key, state_key, grass_key, vertices, indices, grass) in rebuilt {
+ 1744|                let gpu = upload_chunk_gpu(&self.device, &vertices, &indices, &grass);
+ 1745|                if gpu.is_none() {
+ 1746|                    // Keep the previous mesh if upload produced nothing (never hole-punch).
+ 1747|                    if let Some(entry) = self.chunk_meshes.get_mut(&key) {
+ 1748|                        entry.last_used = self.frame_index;
+ 1749|                    }
+ 1750|                    // Empty mesh for a filled chunk â€” guardian will retry next frames.
+ 1751|                    rebuilt_count += 1;
+ 1752|                    continue;
+ 1753|                }
+ 1754|                self.edit_priority.remove(&key);
+ 1755|                self.chunk_meshes.insert(
+ 1756|                    key,
+ 1757|                    ChunkMeshEntry {
+ 1758|                        state_key,
+ 1759|                        grass_key,
+ 1760|                        gpu,
+ 1761|                        last_used: self.frame_index,
+ 1762|                        hole_since: None,
+ 1763|                    },
+ 1764|                );
+ 1765|                rebuilt_count += 1;
+ 1766|            }
+ 1767|
+ 1768|            // Always finish at least one batch; further batches respect the budget.
+ 1769|            if rebuilt_count > 0 && mesh_start.elapsed() >= mesh_budget {
+ 1770|                break;
+ 1771|            }
+ 1772|        }
+ 1773|
+ 1774|        // Leftover dirty *visible* chunks wait for a later frame.
+ 1775|        self.chunk_rebuild_queue.extend(ordered);
+ 1776|
+ 1777|        self.visible_chunks = visible;
+ 1778|        self.evict_vram_cache(world);
+ 1779|    }
+ 1780|
+ 1781|    fn draw_visible_dirt<'a>(
+ 1782|        &'a self,
+ 1783|        pass: &mut wgpu::RenderPass<'a>,
+ 1784|        shadow: bool,
+ 1785|        world: &World,
+ 1786|    ) {
+ 1787|        if shadow {
+ 1788|            pass.set_pipeline(&self.shadow_pipeline);
+ 1789|            pass.set_bind_group(0, &self.shadow_frame_bind_group, &[]);
+ 1790|        } else {
+ 1791|            pass.set_pipeline(&self.render_pipeline);
+ 1792|            pass.set_bind_group(0, &self.frame_bind_group, &[]);
+ 1793|            pass.set_bind_group(1, &self.terrain_bind_group, &[]);
+ 1794|        }
+ 1795|        for &(cx, cz) in &self.visible_chunks {
+ 1796|            if !world.chunk_filled(cx, cz) {
+ 1797|                continue;
+ 1798|            }
+ 1799|            let Some(entry) = self.chunk_meshes.get(&(cx, cz)) else {
+ 1800|                continue;
+ 1801|            };
+ 1802|            let Some(gpu) = entry.gpu.as_ref() else {
+ 1803|                continue;
+ 1804|            };
+ 1805|            if gpu.num_indices == 0 {
+ 1806|                continue;
+ 1807|            }
+ 1808|            pass.set_vertex_buffer(0, gpu.vertex_buffer.slice(..));
+ 1809|            pass.set_index_buffer(gpu.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+ 1810|            pass.draw_indexed(0..gpu.num_indices, 0, 0..1);
+ 1811|        }
+ 1812|    }
+ 1813|
+ 1814|    fn draw_visible_grass<'a>(
+ 1815|        &'a self,
+ 1816|        pass: &mut wgpu::RenderPass<'a>,
+ 1817|        shadow: bool,
+ 1818|        world: &World,
+ 1819|    ) {
+ 1820|        // Grass uses cheap elliptical contact blobs instead of shadow-map casting.
+ 1821|        if shadow {
+ 1822|            return;
+ 1823|        }
+ 1824|        pass.set_pipeline(&self.grass_pipeline);
+ 1825|        pass.set_bind_group(0, &self.frame_bind_group, &[]);
+ 1826|        pass.set_bind_group(1, &self.terrain_bind_group, &[]);
+ 1827|        pass.set_bind_group(2, &self.grass_bind_group, &[]);
+ 1828|        pass.set_vertex_buffer(0, self.grass_template_vb.slice(..));
+ 1829|        pass.set_index_buffer(self.grass_template_ib.slice(..), wgpu::IndexFormat::Uint32);
+ 1830|        for &(cx, cz) in &self.visible_chunks {
+ 1831|            if !world.chunk_filled(cx, cz) {
+ 1832|                continue;
+ 1833|            }
+ 1834|            let Some(entry) = self.chunk_meshes.get(&(cx, cz)) else {
+ 1835|                continue;
+ 1836|            };
+ 1837|            let Some(gpu) = entry.gpu.as_ref() else {
+ 1838|                continue;
+ 1839|            };
+ 1840|            let Some(grass_buf) = gpu.grass_instance_buffer.as_ref() else {
+ 1841|                continue;
+ 1842|            };
+ 1843|            if gpu.num_grass == 0 {
+ 1844|                continue;
+ 1845|            }
+ 1846|            pass.set_vertex_buffer(1, grass_buf.slice(..));
+ 1847|            pass.draw_indexed(
+ 1848|                0..self.grass_template_index_count,
+ 1849|                0,
+ 1850|                0..gpu.num_grass,

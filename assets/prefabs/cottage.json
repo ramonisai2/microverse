@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "id": "cottage",
+  "name": "Cabaña",
+  "size": [5, 4, 5],
+  "anchor": [2, 0, 2],
+  "entrance": { "position": [2, 1, 0], "facing": "south" },
+  "lot": { "width": 7, "depth": 7 },
+  "palette": {
+    ".": "air",
+    "S": "village_stone",
+    "W": "wood_planks",
+    "G": "glass",
+    "R": "wood_roof",
+    "D": "door"
+  },
+  "layers": [
+    [
+      "SSSSS",
+      "SSSSS",
+      "SSSSS",
+      "SSSSS",
+      "SSSSS"
+    ],
+    [
+      "WWDWW",
+      "W...W",
+      "W...W",
+      "W...W",
+      "WWWWW"
+    ],
+    [
+      "WWDWW",
+      "G...G",
+      "W...W",
+      "G...G",
+      "WWGWW"
+    ],
+    [
+      "RRRRR",
+      "RRRRR",
+      "RRRRR",
+      "RRRRR",
+      "RRRRR"
+    ]
+  ]
+}

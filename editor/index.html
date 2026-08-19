@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Microverse — Editores</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            min-height: 100vh;
+            font-family: 'Segoe UI', sans-serif;
+            color: #eee;
+            background:
+                radial-gradient(ellipse 80% 50% at 20% 10%, #2a3a5a 0%, transparent 50%),
+                radial-gradient(ellipse 60% 40% at 80% 80%, #3a2a40 0%, transparent 45%),
+                #12121e;
+        }
+        header {
+            padding: 48px 24px 24px;
+            text-align: center;
+        }
+        header h1 {
+            font-size: clamp(1.6rem, 4vw, 2.4rem);
+            font-weight: 700;
+            letter-spacing: -0.02em;
+        }
+        header p {
+            margin-top: 10px;
+            color: #99a;
+            max-width: 520px;
+            margin-left: auto;
+            margin-right: auto;
+            line-height: 1.45;
+            font-size: 15px;
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+            gap: 16px;
+            max-width: 960px;
+            margin: 0 auto;
+            padding: 16px 24px 64px;
+        }
+        a.card {
+            display: block;
+            text-decoration: none;
+            color: inherit;
+            background: rgba(0, 0, 0, 0.35);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 16px;
+            padding: 20px 18px;
+            transition: 0.2s;
+            backdrop-filter: blur(8px);
+        }
+        a.card:hover {
+            border-color: #4a9eff;
+            background: rgba(74, 158, 255, 0.12);
+            transform: translateY(-2px);
+        }
+        a.card h2 {
+            font-size: 1.05rem;
+            margin-bottom: 6px;
+        }
+        a.card .tag {
+            display: inline-block;
+            font-size: 10px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: #88aaff;
+            margin-bottom: 8px;
+        }
+        a.card p {
+            font-size: 13px;
+            color: #99a;
+            line-height: 1.4;
+        }
+        footer {
+            text-align: center;
+            padding: 0 24px 40px;
+            font-size: 12px;
+            color: #667;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Editores Microvoxel</h1>
+        <p>
+            Elige un editor. Cada tipo de criatura tiene su propio esqueleto.
+            Ponle nombre al exportar. Los objetos no usan rotación de articulaciones.
+        </p>
+    </header>
+    <div class="grid" id="grid"></div>
+    <footer>Abre con un servidor local si el import de módulos falla (<code>npx serve .</code>)</footer>
+
+    <script type="module">
+        import { PRESET_LIST } from './presets.js';
+
+        const grid = document.getElementById('grid');
+        for (const p of PRESET_LIST) {
+            const a = document.createElement('a');
+            a.className = 'card';
+            a.href = `sculpt.html?preset=${encodeURIComponent(p.id)}`;
+            a.innerHTML =
+                `<div class="tag">${p.kind === 'object' ? 'Objeto' : 'Criatura'}</div>` +
+                `<h2>${p.label}</h2>` +
+                `<p>${p.blurb}</p>`;
+            grid.appendChild(a);
+        }
+
+        const prefab = document.createElement('a');
+        prefab.className = 'card';
+        prefab.href = 'prefab.html';
+        prefab.innerHTML =
+            '<div class="tag">Worldgen</div>' +
+            '<h2>🥚 Prefabs de edificios</h2>' +
+            '<p>Edita casas por capas, amplía su volumen y exporta el JSON que instancian los huevos de aldeas.</p>';
+        grid.appendChild(prefab);
+    </script>
+</body>
+</html>

@@ -1,1584 +1,1061 @@
-#![allow(
-    dead_code,
-    unused_variables,
-    unused_imports,
-    clippy::manual_slice_size_calculation,
-    clippy::too_many_arguments,
-    clippy::unnecessary_wraps,
-    unused_assignments,
-    unused_must_use
-)]
-#![feature(portable_simd)]
-//
-// Internal Dep:
-//
+//! App loop: Input → player/tool state → mining Hit → dig → dirty → remesh → GPU.
+mod animation;
+mod biomes;
+mod camera;
+mod caves;
+mod combat;
+mod entity_model;
+mod hero;
+mod hero_pose;
+mod hud;
+mod inventory;
+mod items;
+mod mining;
+mod player;
+mod prefab;
+mod realms;
+mod render;
+mod save;
+mod settlements;
+mod stair_dig;
+mod world;
 
-mod lib;  // Declare the lib module
-use lib::SV64tree;
-/* Unused brickmaps!
-use lib::brickmap;  // Use the Brickmap struct
-use lib::brickmap::ChunkWorld;
-use lib::brickmap::GPUChunk;
-*/
-//
-// Dependancies
-//
-
-use bytemuck::Zeroable;
-use bytemuck::Pod;
-//dot vox stuff:
-use dot_vox::DotVoxData;
-use dot_vox::load;
-//textures
-mod mc;
-mod texture;
-
-//math
-use cgmath::num_traits::int;
-use cgmath::Vector3;
-use cgmath::vec2;
-use cgmath::vec3;
-use cgmath::Vector2;
-use cgmath::{InnerSpace, Deg};
-
-use dot_vox::Size;
-use geese::Mut;
-use geese::SystemRef;
-//geese
-use geese::{
-    dependencies, Dependencies, EventHandlers, EventQueue,
-    GeeseContext, GeeseContextHandle, GeeseSystem, event_handlers,
+use camera::{Camera, HeldKeys, MAX_TICKS_PER_FRAME, TICKS_PER_SECOND};
+use hud::{
+    append_hud, build_compass_hud, build_hotbar_hud, build_inventory_hud, build_stair_hud,
+    build_status_hud, hit_test, Hotbar, HudAction, HudMesh,
 };
-
-use lib::SV64tree::add_vox_to_tree;
-use lib::SV64tree::create_test_tree;
-use lib::SV64tree::create_test_tree_from_vox;
-use lib::SV64tree::Sparse64Tree;
-use lib::SV64tree::Tree64GpuManager;
-use lib::SV64tree::TreeMemoryManager;
-use lib::SV64tree::AABB;
-use noise::Perlin;
-use wgpu::core::device;
-use winit::keyboard::Key;
-//use wgpu::hal::vulkan::Buffer;
-//use texture::Texture;
-//use wgpu::core::device;
-use std::collections::btree_map::Range;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::{default, iter, usize};
-//wgpu
-use dot_vox::Color;
-use wgpu::util::DeviceExt;
-use wgpu::{Adapter, BindGroup, BindGroupLayout, Buffer, Device, Instance, PipelineCompilationOptions, Queue, RenderPipeline, Surface, SurfaceConfiguration, Texture, TextureView};
-use wgpu::core::device::queue;
-//winit
-use winit::dpi::PhysicalSize;
-use winit::{ event_loop, event::*,
-    event_loop::EventLoop,
-    keyboard::{KeyCode, PhysicalKey},
-    window::{Window, WindowBuilder},
+use items::{bare_hand_can_mine, bare_hand_dig_interval, spawn_wooden_pickaxe, ToolInstance};
+use mining::{
+    break_solid_cell, break_solid_cell_bare, raycast_reach, BreakOutcome, MiningProgress,
 };
+use player::{MAX_BOTTLES, MAX_HEARTS};
+use player::Player;
+use render::Renderer;
+use stair_dig::{
+    PadDir, StairPhase, StairTool, TunnelFacing, TunnelIncline, STAIR_DIG_INTERVAL,
+};
+use std::sync::Arc;
+use std::time::Instant;
+use inventory::{InvItem, PlayerInventory};
+use world::{
+    fragment_drop_for, Material, OreDrop, DEBUG_FACE_VISIBILITY, ENABLE_HD2D, Voxel, World,
+};
+use winit::application::ApplicationHandler;
+use winit::event::{DeviceEvent, ElementState, KeyEvent, MouseButton, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::window::{CursorGrabMode, Window, WindowId};
 
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-
-//
-// Startup + Eventloop
-//
-//static vox_path: &str = "blue_shroom_hut.vox";
-static vox_path: &str = "C:\\Users\\USER\\.vox";
-//main loop
-fn main() {
-    println!("Size of CameraBuffer: {} bytes", std::mem::size_of::<CameraBuffer>());
-    println!("Alignment of CameraBuffer: {} bytes", std::mem::align_of::<CameraBuffer>());
-    println!("Program started.");
-    pollster::block_on(run());
-    println!("Program ended.");
+struct App {
+    window: Option<Arc<Window>>,
+    renderer: Option<Renderer>,
+    world: World,
+    player: Player,
+    camera: Camera,
+    keys: HeldKeys,
+    cursor_captured: bool,
+    last_frame: Instant,
+    tick_accum: f32,
+    /// Throttle window title updates (avoids format work every frame).
+    title_frames: u32,
+    /// Smoothed frames-per-second for the title HUD.
+    fps_ema: f32,
+    /// Smoothed frame time in milliseconds.
+    frame_ms_ema: f32,
+    stair: StairTool,
+    /// Equipped wooden pick (durability from `assets/items/wooden_pickaxe.json`).
+    pickaxe: ToolInstance,
+    /// Bottom-left weapon / tool hotbar (4 slots).
+    hotbar: Hotbar,
+    /// Last built stair HUD (for hit-testing clicks).
+    stair_hud: HudMesh,
+    /// Cursor position in logical pixels (top-left origin).
+    mouse_logical: (f32, f32),
+    /// Hold-to-break (LMB) while pickaxe is equipped in HD-2D.
+    attack_held: bool,
+    mining: MiningProgress,
+    /// Minecraft-style 9×3 storage (+ UI cursor stack).
+    inventory: PlayerInventory,
+    /// Inventory panel open (INV button / G).
+    inventory_open: bool,
+    /// Location sign text (realm + nearest settlement), recomputed on block change.
+    sign_line1: String,
+    sign_line2: String,
+    /// Cached meters to nearest settlement (drives sign opacity fade).
+    sign_dist_m: Option<i32>,
+    /// Block the sign was last computed for (`None` = never).
+    sign_block: Option<(i32, i32)>,
+    last_autosave: Instant,
 }
 
-mod on {
-    use std::fmt::DebugTuple;
-
-    use winit::dpi::PhysicalSize;
-
-    pub struct NewFrame{
+impl App {
+    fn new() -> Self {
+        let mut player = Player::spawn_on_terrain();
+        let mut world = if DEBUG_FACE_VISIBILITY {
+            World::with_face_debug()
+        } else {
+            World::new()
+        };
+        let mut pickaxe = spawn_wooden_pickaxe();
+        let mut hotbar = Hotbar::default();
+        let mut inventory = PlayerInventory::default();
+        if !DEBUG_FACE_VISIBILITY {
+            if let Some(loaded) = save::try_load() {
+                player.restore_from_save(
+                    loaded.feet,
+                    loaded.facing,
+                    loaded.hearts,
+                    loaded.bottles,
+                );
+                pickaxe.durability = loaded
+                    .pickaxe_durability
+                    .min(pickaxe.def.max_durability);
+                hotbar = loaded.hotbar;
+                inventory = loaded.inventory;
+                world.load_player_edits(loaded.edits);
+            }
+        }
+        let camera = if DEBUG_FACE_VISIBILITY {
+            Camera::looking_at_face_debug()
+        } else if ENABLE_HD2D {
+            Camera::hd2d_follow(player.focus_position())
+        } else {
+            Camera::first_person(player.eye_position())
+        };
+        Self {
+            window: None,
+            renderer: None,
+            world,
+            player,
+            camera,
+            keys: HeldKeys::default(),
+            cursor_captured: false,
+            last_frame: Instant::now(),
+            tick_accum: 0.0,
+            title_frames: 0,
+            fps_ema: 60.0,
+            frame_ms_ema: 16.7,
+            stair: StairTool::default(),
+            pickaxe,
+            hotbar,
+            stair_hud: HudMesh::default(),
+            mouse_logical: (0.0, 0.0),
+            attack_held: false,
+            mining: MiningProgress::default(),
+            inventory,
+            inventory_open: false,
+            sign_line1: String::new(),
+            sign_line2: String::new(),
+            sign_dist_m: None,
+            sign_block: None,
+            last_autosave: Instant::now(),
+        }
     }
 
-    pub struct WindowResized{
-        pub physical_size: PhysicalSize<u32>,
+    fn close_inventory(&mut self) {
+        if !self.inventory_open {
+            return;
+        }
+        self.inventory.return_cursor();
+        self.inventory_open = false;
+        self.sync_cursor_for_ui();
     }
 
-    pub struct MouseMoved{
-        pub delta_y: f32,
-        pub delta_x: f32,
+    fn persist(&mut self, why: &str) {
+        match save::write_snapshot(
+            &self.world,
+            self.player.feet,
+            self.player.facing,
+            self.player.hearts,
+            self.player.bottles,
+            self.pickaxe.durability,
+            &self.hotbar,
+            &self.inventory,
+        ) {
+            Ok(path) => {
+                self.last_autosave = Instant::now();
+                log::info!("save ({why}): {}", path.display());
+            }
+            Err(e) => log::warn!("save ({why}) failed: {e}"),
+        }
     }
 
-    pub struct KeyPressed {
-        pub key: winit::keyboard::KeyCode,
-        pub state: winit::event::ElementState,
+    fn toggle_inventory(&mut self) {
+        if self.inventory_open {
+            self.close_inventory();
+        } else {
+            self.inventory_open = true;
+            self.sync_cursor_for_ui();
+        }
     }
 
-}
-
-async fn run() {
-    env_logger::init();
-    let event_loop = EventLoop::new().unwrap();
-    let window = Arc::new(WindowBuilder::new()
-        .with_maximized(true)
-        .with_title("Lepton Engine")
-        .build(&event_loop)
-        .unwrap());
-    window.set_cursor_visible(false);
-    window.set_cursor_grab(winit::window::CursorGrabMode::Confined)
-        .or_else(|_| window.set_cursor_grab(winit::window::CursorGrabMode::Locked))
-        .expect("Failed to grab cursor");
-
-    let ctx = GeeseContext::default();
-    let ctx = Arc::new(Mutex::new(ctx));
-    
-    {
-        let mut ctx_guard = ctx.lock().unwrap();
-
-        ctx_guard.flush().with(geese::notify::add_system::<ParamSystem>());
-        ctx_guard.get_mut::<ParamSystem>().window = Some(window.clone());
-
-        ctx_guard.flush()
-            .with(geese::notify::add_system::<InstanceSystem>())
-            .with(geese::notify::add_system::<SurfaceSystem>())
-            .with(geese::notify::add_system::<DeviceSystem>())
-            .with(geese::notify::add_system::<CameraSystem>())
-            .with(geese::notify::add_system::<PipelineSystem>())
-            .with(geese::notify::add_system::<ResizeSystem>())
-            .with(geese::notify::add_system::<RenderSystem>())
-            .with(geese::notify::add_system::<ComputePipelineSystem>())
-            .with(geese::notify::add_system::<WorldSystem>())
-            .with(geese::notify::add_system::<FreeCamSystem>())
-            /*.with(geese::notify::add_system::<CameraUpdateSystem>())*/;
-            
+    fn collect_ore(&mut self, drop: OreDrop) {
+        let before_cube = self
+            .inventory
+            .count_of(InvItem::cube_for_embed(drop.kind));
+        let added = self.inventory.add_ore_drop(drop);
+        let micros = self
+            .inventory
+            .count_of(InvItem::micro_for_embed(drop.kind));
+        let cubes = self
+            .inventory
+            .count_of(InvItem::cube_for_embed(drop.kind));
+        let name = drop.kind.label();
+        if added == 0 {
+            log::info!("{name}: inventario lleno");
+        } else if cubes > before_cube {
+            log::info!(
+                "{name}: +{added} micro → cubo (total {cubes} cubos, {micros} micros)"
+            );
+        } else {
+            log::info!("{name}: +{added} micro ({micros} en inventario)");
+        }
     }
-    
-    let render_system = {let ctx_guard = ctx.lock().unwrap(); ctx_guard.get::<RenderSystem>();};
-    
-    let event_loop_ctx = Arc::clone(&ctx);
 
-    let _ = 
-    event_loop.run(move |event, control_flow: &event_loop::EventLoopWindowTarget<()>| {
-        match event {
+    fn collect_fragments(&mut self, material: Material) {
+        let Some((kind, amount)) = fragment_drop_for(material) else {
+            return;
+        };
+        let added = self.inventory.add_fragments(kind, amount);
+        let total = self.inventory.count_of(InvItem::from_fragment(kind));
+        if added == 0 {
+            log::info!("{}: inventario lleno ({total}/100)", kind.label());
+        } else if added < amount {
+            log::info!("{}: +{added} (lleno: {total}/100)", kind.label());
+        } else {
+            log::info!("{}: +{added} ({total}/100)", kind.label());
+        }
+    }
 
-            winit::event::Event::DeviceEvent { event, .. } => {
-                if let DeviceEvent::MouseMotion { delta } = event {
-                    let dx = delta.0;
-                    let dy = delta.1;
-                    let delta_x= dx as f32;
-                    let delta_y= dy as f32;
-                    //println!("Yaw: {}, Pitch: {}", delta.0, delta.1);
-                    if let Ok(mut ctx_guard) = event_loop_ctx.lock() {
-                        ctx_guard.flush().with(on::MouseMoved{delta_x, delta_y});
+    fn collect_break_loot(&mut self, material: Material, ore: Option<OreDrop>) {
+        self.collect_fragments(material);
+        if let Some(drop) = ore {
+            self.collect_ore(drop);
+        }
+    }
+
+    /// Excavate queued stair cells via [`break_solid_cell`] (wear → remove → grass → dirty).
+    fn tick_stair_dig(&mut self, now: Instant) {
+        while let Some(pos) = self.stair.peek_dig_at(now) {
+            let material = self.world.dig_material_at(pos);
+            let interval = material
+                .map(|m| self.pickaxe.def.dig_interval(m))
+                .unwrap_or(STAIR_DIG_INTERVAL);
+
+            match break_solid_cell(&mut self.world, pos, &mut self.pickaxe) {
+                BreakOutcome::ToolBlocked => {
+                    self.stair.abort_dig();
+                    log::info!("pico roto — excavación detenida");
+                    break;
+                }
+                BreakOutcome::Skipped => {
+                    let _ = self.stair.commit_dig(now, interval);
+                }
+                BreakOutcome::Broke { material: mat, ore } => {
+                    self.collect_break_loot(mat, ore);
+                    let _ = self.stair.commit_dig(now, interval);
+                    if matches!(
+                        mat,
+                        Material::Stone
+                            | Material::BlackStone
+                            | Material::Coal
+                            | Material::Sapphire
+                            | Material::Ruby
+                            | Material::Emerald
+                    ) {
+                        break;
                     }
-                    window.request_redraw();
-                    //camera.update_rotation(delta_x as f32, delta_y as f32);
-                    
-                    
-                    
                 }
             }
+        }
+    }
 
-            // Window-specific events
-            winit::event::Event::WindowEvent { event, window_id }
-                if window_id == window.id() =>
-            {
-                match event {
-                    // Handle close or escape key to exit
-                    WindowEvent::CloseRequested
-                    | WindowEvent::KeyboardInput {
-                        event:
-                            KeyEvent {
-                                state: ElementState::Pressed,
-                                physical_key: PhysicalKey::Code(KeyCode::Escape),
-                                ..
-                            },
-                        ..
-                    } => control_flow.exit(),
+    /// Classic hold-to-break (HD-2D; skips stair mode).
+    /// Pickaxe uses tool timings; bare hands / non-dig tools take 10× longer.
+    fn tick_hold_break(&mut self, dt: f32) {
+        if !ENABLE_HD2D || DEBUG_FACE_VISIBILITY {
+            return;
+        }
+        if self.stair.is_active() || !self.attack_held {
+            self.mining.clear();
+            return;
+        }
 
-                    // Handle window resize events
-                    WindowEvent::Resized(physical_size) => {
-                        log::info!("Window resized: {physical_size:?}");
-                        if let Ok(mut ctx_guard) = event_loop_ctx.lock() {
-                            ctx_guard.flush().with(on::WindowResized{physical_size});
+        let using_pick = self.hotbar.tool_id().is_some_and(|id| id.can_dig())
+            && !self.pickaxe.is_broken();
+
+        let origin = self.player.eye_position();
+        let yaw = self.player.facing;
+        let dir = glam::Vec3::new(yaw.cos(), -0.35, yaw.sin()).normalize_or_zero();
+        let Some(hit) = raycast_reach(&self.world, origin, dir) else {
+            self.mining.clear();
+            return;
+        };
+        let Some(material) = self.world.dig_material_at(hit.block) else {
+            self.mining.clear();
+            return;
+        };
+
+        let interval = if using_pick {
+            if !self.pickaxe.def.can_mine(material) {
+                self.mining.clear();
+                return;
+            }
+            self.pickaxe.def.dig_interval(material)
+        } else {
+            if !bare_hand_can_mine(material) {
+                self.mining.clear();
+                return;
+            }
+            bare_hand_dig_interval(material)
+        };
+
+        if self.mining.tick(hit.block, dt, interval) {
+            let outcome = if using_pick {
+                break_solid_cell(&mut self.world, hit.block, &mut self.pickaxe)
+            } else {
+                break_solid_cell_bare(&mut self.world, hit.block)
+            };
+            match outcome {
+                BreakOutcome::ToolBlocked => {
+                    if using_pick {
+                        log::info!("pico roto — hold-break detenido");
+                    }
+                    self.mining.clear();
+                }
+                BreakOutcome::Broke { material, ore } => {
+                    self.collect_break_loot(material, ore);
+                }
+                BreakOutcome::Skipped => {}
+            }
+        }
+    }
+
+    fn digging_for_pose(&self) -> bool {
+        self.stair.is_digging()
+            || (self.attack_held && self.mining.target.is_some())
+    }
+
+    fn set_cursor_captured(&mut self, captured: bool) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        if captured {
+            let _ = window
+                .set_cursor_grab(CursorGrabMode::Locked)
+                .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
+            window.set_cursor_visible(false);
+        } else {
+            let _ = window.set_cursor_grab(CursorGrabMode::None);
+            window.set_cursor_visible(true);
+        }
+        self.cursor_captured = captured;
+    }
+
+    /// Keep the cursor free for HUD clicks (hotbar, INV, stair panel).
+    /// HD-2D never locks the mouse; FPS only unlocks while a menu is open.
+    fn sync_cursor_for_ui(&mut self) {
+        let need_free =
+            ENABLE_HD2D || self.stair.is_active() || self.inventory_open;
+        if need_free {
+            if self.cursor_captured {
+                self.set_cursor_captured(false);
+            }
+        }
+    }
+
+    fn sync_cursor_for_stair(&mut self) {
+        self.sync_cursor_for_ui();
+    }
+
+    fn break_targeted_block(&mut self) {
+        let Some(hit) = raycast_reach(
+            &self.world,
+            self.camera.position,
+            self.camera.forward(),
+        ) else {
+            return;
+        };
+        if let BreakOutcome::Broke { material, ore } =
+            break_solid_cell(&mut self.world, hit.block, &mut self.pickaxe)
+        {
+            self.collect_break_loot(material, ore);
+        }
+    }
+
+    fn place_against_targeted_block(&mut self) {
+        let Some(hit) = raycast_reach(
+            &self.world,
+            self.camera.position,
+            self.camera.forward(),
+        ) else {
+            return;
+        };
+        let place = hit.prev;
+        if place == hit.block {
+            return;
+        }
+        let occupied = self.player.occupied_blocks();
+        if occupied.contains(&place) {
+            return;
+        }
+        if self.world.get_voxel(place).is_some() {
+            return;
+        }
+        self.world.set_voxel_player(place, Voxel::dirt());
+    }
+
+    /// Block under the player’s feet — stair ghost root (no mouse aim).
+    fn stair_anchor_block(&self) -> glam::IVec3 {
+        let f = self.player.feet;
+        glam::IVec3::new(
+            f.x.floor() as i32,
+            (f.y - 0.05).floor() as i32,
+            f.z.floor() as i32,
+        )
+    }
+
+    /// Look-at for Q/E orbit: stair midpoint when a yellow trail is up.
+    fn stair_orbit_focus(&self) -> glam::Vec3 {
+        let player = self.player.focus_position();
+        if let Some(far) = self.stair.ghost_far_point() {
+            (player + far) * 0.5
+        } else {
+            player
+        }
+    }
+
+    fn move_yaw(&self) -> f32 {
+        if ENABLE_HD2D {
+            self.camera.move_yaw()
+        } else {
+            self.camera.yaw
+        }
+    }
+
+    /// Turn the character (and dig heading) to a world cardinal from a pad slot.
+    fn apply_pad_facing(&mut self, facing: TunnelFacing) {
+        self.player.face_yaw(facing.yaw());
+        self.stair.set_facing(facing);
+    }
+
+    fn apply_hud_action(&mut self, action: HudAction) {
+        match action {
+            HudAction::Facing(f) => self.apply_pad_facing(f),
+            HudAction::Incline(i) => self.stair.set_incline(i),
+            HudAction::LenMinus => self.stair.nudge_steps(-1),
+            HudAction::LenPlus => self.stair.nudge_steps(1),
+            HudAction::WidthToggle => self.stair.cycle_width(),
+            HudAction::Dig => {
+                if self.pickaxe.is_broken() {
+                    log::info!("pico roto — no se puede cavar");
+                    return;
+                }
+                // Keep pad-selected facing (N/S/E/W) — do not overwrite from look yaw.
+                self.stair.sync_ghost_anchor(self.stair_anchor_block());
+                let _ = self.stair.confirm_dig();
+            }
+            HudAction::Cancel => {
+                self.stair.cancel_to_idle();
+                self.sync_cursor_for_stair();
+            }
+            HudAction::SelectSlot(i) => {
+                self.hotbar.press_slot(i as usize);
+                self.player.notify_equip();
+                if !self.hotbar.holding_pickaxe() && self.stair.is_active() {
+                    self.stair.cancel_to_idle();
+                    self.sync_cursor_for_stair();
+                }
+            }
+            HudAction::ToggleInventory => {
+                self.toggle_inventory();
+            }
+            HudAction::InvSlot(i) => {
+                self.inventory.click_slot(i as usize, false);
+            }
+            HudAction::InventoryBackdrop => {
+                // Click outside the panel closes (Minecraft-like).
+                self.close_inventory();
+            }
+            HudAction::InventoryPanel => {}
+        }
+    }
+
+    fn apply_hud_click(&mut self, action: HudAction, right: bool) {
+        match action {
+            HudAction::InvSlot(i) => {
+                self.inventory.click_slot(i as usize, right);
+            }
+            HudAction::InventoryBackdrop => {
+                if !right {
+                    self.close_inventory();
+                }
+            }
+            HudAction::InventoryPanel => {}
+            _ if !right => self.apply_hud_action(action),
+            _ => {}
+        }
+    }
+
+    /// Arrow keys = camera-relative pad; R/F/C = up / down / flat; [/] = length; B = width.
+    /// (`G` is inventory — see keyboard handler.)
+    fn handle_stair_dir_key(&mut self, key: KeyCode) -> bool {
+        let view = self.move_yaw();
+        match key {
+            KeyCode::ArrowUp => {
+                self.apply_pad_facing(PadDir::Up.to_facing(view));
+                true
+            }
+            KeyCode::ArrowDown => {
+                self.apply_pad_facing(PadDir::Down.to_facing(view));
+                true
+            }
+            KeyCode::ArrowRight => {
+                self.apply_pad_facing(PadDir::Right.to_facing(view));
+                true
+            }
+            KeyCode::ArrowLeft => {
+                self.apply_pad_facing(PadDir::Left.to_facing(view));
+                true
+            }
+            KeyCode::KeyR | KeyCode::PageUp => {
+                self.stair.set_incline(TunnelIncline::Up);
+                true
+            }
+            KeyCode::KeyF | KeyCode::PageDown => {
+                self.stair.set_incline(TunnelIncline::Down);
+                true
+            }
+            KeyCode::KeyC => {
+                self.stair.set_incline(TunnelIncline::Flat);
+                true
+            }
+            KeyCode::BracketLeft | KeyCode::Minus => {
+                self.stair.nudge_steps(-1);
+                true
+            }
+            KeyCode::BracketRight | KeyCode::Equal => {
+                self.stair.nudge_steps(1);
+                true
+            }
+            KeyCode::KeyB => {
+                self.stair.cycle_width();
+                true
+            }
+            KeyCode::Enter | KeyCode::NumpadEnter => {
+                if self.pickaxe.is_broken() {
+                    log::info!("pico roto — no se puede cavar");
+                    return true;
+                }
+                self.stair.sync_ghost_anchor(self.stair_anchor_block());
+                let _ = self.stair.confirm_dig();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Recompute the location sign when the player steps onto a new block.
+    fn refresh_location_sign(&mut self) {
+        let feet = self.player.feet;
+        let bx = feet.x.floor() as i32;
+        let bz = feet.z.floor() as i32;
+        let block = (bx, bz);
+        if self.sign_block == Some(block) {
+            return;
+        }
+        self.sign_block = Some(block);
+
+        let info = settlements::sign_info_at_block(bx, bz);
+        let biome = info.biome.label_es();
+        self.sign_line1 = match &info.realm_name {
+            Some(name) => format!("REINO {name} · {biome}"),
+            None => format!("TIERRA SALVAJE · {biome}"),
+        };
+        self.sign_dist_m = info.nearest.as_ref().map(|n| n.dist);
+        self.sign_line2 = match &info.nearest {
+            Some(n) => format!("{} A {} M", n.kind.label_es(), n.dist),
+            None => "SIN ASENTAMIENTOS".to_string(),
+        };
+    }
+
+    fn logical_size(&self) -> (f32, f32) {
+        let Some(window) = self.window.as_ref() else {
+            return (1280.0, 720.0);
+        };
+        let s = window.inner_size();
+        let scale = window.scale_factor() as f32;
+        (
+            s.width as f32 / scale.max(0.01),
+            s.height as f32 / scale.max(0.01),
+        )
+    }
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window.is_some() {
+            return;
+        }
+
+        let title = if ENABLE_HD2D {
+            "Microverse — HD-2D"
+        } else {
+            "Microverse — first person"
+        };
+        let window = Arc::new(
+            event_loop
+                .create_window(
+                    Window::default_attributes()
+                        .with_title("Microverse — precargando mundo…")
+                        .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0)),
+                )
+                .expect("create window"),
+        );
+
+        // Fill nearest shunks before GPU init so the first frame has solid ground.
+        if !DEBUG_FACE_VISIBILITY {
+            self.world.preload_shunks_around(self.player.focus_position());
+            // Edits none at boot; leave stream dirties for warm_start_meshes.
+            let _ = self.world.take_dirty_edits();
+        }
+
+        window.set_title("Microverse — precargando meshes…");
+        let mut renderer = pollster::block_on(Renderer::new(
+            window.clone(),
+            &self.world,
+            &self.camera,
+        ));
+
+        let size = window.inner_size();
+        self.camera.aspect = size.width as f32 / size.height.max(1) as f32;
+
+        if !DEBUG_FACE_VISIBILITY {
+            renderer.warm_start_meshes(&mut self.world, &self.camera);
+        }
+        window.set_title(title);
+
+        self.window = Some(window);
+        self.renderer = Some(renderer);
+        // Visible cursor from the start so hotbar / INV / HUD stay clickable.
+        self.set_cursor_captured(false);
+        self.last_frame = Instant::now();
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => {
+                self.persist("exit");
+                event_loop.exit();
+            }
+            WindowEvent::Resized(size) => {
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.resize(size);
+                }
+                self.camera.aspect = size.width as f32 / size.height.max(1) as f32;
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let scale = self
+                    .window
+                    .as_ref()
+                    .map(|w| w.scale_factor() as f32)
+                    .unwrap_or(1.0)
+                    .max(0.01);
+                self.mouse_logical = (position.x as f32 / scale, position.y as f32 / scale);
+            }
+            WindowEvent::RedrawRequested => {
+                let now = Instant::now();
+                let frame_secs = (now - self.last_frame).as_secs_f32().min(0.25);
+                self.last_frame = now;
+
+                let inst_fps = if frame_secs > 1e-4 {
+                    1.0 / frame_secs
+                } else {
+                    999.0
+                };
+                let inst_ms = frame_secs * 1000.0;
+                self.fps_ema = self.fps_ema * 0.90 + inst_fps * 0.10;
+                self.frame_ms_ema = self.frame_ms_ema * 0.90 + inst_ms * 0.10;
+
+                self.tick_accum += frame_secs * TICKS_PER_SECOND as f32;
+                let mut ticks = self.tick_accum.floor() as u32;
+                self.tick_accum -= ticks as f32;
+                ticks = ticks.min(MAX_TICKS_PER_FRAME);
+
+                if !DEBUG_FACE_VISIBILITY {
+                    let move_yaw = self.move_yaw();
+                    let dig_pose = self.digging_for_pose();
+                    self.player
+                        .tick(&self.world, &self.keys, move_yaw, ticks, dig_pose);
+                    let alpha = self.tick_accum;
+                    if ENABLE_HD2D {
+                        let pressure = self
+                            .renderer
+                            .as_ref()
+                            .map(|r| r.pop_pressure())
+                            .unwrap_or(0.0);
+                        // Stair ghost must track feet before framing the lens.
+                        if self.stair.is_active() && self.stair.phase != StairPhase::Digging {
+                            self.stair.sync_ghost_anchor(self.stair_anchor_block());
                         }
-                        window.request_redraw();
-                        //ctx.raise_event(|sys: &mut ResizeSystem| {
-                        //sys.handle_resize(physical_size);
-                        //});
+                        let player_focus = self.player.display_focus(alpha);
+                        let (focus, frame_half, confine) =
+                            if let Some(far) = self.stair.ghost_far_point() {
+                                // Midpoint between hero and yellow-trail tip so the
+                                // whole planned dig stays on screen while lengthening.
+                                let mid = (player_focus + far) * 0.5;
+                                let half = player_focus.distance(far) * 0.5;
+                                // Don't pull into confined dig zoom — we need the overview.
+                                (mid, half, 0.0)
+                            } else {
+                                let confine = self.world.hd2d_confine_factor(player_focus);
+                                (player_focus, 0.0, confine)
+                            };
+                        self.camera
+                            .follow_hd2d_framed(focus, pressure, confine, frame_half);
+                    } else {
+                        self.camera
+                            .sync_from_player(self.player.display_eye(alpha));
                     }
 
-                    // Request a redraw when needed
-                    WindowEvent::RedrawRequested => {
-                        window.request_redraw();
-                        if let Ok(mut ctx_guard) = event_loop_ctx.lock() {
-                            //window.request_redraw();
-                            ctx_guard.flush().with(on::NewFrame{});
-                        }
-                        //ctx.raise_event(|sys: &mut RenderSystem| {
-                        //    sys.render();
-                        //});
+                    // Stair dig tick (ghost already synced above for HD-2D framing).
+                    if self.stair.is_active()
+                        && self.stair.phase != StairPhase::Digging
+                        && !ENABLE_HD2D
+                    {
+                        self.stair.sync_ghost_anchor(self.stair_anchor_block());
                     }
+                    self.tick_stair_dig(now);
+                    let hold_dt = ticks as f32 / TICKS_PER_SECOND as f32;
+                    self.tick_hold_break(hold_dt.max(frame_secs));
+                }
 
-                    WindowEvent::KeyboardInput {
-                        event:
-                            KeyEvent {
-                                physical_key: PhysicalKey::Code(key_code),
-                                state,
-                                ..
-                            },
+                let (lw, lh) = self.logical_size();
+                let mut hud = build_status_hud(
+                    self.player.hearts,
+                    MAX_HEARTS,
+                    self.player.bottles,
+                    MAX_BOTTLES,
+                    lw,
+                    lh,
+                );
+                let compass = build_compass_hud(self.player.facing, lw, lh);
+                append_hud(&mut hud, &compass);
+                self.refresh_location_sign();
+                let sign_a = crate::hud::settlement_sign_opacity(self.sign_dist_m);
+                let sign = crate::hud::build_realm_sign_hud(
+                    &self.sign_line1,
+                    &self.sign_line2,
+                    lw,
+                    lh,
+                    sign_a,
+                );
+                append_hud(&mut hud, &sign);
+                let hotbar = build_hotbar_hud(&self.hotbar, self.inventory_open, lw, lh);
+                append_hud(&mut hud, &hotbar);
+                let inv = build_inventory_hud(
+                    self.inventory_open,
+                    &self.inventory,
+                    &self.hotbar,
+                    self.mouse_logical,
+                    lw,
+                    lh,
+                );
+                append_hud(&mut hud, &inv);
+                let stair = build_stair_hud(&self.stair, self.move_yaw(), lw, lh);
+                append_hud(&mut hud, &stair);
+                self.stair_hud = hud;
+
+                self.title_frames = self.title_frames.wrapping_add(1);
+                if self.last_autosave.elapsed().as_secs_f32() >= save::AUTOSAVE_SECS {
+                    self.persist("auto");
+                }
+                if self.title_frames % 10 == 0 {
+                    let (dirt_n, grass_n) = self.world.voxel_counts();
+                    let pressure = self
+                        .renderer
+                        .as_ref()
+                        .map(|r| r.pop_pressure())
+                        .unwrap_or(0.0);
+                    if let Some(window) = &self.window {
+                        let mode = if ENABLE_HD2D { "HD-2D" } else { "FPS" };
+                        let dir = self.stair.hud_dir();
+                        let pick = self.pickaxe.hud_tag();
+                        let stair = match self.stair.phase {
+                            StairPhase::Idle => String::new(),
+                            StairPhase::Armed | StairPhase::Preview => {
+                                format!(" | STAIR {dir}: HUD · Enter=dig")
+                            }
+                            StairPhase::Digging => format!(" | STAIR {dir}: digging…"),
+                        };
+                        let pi = self.inventory.count_of(InvItem::StoneFrag);
+                        let ti = self.inventory.count_of(InvItem::DirtFrag);
+                        let c_m = self.inventory.count_of(InvItem::CoalMicro);
+                        let c_c = self.inventory.count_of(InvItem::CoalCube);
+                        let s_m = self.inventory.count_of(InvItem::SapphireMicro);
+                        let s_c = self.inventory.count_of(InvItem::SapphireCube);
+                        let r_m = self.inventory.count_of(InvItem::RubyMicro);
+                        let r_c = self.inventory.count_of(InvItem::RubyCube);
+                        let e_m = self.inventory.count_of(InvItem::EmeraldMicro);
+                        let e_c = self.inventory.count_of(InvItem::EmeraldCube);
+                        let facing = TunnelFacing::from_yaw(self.player.facing).label_es();
+                        window.set_title(&format!(
+                            "Microverse — {mode} | {}{stair} | mira:{facing} | {pick} | Pi:{pi}/100 Ti:{ti}/100 | C:{c_m}/{c_c} S:{s_m}/{s_c} R:{r_m}/{r_c} E:{e_m}/{e_c} | {:.0} fps · {:.1} ms | chunks:{} dirt:{} grass:{} cam:{:.0}%",
+                            self.player.hearts_title(),
+                            self.fps_ema,
+                            self.frame_ms_ema,
+                            self.world.loaded_chunk_count(),
+                            dirt_n,
+                            grass_n,
+                            pressure * 100.0,
+                        ));
+                    }
+                }
+
+                if let Some(renderer) = self.renderer.as_mut() {
+                    let alpha = self.tick_accum;
+                    let feet = if ENABLE_HD2D && !DEBUG_FACE_VISIBILITY {
+                        Some(self.player.display_feet(alpha))
+                    } else {
+                        None
+                    };
+                    let facing = self.player.display_facing(alpha);
+                    let pose = self.player.display_hero_pose(alpha);
+                    let tool_swing = self.player.display_tool_swing(alpha);
+                    let equip = self.player.display_equip_blend(alpha);
+                    let ghost = self.stair.ghost_cells();
+                    let hud = Some(&self.stair_hud);
+                    match renderer.render(
+                        &self.camera,
+                        &mut self.world,
+                        feet,
+                        facing,
+                        &pose,
+                        self.hotbar.tool_id(),
+                        tool_swing,
+                        equip,
+                        ghost,
+                        hud,
+                    ) {
+                        Ok(()) => {}
+                        Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                            let size = renderer.size();
+                            renderer.resize(size);
+                        }
+                        Err(wgpu::SurfaceError::OutOfMemory) => {
+                            log::error!("out of memory");
+                            event_loop.exit();
+                        }
+                        Err(e) => log::warn!("surface error: {e:?}"),
+                    }
+                }
+
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(key),
+                        state,
                         ..
-                    } => {
-                        // Skip the escape key since it's handled above
-                        if key_code != KeyCode::Escape {
-                            //window.request_redraw();
-                            //println!("yeah it works :D || The key pressed:  {:?}", key_code);
-                            if let Ok(mut ctx_guard) = event_loop_ctx.lock() {
-                                ctx_guard.flush().with(on::KeyPressed{
-                                    key: key_code,
-                                    state: state,
+                    },
+                ..
+            } => {
+                let pressed = state == ElementState::Pressed;
+                if key == KeyCode::Escape && pressed {
+                    if self.inventory_open {
+                        self.close_inventory();
+                    } else if self.stair.is_active() {
+                        self.stair.cancel_to_idle();
+                        self.sync_cursor_for_stair();
+                    } else if self.cursor_captured {
+                        self.set_cursor_captured(false);
+                    } else {
+                        self.persist("exit");
+                        event_loop.exit();
+                    }
+                } else if key == KeyCode::F5 && pressed {
+                    self.persist("F5");
+                } else if key == KeyCode::KeyG && pressed {
+                    self.toggle_inventory();
+                } else if pressed && matches!(
+                    key,
+                    KeyCode::Digit1 | KeyCode::Digit2 | KeyCode::Digit3 | KeyCode::Digit4
+                        | KeyCode::Numpad1 | KeyCode::Numpad2 | KeyCode::Numpad3 | KeyCode::Numpad4
+                ) {
+                    let slot = match key {
+                        KeyCode::Digit1 | KeyCode::Numpad1 => 0,
+                        KeyCode::Digit2 | KeyCode::Numpad2 => 1,
+                        KeyCode::Digit3 | KeyCode::Numpad3 => 2,
+                        _ => 3,
+                    };
+                    self.hotbar.press_slot(slot);
+                    self.player.notify_equip();
+                    // Stowing the pickaxe cancels an armed dig tool.
+                    if !self.hotbar.holding_pickaxe() && self.stair.is_active() {
+                        self.stair.cancel_to_idle();
+                        self.sync_cursor_for_stair();
+                    }
+                } else if key == KeyCode::KeyT && pressed && !DEBUG_FACE_VISIBILITY {
+                    // Stair tool only while the pickaxe is in hand.
+                    if self.hotbar.holding_pickaxe() {
+                        self.stair.arm_from_yaw(self.player.facing);
+                        self.sync_cursor_for_stair();
+                    } else {
+                        log::info!("equipa el pico (2) para cavar — 2 otra vez para guardarlo");
+                    }
+                } else if self.stair.is_active()
+                    && pressed
+                    && !DEBUG_FACE_VISIBILITY
+                    && self.handle_stair_dir_key(key)
+                {
+                    // Facing / incline / length / dig consumed.
+                } else if key == KeyCode::KeyF && pressed {
+                    if let Some(r) = self.renderer.as_mut() {
+                        let flip = r.toggle_hero_winding_flip();
+                        log::info!(
+                            "hero camera-face flip = {flip} (swaps bright↔dark; no triangle flip)"
+                        );
+                    }
+                } else if ENABLE_HD2D && !DEBUG_FACE_VISIBILITY && pressed {
+                    match key {
+                        KeyCode::KeyQ => {
+                            let f = self.stair_orbit_focus();
+                            self.camera.orbit_hd2d(-1, f);
+                        }
+                        KeyCode::KeyE => {
+                            let f = self.stair_orbit_focus();
+                            self.camera.orbit_hd2d(1, f);
+                        }
+                        _ => self.keys.set(key, pressed),
+                    }
+                } else {
+                    self.keys.set(key, pressed);
+                }
+            }
+            WindowEvent::MouseInput {
+                state,
+                button,
+                ..
+            } => {
+                let pressed = state == ElementState::Pressed;
+                if button == MouseButton::Left && !pressed {
+                    self.attack_held = false;
+                    self.mining.clear();
+                    return;
+                }
+
+                if !pressed {
+                    return;
+                }
+
+                if matches!(button, MouseButton::Left | MouseButton::Right) {
+                    if let Some(action) =
+                        hit_test(&self.stair_hud.hits, self.mouse_logical.0, self.mouse_logical.1)
+                    {
+                        self.apply_hud_click(action, button == MouseButton::Right);
+                        return;
+                    }
+                }
+
+                if self.stair.is_active() {
+                    // Stair mode: mouse only talks to the on-screen panel.
+                    if button == MouseButton::Right {
+                        self.stair.cancel_preview();
+                    }
+                    return;
+                }
+
+                if self.inventory_open {
+                    // Inventory open: clicks only hit HUD slots / INV button.
+                    return;
+                }
+
+                // HD-2D: free cursor — click always swings; pick hold still mines.
+                if ENABLE_HD2D && !DEBUG_FACE_VISIBILITY {
+                    if button == MouseButton::Left {
+                        let origin = self.player.eye_position();
+                        let yaw = self.player.facing;
+                        let dir =
+                            glam::Vec3::new(yaw.cos(), -0.35, yaw.sin()).normalize_or_zero();
+                        let hit = raycast_reach(&self.world, origin, dir);
+                        let timid = hit.is_none();
+                        let item = self.hotbar.selected_item();
+                        let dmg = self.player.begin_melee(item, timid);
+                        if !timid {
+                            log::debug!("golpe conectado · daño {dmg} (tabla provisional)");
+                        }
+                        // Hold-to-mine: pickaxe at tool speed, otherwise bare hands (10×).
+                        if hit.is_some() {
+                            let diggable = hit
+                                .as_ref()
+                                .and_then(|h| self.world.dig_material_at(h.block))
+                                .is_some_and(|m| {
+                                    if self.hotbar.holding_pickaxe() && !self.pickaxe.is_broken() {
+                                        self.pickaxe.def.can_mine(m)
+                                    } else {
+                                        bare_hand_can_mine(m)
+                                    }
                                 });
+                            if diggable {
+                                self.attack_held = true;
                             }
                         }
                     }
-
-                    
-                    _ => {}
-
+                    return;
                 }
 
-                
-
-            } // Handle other events if necessary
-
+                // FPS: first world click captures for look; HUD already handled above.
+                if !self.cursor_captured {
+                    self.set_cursor_captured(true);
+                    return;
+                }
+                match button {
+                    MouseButton::Left => self.break_targeted_block(),
+                    MouseButton::Right => self.place_against_targeted_block(),
+                    _ => {}
+                }
+            }
             _ => {}
         }
-    });
-}
-
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-
-//
-// Graphics Init
-//
-
-
-
-#[derive(Default)]
-struct ParamSystem{
-    window: Option<Arc<Window>>
-}
-
-impl GeeseSystem for ParamSystem {
-    fn new(_: GeeseContextHandle<Self>) -> Self {
-        Self::default()
-    }
-}
-
-pub struct InstanceSystem {
-    instance: Arc<Instance>,
-}
-impl GeeseSystem for InstanceSystem {  
-    fn new(ctx: geese::GeeseContextHandle<Self>) -> Self {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            #[cfg(not(target_arch = "wasm32"))]
-            backends: wgpu::Backends::PRIMARY,
-            #[cfg(target_arch = "wasm32")]
-            backends: wgpu::Backends::GL,
-            ..Default::default()
-        });
-
-        //let surface_system = ctx.get::<SurfaceSystem>();
-        //let surface = &surface_system.surface;
-        
-        
-        
-
-        Self { instance: Arc::new(instance)}
-    }
-}
-impl InstanceSystem {
-    pub fn get(self: &Self) -> Arc<Instance> {
-        return  Arc::clone(&self.instance);
-    }
-}
-
-pub struct SurfaceSystem {
-    surface: Surface<'static>,
-    adapter: Arc<Adapter>,
-}
-impl GeeseSystem for SurfaceSystem {
-    const DEPENDENCIES: Dependencies = dependencies()
-        .with::<InstanceSystem>()
-        .with::<ParamSystem>();
-    fn new(ctx: geese::GeeseContextHandle<Self>) -> Self {
-        let instance_system = &ctx.get::<InstanceSystem>();
-        let instance = &instance_system.instance;
-
-        let param_system = ctx.get::<ParamSystem>();
-        let window = param_system.window.clone().expect("Window not initialized");
-
-        let surface = instance.create_surface(window).unwrap();
-
-
-        let adapter = pollster::block_on( async{instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            })
-            .await
-            .unwrap()});
-        
-        
-
-        Self { surface, adapter: Arc::new(adapter) }
-    }
-    
-}
-impl SurfaceSystem {
-    pub fn get(self: &Self) -> &wgpu::Surface {
-        return &self.surface;
-    }
-}
-pub struct DeviceSystem {
-    device: Arc<Device>,
-    queue: Arc<Queue>,
-}
-impl DeviceSystem {
-    pub async fn init(
-        adapter: Arc<Adapter>,
-    ) -> (Arc<wgpu::Device>, Arc<wgpu::Queue>) {
-        let desired_limits = wgpu::Limits {
-            // max_buffer_size: 4 * 1024 * 1024 * 1024, // Request up to 4 GB
-            // max_uniform_buffer_binding_size: 64 * 1024, // Request larger uniform buffers THIS USED TO BE 64 * 1024
-            // max_storage_buffer_binding_size: 2 * 1024 * 1024 * 1024,
-            max_buffer_size: 2 * 1024 * 1024 * 1024, // 4 GB
-            max_uniform_buffer_binding_size: 64 * 1024, // 64 KB
-            max_storage_buffer_binding_size: 1024 * 1024 * 1024 * 2,
-            ..wgpu::Limits::default()
-        };
-        let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: None,
-                    required_features: wgpu::Features::STORAGE_RESOURCE_BINDING_ARRAY,
-                    required_limits: desired_limits, //wgpu::Limits::default()
-                    memory_hints: Default::default(),
-                },
-                None,
-            )
-            .await
-            .unwrap();
-        let limits = adapter.limits();
-        println!("Max Buffer Size: {}", limits.max_buffer_size);
-        println!("Max Storage Buffer Size: {}", limits.max_storage_buffer_binding_size);
-        (Arc::new(device), Arc::new(queue))
     }
 
-    pub async fn get(ctx: GeeseContextHandle<Self>) -> (Arc<wgpu::Device>, Arc<wgpu::Queue>) {
-        let instance_system = ctx.get::<InstanceSystem>();
-        let instance = Arc::clone(&instance_system.instance);
-
-        let surface_system = ctx.get::<SurfaceSystem>();
-        let surface = &surface_system.surface;
-        let adapter = &surface_system.adapter;
-
-        let (device, queue) =
-            pollster::block_on(async { DeviceSystem::init(adapter.clone()).await });
-        (device, queue)
-    }
-}
-impl GeeseSystem for DeviceSystem {
-    const DEPENDENCIES: Dependencies = dependencies()
-        .with::<InstanceSystem>().with::<SurfaceSystem>();
-    fn new(ctx: geese::GeeseContextHandle<Self>) -> Self {
-        let (device, queue) = pollster::block_on(DeviceSystem::get(ctx));
-        Self { device, queue }
-    }
-}
-struct TextureViewSystem {
-    texture_view: TextureView,
-    texture: Texture,
-}
-impl GeeseSystem for TextureViewSystem {
-    const DEPENDENCIES: Dependencies = dependencies()
-        .with::<DeviceSystem>()
-        .with::<ParamSystem>();
-        
-     fn new(ctx: GeeseContextHandle<Self>) -> Self {
-        let param_system = ctx.get::<ParamSystem>();
-        let window = param_system.window.clone().expect("Window not initialized");
-        let size = window.inner_size();
-        let device = &ctx.get::<DeviceSystem>().device;
-
-        let texture_size = wgpu::Extent3d {
-            width: size.width,
-            height: size.height,
-            depth_or_array_layers: 1,
-        };
-        let texture_desc = wgpu::TextureDescriptor {
-            label: Some("Raytracing Output Texture"),
-            size: texture_size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::STORAGE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
-            view_formats: Default::default(),
-        };
-        let texture = device.create_texture(&texture_desc);
-        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        Self { texture_view, texture}
-     }
-
- }
-
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-
-//
-// Pipelines
-//
-
-struct ComputePipelineSystem{
-    compute_pipeline: wgpu::ComputePipeline,
-    compute_bind_group: wgpu::BindGroup,
-}
-impl GeeseSystem for ComputePipelineSystem {
-    const DEPENDENCIES: Dependencies = dependencies()
-        .with::<DeviceSystem>()
-        .with::<SurfaceSystem>()
-        .with::<InstanceSystem>()
-        .with::<CameraSystem>()
-        .with::<ParamSystem>()
-        .with::<TextureViewSystem>()
-        .with::<WorldSystem>();
-
-    fn new(ctx: GeeseContextHandle<Self>) -> Self {
-        // Device, Surface, Adapter
-        let device_system = ctx.get::<DeviceSystem>();
-        let device = &device_system.device;
-        let queue = &device_system.queue;
-        let surface_system = ctx.get::<SurfaceSystem>();
-        let surface = &surface_system.surface;
-        let adapter = &surface_system.adapter;
-        let param_system = ctx.get::<ParamSystem>();
-        //Window
-        let window = param_system.window.clone().expect("Window not initialized");
-        let size = window.inner_size();
-        let texture_view = &ctx.get::<TextureViewSystem>().texture_view;
-        // Camera
-        let camera_system = ctx.get::<CameraSystem>();
-        let camera_bind_group_layout = &camera_system.camera_bind_group_layout;
-        // // Voxel Data
-        
-        let world_system = ctx.get::<WorldSystem>();
-        let world_bind_group = &world_system.tree_manager.contree_bind_group;
-        let world_bind_group_layout = &world_system.tree_manager.contree_bind_group_layout;
-        // let gpu_chunk = &chunk_system.gpu_voxel_world;
-        // let voxel_world_bind_group_layout   = &gpu_chunk.vox_world_bind_group_layout;
-        // let (gpu_bricks, gpu_indices) = chunk_world.collect_bricks_gpu(256);
-        // let (bricks_gpu_buffer, indices_gpu_buffer) = upload_to_gpu(&device, &queue, gpu_bricks, gpu_indices);
-        
-
-
-
-
-
-        let compute_shader = device.create_shader_module(wgpu::include_wgsl!("shaders/compute_trace.wgsl"));
-        
-        let surface_caps = surface.get_capabilities(&adapter);
-
-        let surface_format = surface_caps
-        .formats
-        .iter()
-        .copied()
-        .find(|f| f.is_srgb())
-        .unwrap_or(surface_caps.formats[0]);
-
-
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: surface_format,
-            width: size.width,
-            height: size.height,
-            present_mode: surface_caps.present_modes[0],
-            alpha_mode: surface_caps.alpha_modes[0],
-            desired_maximum_frame_latency: 1,
-            view_formats: vec![],
-        };
-
-
-        let compute_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("Compute Bind Group Layout"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::StorageTexture {
-                    access: wgpu::StorageTextureAccess::WriteOnly,
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                },
-                count: None,
-            },
-            
-            /*wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer { 
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None
-                },
-                count: None,
-            },*/
-            
-        ],
-    });
-
-
-        let compute_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Compute Pipeline Layout"),
-            bind_group_layouts: &[&compute_bind_group_layout, &camera_bind_group_layout, &world_bind_group_layout], // Bind group layout created earlier
-            push_constant_ranges: &[],
-        });
-        
-        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Compute Pipeline"),
-            layout: Some(&compute_pipeline_layout),
-            module: &compute_shader,
-            entry_point: "cs_main",
-            cache: None,
-            compilation_options: Default::default(),
-            
-        });
-
-        let compute_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Compute Bind Group"),
-            layout: &compute_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&texture_view),
-            },/*wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &camera_buffer,
-                    offset: 0,
-                    size: None
-                }),
-            },*/],
-        });
-
-        
-
-
-        Self { compute_pipeline, compute_bind_group }
-    }
-}
-
-//Vertex definition.
-//Used in rendering the final image.
-//No other use use.
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct Vertex {
-    position: [f32; 3],
-    color: [f32; 3],
-    uv: [f32; 2],
-}
-
-// lib.rs
-impl Vertex {
-    const ATTRIBS: [wgpu::VertexAttribute; 3] =
-        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2];
-
-    fn desc() -> wgpu::VertexBufferLayout<'static> {
-        use std::mem;
-
-        wgpu::VertexBufferLayout {
-            array_stride: mem::size_of::<Self>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &Self::ATTRIBS,
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: winit::event::DeviceId,
+        event: DeviceEvent,
+    ) {
+        if let DeviceEvent::MouseMotion { delta } = event {
+            if self.cursor_captured {
+                // HD-2D: camera never free-looks; mouse is unused for facing.
+                if !ENABLE_HD2D || DEBUG_FACE_VISIBILITY {
+                    self.camera.apply_mouse_delta(delta.0, delta.1);
+                }
+            }
         }
     }
 }
 
-const VERTICES: &[Vertex] = &[
-    Vertex {
-        position: [1.0, 1.0, 0.0],
-        color: [0.0, 0.0, 0.0],
-        uv: [1.0, 1.0],
-    },
-    Vertex {
-        position: [-1.0, -1.0, 0.0],
-        color: [0.0, 1.0, 0.0],
-        uv: [0.0, 0.0],
-    },
-    Vertex {
-        position: [1.0, -1.0, 0.0],
-        color: [0.0, 0.0, 1.0],
-        uv: [1.0, 0.0],
-    },
-    Vertex {
-        position: [-1.0, -1.0, 0.0],
-        color: [1.0, 0.0, 0.0],
-        uv: [0.0, 0.0],
-    },
-    Vertex {
-        position: [1.0, 1.0, 0.0],
-        color: [0.0, 1.0, 0.0],
-        uv: [1.0, 1.0],
-    },
-    Vertex {
-        position: [-1.0, 1.0, 0.0],
-        color: [0.0, 0.0, 1.0],
-        uv: [0.0, 1.0],
-    },
-];
-
-struct PipelineSystem {
-    render_pipeline: RenderPipeline,
-    vertex_buffer: wgpu::Buffer,
-    config: SurfaceConfiguration,
-    size: PhysicalSize<u32>,
-    fragment_bind_group: BindGroup,
-    /*depth_texture: Arc<Texture>,*/
-}
-impl GeeseSystem for PipelineSystem {
-    const DEPENDENCIES: Dependencies = dependencies()
-        .with::<DeviceSystem>()
-        .with::<SurfaceSystem>()
-        .with::<InstanceSystem>()
-        .with::<CameraSystem>()
-        .with::<TextureViewSystem>()
-        .with::<ParamSystem>();
-
-    fn new(ctx: GeeseContextHandle<Self>) -> Self {
-       let device_system = ctx.get::<DeviceSystem>();
-       let device = &device_system.device;
-       let surface_system = ctx.get::<SurfaceSystem>();
-       let surface = &surface_system.surface;
-       //let instance_system = ctx.get::<InstanceSystem>();
-       //let instance = &instance_system.instance;
-       let adapter = &surface_system.adapter;
-       let param_system = ctx.get::<ParamSystem>();
-       let window = param_system.window.clone().expect("Window not initialized");
-       let size = window.inner_size();
-       let texture_view = &ctx.get::<TextureViewSystem>().texture_view;
-       //let camera_system = ctx.get::<CameraSystem>();
-       
-
-       let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("Vertex Buffer"),
-        contents: bytemuck::cast_slice(VERTICES),
-        usage: wgpu::BufferUsages::VERTEX,
-        });
-
-
-    
-        
-       
-
-
-
-
-       let shader = device.create_shader_module(wgpu::include_wgsl!("shaders/fragment_render.wgsl"));
-
-       let surface_caps = surface.get_capabilities(&adapter);
-
-       let surface_format = surface_caps
-       .formats
-       .iter()
-       .copied()
-       .find(|f| f.is_srgb())
-       .unwrap_or(surface_caps.formats[0]);
-
-        
-    
-        //|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-        //|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-        //|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-
-        //
-        // Config
-        //
-
-        let config = wgpu::SurfaceConfiguration {
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-        format: surface_format,
-        width: size.width,
-        height: size.height,
-        present_mode: surface_caps.present_modes[0],
-        alpha_mode: surface_caps.alpha_modes[0],
-        desired_maximum_frame_latency: 0,
-        view_formats: vec![],
-    };
-    //let depth_texture = texture::Texture::create_depth_texture(&device, &config, "depth_texture");
-    /*let camera_bind_group_layout =
-    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        entries: &[wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        }],
-        label: Some("camera_bind_group_layout"),
-    });*/
-
-
-    let fragment_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("Fragment Bind Group Layout"),
-        entries: &[
-            // Texture sampler
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                count: None,
-            },
-            // Texture view
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
-        ],
-    });
-
-
-    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-        label: Some("Sampler"),
-        address_mode_u: wgpu::AddressMode::ClampToEdge,
-        address_mode_v: wgpu::AddressMode::ClampToEdge,
-        address_mode_w: wgpu::AddressMode::ClampToEdge,
-        mag_filter: wgpu::FilterMode::Linear,
-        min_filter: wgpu::FilterMode::Linear,
-        mipmap_filter: wgpu::FilterMode::Nearest,
-        lod_min_clamp: Default::default(),
-        lod_max_clamp: Default::default(),
-        compare: Default::default(),
-        anisotropy_clamp: 1,
-        border_color: Default::default(),
-        
-    });
-    
-    let fragment_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("Fragment Bind Group"),
-        layout: &fragment_bind_group_layout,
-        entries: &[
-            // Bind the sampler
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Sampler(&sampler),
-            },
-            // Bind the texture view
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::TextureView(&texture_view),
-            },
-        ],
-    });
-    
-
-       let render_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Render Pipeline Layout"),
-                bind_group_layouts: &[&fragment_bind_group_layout],
-                push_constant_ranges: &[],
-            });
-
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Render Pipeline"),
-            layout: Some(&render_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: "vs_main",
-                buffers: &[Vertex::desc()],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: "fs_main",
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: Some(wgpu::BlendState {
-                        color: wgpu::BlendComponent::REPLACE,
-                        alpha: wgpu::BlendComponent::REPLACE,
-                    }),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
-                // Setting this to anything other than Fill requires Features::POLYGON_MODE_LINE
-                // or Features::POLYGON_MODE_POINT
-                polygon_mode: wgpu::PolygonMode::Fill,
-                // Requires Features::DEPTH_CLIP_CONTROL
-                unclipped_depth: false,
-                // Requires Features::CONSERVATIVE_RASTERIZATION
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState {
-                count: 1,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            // If the pipeline will be used with a multiview render pass, this
-            // indicates how many array layers the attachments will have.
-            multiview: None,
-            // Useful for optimizing shader compilation on Android
-            cache: None,
-        });
-    
-        surface.configure(&device, &config);
-
-        Self {render_pipeline, vertex_buffer, config, size, fragment_bind_group/*depth_texture: Arc::new(depth_texture)*/}
-    }
-}
-
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-
-//
-// Rendering
-//
-
-struct RenderSystem {
-    ctx: GeeseContextHandle<Self>,
-}
-
-impl GeeseSystem for RenderSystem {
-    const DEPENDENCIES: Dependencies = dependencies()
-        .with::<DeviceSystem>()
-        .with::<PipelineSystem>()
-        .with::<CameraSystem>()
-        .with::<SurfaceSystem>()
-        .with::<ComputePipelineSystem>()
-        .with::<WorldSystem>()
-        .with::<ParamSystem>();
-
-    const EVENT_HANDLERS: EventHandlers<Self> = event_handlers().with(Self::call_render);
-
-    fn new(ctx: GeeseContextHandle<Self>) -> Self {
-        Self {ctx}
-    }
-}
-
-impl RenderSystem {
-
-    fn call_render(&mut self, event: &on::NewFrame){
-        self.render();
-    }
-
-    fn render(&mut self) -> Result<(), wgpu::SurfaceError> 
-    {
-        let device_system = self.ctx.get::<DeviceSystem>();
-        let device = &device_system.device;
-        let queue = &device_system.queue;
-        let pipeline_system = self.ctx.get::<PipelineSystem>();
-        //let camera_system = self.ctx.get::<CameraSystem>();
-        /*let depth_texture = Arc::clone(&pipeline_system.depth_texture);*/
-        let surface_system = self.ctx.get::<SurfaceSystem>();
-        let surface = &surface_system.surface;
-
-        let output = surface.get_current_texture()?;
-        let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-
-        let compute_system = &self.ctx.get::<ComputePipelineSystem>();
-        let compute_pipeline = &compute_system.compute_pipeline;
-        let compute_bind_group = &compute_system.compute_bind_group;
-
-        let camera_system = self.ctx.get::<CameraSystem>();
-        let camera_bind_group = &camera_system.camera_bind_group;
-        let camera_bind_group_layout = &camera_system.camera_bind_group_layout;
-
-        let world_system = self.ctx.get::<WorldSystem>();
-        let world_bind_group = &world_system.tree_manager.contree_bind_group;
-        let world_bind_group_layout = &world_system.tree_manager.contree_bind_group_layout;
-
-
-        // let chunk_system = self.ctx.get::<ChunkSystem>();
-        // let voxel_world = &chunk_system.gpu_voxel_world;
-        // let voxel_world_bind_group = &voxel_world.vox_world_bind_group;
-        // let voxel_world_bind_group_layout = &voxel_world.vox_world_bind_group_layout;
-        
-
-        let param_system = &self.ctx.get::<ParamSystem>();
-        let window = param_system.window.clone().expect("Window not initialized");
-        let size = window.inner_size();
-
-
-        let fragment_bind_group = &pipeline_system.fragment_bind_group;
-
-        let mut encoder = device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Render Encoder"),
-            });
-
-        
-        
-    
-        // let dst_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        //     label: Some("Destination Camera Buffer"),
-        //     size: std::mem::size_of::<CameraBuffer>() as u64,
-        //     usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        //     mapped_at_creation: false,
-        // });
-        // //let camera_buffer_array = [camera_buffer];
-        // //let src_buffer_data = bytemuck::cast_slice(&camera_buffer_array);
-        // let src_buffer_data = bytemuck::bytes_of(&camera_buffer);
-        // queue.write_buffer(&src_buffer, 0, &src_buffer_data);
-        
-        
-
-
-
-        {
-            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Compute Pass"),
-                timestamp_writes: Default::default(),});
-                compute_pass.set_pipeline(&compute_pipeline);
-                compute_pass.set_bind_group(0, &compute_bind_group, &[]);
-                compute_pass.set_bind_group(1, &camera_bind_group, &[]);
-                compute_pass.set_bind_group(2, &world_bind_group, &[]);
-                //compute_pass.set_bind_group(2, &voxel_world_bind_group, &[]);
-                //compute_pass.set_bind_group(1, &camera_bind_group, &[]);
-                compute_pass.dispatch_workgroups((&size.width + 15) / 16, (&size.height + 15) / 16, 1);
-        }
-        
-
-        {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.1,
-                            g: 0.2,
-                            b: 0.3,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                occlusion_query_set: None,
-                timestamp_writes: None,
-            });
-
-            render_pass.set_pipeline(&pipeline_system.render_pipeline);
-            render_pass.set_bind_group(0, &fragment_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, pipeline_system.vertex_buffer.slice(..));
-            
-            render_pass.draw(0..6, 0..1);
-            
-            
-        }
-
-        device_system.queue.submit(iter::once(encoder.finish()));
-        //device_system.device.poll(wgpu::Maintain::Wait);
-        output.present();
-
-        Ok(())
-    }
-}
-
-
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-
-//
-// Resizing
-//
-
-struct ResizeSystem {
-    ctx: GeeseContextHandle<Self>,
-}
-impl GeeseSystem for ResizeSystem {
-
-    const DEPENDENCIES: Dependencies = dependencies()
-    .with::<PipelineSystem>()
-    .with::<SurfaceSystem>()
-    .with::<DeviceSystem>();
-
-    const EVENT_HANDLERS: EventHandlers<Self> = event_handlers().with(Self::resize);
-
-    fn new(ctx: GeeseContextHandle<Self>) -> Self {
-        Self { ctx }
-    }
-}
-
-impl ResizeSystem{
-    fn resize(&mut self, event: &on::WindowResized){
-        
-
-        let surface_system = self.ctx.get::<SurfaceSystem>();
-        let surface = &surface_system.surface;
-        let device_system = self.ctx.get::<DeviceSystem>();
-        let device = &device_system.device;
-        let /*mut*/ pipeline_system = self.ctx.get::<PipelineSystem>();
-        let mut config = pipeline_system.config.clone();
-        let mut size = pipeline_system.size;
-        let new_size = event.physical_size;
-
-        
-        if new_size.width > 0 && new_size.height > 0 {
-            
-            size = new_size;
-            config.width = new_size.width;
-            config.height = new_size.height;
-            surface.configure(&device, &config);
-            
-            
-        }
-        
-    }
-}
-
-
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-
-//
-// Camera
-//
-
-struct Camera {
-    position: [f32; 3],
-    yaw: f32,
-    pitch: f32,
-    fov: f32,
-}
-
-impl Default for Camera {
-    fn default() -> Self {
-        Self {
-            position: [0.0, 2.0, 20.0],
-            yaw: 45.0,
-            pitch: 30.0,
-            fov: 60.0,
-        }
-    }
-}
-
-impl Camera {
-    fn new(position: [f32; 3], yaw: f32, pitch: f32, fov: f32) -> Self{
-        Self {position, yaw, pitch, fov}
-    }
-
-    pub fn update_rotation(&mut self, delta_x: f32, delta_y: f32) {
-        let sensitivity = 0.05; // Adjust this value to change mouse sensitivity
-
-        // Update yaw and pitch with sensitivity scaling
-        self.yaw -= delta_x * sensitivity;
-        self.pitch -= delta_y * sensitivity;
-
-        // Clamp pitch to avoid flipping at the poles
-        self.pitch = self.pitch.clamp(-89.0, 89.0);
-        self.yaw = (self.yaw + 360.0) % 360.0;
-        // println!("Delta X: {}, Delta Y: {}", delta_x, delta_y);
-        // println!("Updated Yaw: {}, Updated Pitch: {}", self.yaw, self.pitch);
-
-
-    }
-
-    fn convert_to_buffer(&mut self) -> CameraBuffer{
-        //let yaw_rad = self.yaw.to_radians();
-        //let pitch_rad = self.pitch.to_radians();
-
-        // Compute the direction vector
-        // println!("Normalized Direction: {:?}", direction);
-        // println!("Magnitude: {}", direction.magnitude());
-
-        //println!("Direction: {:?}", direction);
-        //let (yaw, pitch) = direction_to_yaw_pitch(direction);
-        //println!("yaw: {} pitch: {}", self.yaw, self.pitch);
-
-
-        CameraBuffer {
-            position: self.position,
-            yaw: self.yaw,
-            pitch: self.pitch,
-            aspect: 16.0 / 9.0,
-            fov: self.fov,
-            padding3: 0.0,
-        }
-        
-
-    }
-}
-struct CameraSystem {
-    camera: Camera,
-    camera_buffer: CameraBuffer,
-    gpu_camera_buffer: Buffer,
-    camera_bind_group: BindGroup,
-    camera_bind_group_layout: BindGroupLayout,
-    ctx: GeeseContextHandle<Self>,
-}
-
-impl GeeseSystem for CameraSystem {
-    const EVENT_HANDLERS: EventHandlers<Self> = event_handlers().with(Self::update_rotation);
-    const DEPENDENCIES: Dependencies = dependencies()
-    .with::<DeviceSystem>();
-    
-    fn new(ctx: GeeseContextHandle<Self>) -> Self {
-        let device = ctx.get::<DeviceSystem>().device.clone();
-        let mut camera = Camera::default();
-
-        let camera_buffer = camera.convert_to_buffer();
-        let gpu_camera_buffer = camera_buffer.to_gpu_buffer(&device);
-
-        let camera_bind_group_layout = //&camera_system.camera_bind_group_layout;
-        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }              
-            ],
-            label: Some("camera_bind_group_layout"),
-        });
-
-        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &camera_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: gpu_camera_buffer.as_entire_binding()
-                 /*wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &gpu_camera_buffer,
-                    offset: 0,
-                    size: None
-                }),*/
-            },],
-            label: Some("Camera Bind Group"),
-
-            /*
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: dst_buffer.as_entire_binding(),
-            }*/
-
-            
-        });
-
-        Self { 
-            camera_buffer,
-            gpu_camera_buffer,
-            camera_bind_group,
-            camera_bind_group_layout,
-            camera,
-            ctx,
-        }
-    }
-}
-
-impl CameraSystem {
-    fn update_rotation(&mut self, event: &on::MouseMoved){
-        let device_system = self.ctx.get::<DeviceSystem>();
-        let device = &device_system.device;
-        let queue = &device_system.queue;
-        self.camera.update_rotation(event.delta_x, event.delta_y); // calculate direction 3D
-
-        self.camera_buffer = self.camera.convert_to_buffer(); // Convert it into Camera Buffer form :)
-
-        //println!("rotation: {} {} {}", self.camera_buffer.rotation[0],self.camera_buffer.rotation[1],self.camera_buffer.rotation[2]); // debug printing
-
-        let binding = [self.camera_buffer];
-        let buffer_data = bytemuck::cast_slice(&binding);
-        queue.write_buffer(&self.gpu_camera_buffer, 0, buffer_data);
-        
-        let encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("camera buffer encoder"),
-        });
-        
-
-        queue.submit(std::iter::once(encoder.finish()));
-        
-    }
-
-    fn update(&mut self){
-        let device_system = self.ctx.get::<DeviceSystem>();
-        let device = &device_system.device;
-        let queue = &device_system.queue;
-        self.camera_buffer = self.camera.convert_to_buffer();
-
-        let binding = [self.camera_buffer];
-        let buffer_data = bytemuck::cast_slice(&binding);
-        queue.write_buffer(&self.gpu_camera_buffer, 0, buffer_data);
-        
-        let encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("camera buffer encoder"),
-        });
-        
-
-        queue.submit(std::iter::once(encoder.finish()));
-    }
-
-}
-
-#[repr(C, align(16))]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct CameraBuffer {
-    position: [f32; 3],
-    yaw: f32,
-    pitch: f32,
-    fov: f32,
-    aspect: f32,
-    padding3: f32,              // 4 bytes
-}
-
-impl CameraBuffer {
-    /// Creates a GPU-ready buffer for the CameraBuffer.
-    pub fn to_gpu_buffer(&self, device: &wgpu::Device) -> wgpu::Buffer {
-        // Convert the CameraBuffer to a byte slice
-        let buffer_data = bytemuck::bytes_of(self);
-
-        device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Camera Uniform Buffer"),
-            size: std::mem::size_of::<CameraBuffer>() as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::UNIFORM,
-            mapped_at_creation: false,
-        })
-
-
-    }
-}
-
-pub fn direction_to_yaw_pitch(direction: Vector3<f32>) -> (f32, f32) {
-    // Ensure the direction vector is normalized
-    let direction = direction.normalize();
-
-    // Calculate pitch (rotation around the X-axis)
-    // asin gives us the angle in radians, convert to degrees
-    let pitch = direction.y.asin().to_degrees();
-
-    // Calculate yaw (rotation around the Y-axis)
-    // atan2 gives us the angle in radians, convert to degrees
-    let yaw = direction.z.atan2(direction.x).to_degrees();
-
-    (yaw, pitch)
-}
-
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-
-//
-// Free Cam
-//
-
-struct FreeCamSystem {
-    ctx: GeeseContextHandle<Self>,
-}
-
-impl FreeCamSystem {
-    fn move_camera(&mut self, event: &on::KeyPressed){
-
-        
-        let delta_time = 0.016;
-        let mut camera_system = self.ctx.get_mut::<CameraSystem>();
-        let yaw = camera_system.camera.yaw;
-        let pitch = camera_system.camera.pitch;
-        let camera_position = camera_system.camera.position;
-        let speed = 0.5;
-
-        let (up, forward, right) = calculate_directions(yaw, pitch);
-
-
-        let mut newpos: [f32; 3];
-        
-
-
-        if event.key == KeyCode::KeyA && event.state == ElementState::Pressed {
-            let newpos: [f32; 3] = apply_motion(camera_position.into(), right, speed, delta_time, false).into();
-            camera_system.camera.position = newpos.into();
-            //println!("A key pressed: {:?}", event.key);
-        }
-
-        if event.key == KeyCode::KeyD {
-            let newpos: [f32; 3]  = apply_motion(camera_position.into(), right, speed, delta_time, true).into();
-            camera_system.camera.position = newpos.into();
-            //println!("D key pressed: {:?}", event.key);
-        }
-
-        if event.key == KeyCode::KeyW {
-            let newpos: [f32; 3]  = apply_motion(camera_position.into(), forward, speed, delta_time, false).into();
-            camera_system.camera.position = newpos.into();
-            //println!("W key pressed: {:?}", event.key);
-        }
-
-        if event.key == KeyCode::KeyS {
-            let newpos: [f32; 3]  = apply_motion(camera_position.into(), forward, speed, delta_time, true).into();
-            camera_system.camera.position = newpos.into();
-            
-            //println!("S key pressed: {:?}", event.key);
-        }
-
-        if event.key == KeyCode::KeyE && event.state == ElementState::Pressed {
-            let newpos: [f32; 3] = apply_motion(camera_position.into(), up, speed, delta_time, false).into();
-            camera_system.camera.position = newpos.into();
-            //println!("A key pressed: {:?}", event.key);
-        }
-
-        if event.key == KeyCode::KeyQ && event.state == ElementState::Pressed {
-            let newpos: [f32; 3] = apply_motion(camera_position.into(), up, speed, delta_time, true).into();
-            camera_system.camera.position = newpos.into();
-            //println!("A key pressed: {:?}", event.key);
-        }
-
-
-        camera_system.update();
-
-
-    }
-
-    
-}
-
-
-impl GeeseSystem for FreeCamSystem {
-    const EVENT_HANDLERS: EventHandlers<Self> = event_handlers().with(Self::move_camera);
-    const DEPENDENCIES: Dependencies = dependencies()
-    .with::<Mut<CameraSystem>>();
-
-    fn new(ctx: GeeseContextHandle<Self>) -> Self {
-        Self { ctx }
-    }
-}
-
-use glam::{Vec3, Mat3};
-
-fn calculate_directions(yaw: f32, pitch: f32) -> (Vec3, Vec3, Vec3) {
-    // Convert yaw and pitch from degrees to radians
-    let yaw_rad = yaw.to_radians();
-    let pitch_rad = pitch.to_radians();
-
-    // Forward direction
-    let forward = Vec3::new(
-        yaw_rad.cos() * pitch_rad.cos(),
-        pitch_rad.sin(),
-        yaw_rad.sin() * pitch_rad.cos(),
-    )
-    .normalize();
-
-    // Right direction (cross product of forward and world up)
-    let world_up = Vec3::new(0.0, 1.0, 0.0);
-    let right = forward.cross(world_up).normalize();
-
-    // Up direction (cross product of right and forward)
-    let up = right.cross(forward).normalize();
-
-    (up, forward, right)
-}
-
-fn apply_motion(
-    position: Vec3,
-    direction: Vec3,
-    speed: f32,
-    delta_time: f32,
-    negative: bool,
-) -> Vec3 {
-
-    if negative == true {
-        position - direction * speed// * delta_time
-    } else {
-        position + direction * speed// * delta_time
-    }
-
-    
-}
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-//|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\|\
-
-struct WorldSystem {
-    tree_manager: Tree64GpuManager,
-    contree: Sparse64Tree,
-}
-
-impl GeeseSystem for WorldSystem {
-    const DEPENDENCIES: Dependencies = dependencies()
-    .with::<DeviceSystem>();
-
-
-    fn new(ctx: GeeseContextHandle<Self>) -> Self {
-        let device_system = &ctx.get::<DeviceSystem>();
-        let device = &device_system.device;
-        let queue = &device_system.queue;
-
-        //let vox_path = "C:\\Users\\jonfr\\Documents\\Game Dev\\MagicaVoxel-0.99.7.1-win64\\MagicaVoxel-0.99.7.1-win64\\vox\\nature//mushrooms//bright_shroom (3).vox";
-        //let contree = create_test_tree_from_vox(vox_path, 4);
-
-        // Create a Perlin noise instance.
-        let perlin = Perlin::new(1234);
-        // Define the overall volume.
-        let volume = AABB { 
-            min: vec3(0.0, 0.0, 0.0), 
-            max: vec3(64.0, 64.0, 64.0) 
-        };
-        // Create the tree and generate terrain.
-        let mut contree = Sparse64Tree::new();
-        contree.generate_terrain_sdf_noise_simd(volume, 4, perlin);
-
-        add_vox_to_tree(vox_path, 4, 120, 30, 128, &mut contree);
-        let mut tree_manager = Tree64GpuManager::new(&device, &contree);
-        
-        println!("contree nodes: {}", contree.nodes.len());
-
-
-        Self {tree_manager, contree}
-    }
-
+fn main() {
+    env_logger::init();
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(cores)
+        .build_global()
+        .expect("rayon pool");
+    log::info!("rayon pool: {cores} hilos");
+
+    let event_loop = EventLoop::new().expect("event loop");
+    event_loop.set_control_flow(ControlFlow::Poll);
+    let mut app = App::new();
+    event_loop.run_app(&mut app).expect("run app");
 }

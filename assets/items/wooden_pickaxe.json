@@ -1,0 +1,21 @@
+{
+  "id": "wooden_pickaxe",
+  "name": "Pico de madera",
+  "model": "assets/entities/picodemadera.json",
+  "max_durability": 60,
+  "dig": {
+    "dirt_cost": 1,
+    "stone_cost": 4,
+    "dirt_ms": 160,
+    "stone_ms": 640
+  },
+  "tier": "wood",
+  "attach": {
+    "scale": 1.1,
+    "wrist": [0.25, -3.9, 0.35],
+    "grip": [0.0, 2.0, 0.0],
+    "orient": "pickaxe",
+    "swing_arc_deg": 45.0,
+    "swing_speed": 1.0
+  }
+}

@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Microverse — Editor de prefabs</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; color: #e9edf5; background: #11151d; font: 14px "Segoe UI", sans-serif; }
+    header { display: flex; align-items: center; gap: 14px; padding: 12px 16px; background: #19202b; border-bottom: 1px solid #344052; }
+    header a { color: #8fc3ff; text-decoration: none; }
+    h1 { margin: 0; font-size: 18px; }
+    main { display: grid; grid-template-columns: 300px minmax(360px, 1fr) minmax(360px, 1fr); gap: 12px; padding: 12px; }
+    .panel { background: #19202b; border: 1px solid #344052; border-radius: 10px; padding: 12px; min-width: 0; }
+    .panel h2 { margin: 0 0 10px; font-size: 14px; color: #a9c7e8; }
+    label { display: block; margin: 8px 0 3px; color: #aab4c3; font-size: 12px; }
+    input, select, button { border: 1px solid #44536a; border-radius: 6px; background: #101621; color: #eef; padding: 7px 8px; }
+    input { width: 100%; }
+    button { cursor: pointer; }
+    button:hover { border-color: #65a9ff; background: #1d3048; }
+    .row { display: flex; gap: 6px; align-items: end; }
+    .row > * { flex: 1; }
+    .palette { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; margin-top: 8px; }
+    .swatch { text-align: left; }
+    .swatch.active { outline: 2px solid #ffd75e; }
+    .dot { display: inline-block; width: 14px; height: 14px; margin-right: 7px; vertical-align: -2px; border: 1px solid #ffffff55; }
+    canvas { display: block; width: 100%; height: auto; background: #0d121a; border: 1px solid #344052; border-radius: 8px; image-rendering: pixelated; }
+    .layerline { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+    .layerline input { flex: 1; }
+    .layerline b { min-width: 52px; text-align: right; }
+    .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 12px; }
+    #file { display: none; }
+    #status { margin-top: 10px; color: #91a0b5; font-size: 12px; line-height: 1.45; }
+    .hint { color: #7f8da0; font-size: 12px; line-height: 1.45; margin-top: 8px; }
+    @media (max-width: 1050px) { main { grid-template-columns: 280px 1fr; } .preview { grid-column: 1 / -1; } }
+    @media (max-width: 700px) { main { grid-template-columns: 1fr; } .preview { grid-column: auto; } }
+  </style>
+</head>
+<body>
+  <header><a href="index.html">← Editores</a><h1>🥚 Editor de prefabs / huevos</h1><a href="MANUAL_PREFABS.md" target="_blank" style="margin-left:auto">📖 Manual</a></header>
+  <main>
+    <section class="panel">
+      <h2>Prefab</h2>
+      <label>ID</label><input id="id" value="house_basic" />
+      <label>Nombre</label><input id="name" value="Casa básica" />
+      <div class="row">
+        <div><label>Ancho X</label><input id="sx" type="number" min="1" max="32" value="7" /></div>
+        <div><label>Alto Y</label><input id="sy" type="number" min="1" max="24" value="5" /></div>
+        <div><label>Fondo Z</label><input id="sz" type="number" min="1" max="32" value="7" /></div>
+      </div>
+      <div class="row">
+        <div><label>Lote ancho</label><input id="lotW" type="number" min="1" max="64" value="9" /></div>
+        <div><label>Lote fondo</label><input id="lotD" type="number" min="1" max="64" value="9" /></div>
+      </div>
+      <button id="resize" style="width:100%;margin-top:8px">Redimensionar conservando</button>
+
+      <h2 style="margin-top:16px">Material</h2>
+      <div class="palette" id="palette"></div>
+      <div class="hint">Clic pinta · clic derecho borra · rueda cambia de capa.</div>
+
+      <div class="actions">
+        <button id="clearLayer">Vaciar capa</button>
+        <button id="fillLayer">Rellenar capa</button>
+        <button id="import">Importar JSON</button>
+        <button id="export">Exportar JSON</button>
+      </div>
+      <input id="file" type="file" accept=".json,application/json" />
+      <div id="status">El huevo reserva el lote; al generarse, instancia este prefab usando su anchor.</div>
+    </section>
+
+    <section class="panel">
+      <h2>Planta por capa</h2>
+      <div class="layerline">
+        <span>Capa</span><input id="layer" type="range" min="0" max="4" value="0" />
+        <b id="layerLabel">Y = 0</b>
+      </div>
+      <canvas id="grid" width="640" height="640"></canvas>
+    </section>
+
+    <section class="panel preview">
+      <h2>Vista isométrica (preview)</h2>
+      <canvas id="preview" width="720" height="640"></canvas>
+      <div class="hint">La flecha amarilla marca la entrada (sur). El punto blanco es el anchor del huevo.</div>
+    </section>
+  </main>
+
+  <script>
+    const MATERIALS = {
+      ".": { name: "Aire", color: "#17202b" },
+      "S": { name: "Piedra aldea", color: "#969078" },
+      "W": { name: "Tablones", color: "#ad793f" },
+      "G": { name: "Vidrio", color: "#83d4df" },
+      "R": { name: "Techo madera", color: "#5e3727" },
+      "D": { name: "Tierra", color: "#705139" }
+    };
+    const NAMES = { ".":"air", S:"village_stone", W:"wood_planks", G:"glass", R:"wood_roof", D:"dirt" };
+    let selected = "W", layer = 0;
+    let size = [7, 5, 7];
+    let layers = makeLayers(...size);
+
+    const $ = id => document.getElementById(id);
+    const grid = $("grid"), gc = grid.getContext("2d");
+    const preview = $("preview"), pc = preview.getContext("2d");
+
+    function makeLayers(x, y, z) {
+      return Array.from({length:y}, () => Array.from({length:z}, () => Array(x).fill(".")));
+    }
+    function defaultHouse() {
+      layers = makeLayers(7,5,7); size = [7,5,7];
+      for (let z=0; z<7; z++) for (let x=0; x<7; x++) layers[0][z][x] = "S";
+      for (let y=1; y<=3; y++) for (let i=0; i<7; i++) {
+        layers[y][0][i]="W"; layers[y][6][i]="W"; layers[y][i][0]="W"; layers[y][i][6]="W";
+      }
+      layers[1][0][3]="."; layers[2][0][3]="G";
+      [[0,2],[0,4],[6,2],[6,4],[2,6],[4,6]].forEach(([x,z]) => layers[2][z][x]="G");
+      for (let z=0; z<7; z++) for (let x=0; x<7; x++) layers[4][z][x] = "R";
+    }
+
+    for (const [key, m] of Object.entries(MATERIALS)) {
+      const b = document.createElement("button");
+      b.className = "swatch" + (key === selected ? " active" : "");
+      b.innerHTML = `<span class="dot" style="background:${m.color}"></span>${key} · ${m.name}`;
+      b.onclick = () => { selected=key; document.querySelectorAll(".swatch").forEach(x=>x.classList.remove("active")); b.classList.add("active"); };
+      $("palette").appendChild(b);
+    }
+
+    function drawGrid() {
+      const [w,,d]=size, cw=grid.width/w, ch=grid.height/d;
+      gc.clearRect(0,0,grid.width,grid.height);
+      for (let z=0; z<d; z++) for (let x=0; x<w; x++) {
+        const k=layers[layer][z][x];
+        gc.fillStyle=MATERIALS[k]?.color || "#f0f"; gc.fillRect(x*cw,z*ch,cw,ch);
+        gc.strokeStyle="#ffffff28"; gc.strokeRect(x*cw+.5,z*ch+.5,cw-1,ch-1);
+        if (k!==".") { gc.fillStyle="#fff"; gc.font=`${Math.max(10,Math.min(cw,ch)*.28)}px monospace`; gc.fillText(k,x*cw+5,z*ch+16); }
+      }
+      // Anchor / entrance guides.
+      const ax=Math.floor(w/2), az=Math.floor(d/2);
+      gc.strokeStyle="#fff"; gc.lineWidth=3; gc.strokeRect(ax*cw+3,az*ch+3,cw-6,ch-6); gc.lineWidth=1;
+      if (layer===1) { gc.fillStyle="#ffd75e"; gc.beginPath(); gc.moveTo((ax+.5)*cw,2); gc.lineTo((ax+.25)*cw,ch*.55); gc.lineTo((ax+.75)*cw,ch*.55); gc.fill(); }
+      drawPreview();
+    }
+
+    function shade(hex, f) {
+      const n=parseInt(hex.slice(1),16), r=Math.min(255,((n>>16)&255)*f), g=Math.min(255,((n>>8)&255)*f), b=Math.min(255,(n&255)*f);
+      return `rgb(${r|0},${g|0},${b|0})`;
+    }
+    function cube(x,y,z,color,ox,oy,s) {
+      const X=ox+(x-z)*s, Y=oy+(x+z)*s*.5-y*s;
+      pc.fillStyle=shade(color,1.05); pc.beginPath(); pc.moveTo(X,Y-s);pc.lineTo(X+s,Y-s*.5);pc.lineTo(X,Y);pc.lineTo(X-s,Y-s*.5);pc.fill();
+      pc.fillStyle=shade(color,.78); pc.beginPath(); pc.moveTo(X-s,Y-s*.5);pc.lineTo(X,Y);pc.lineTo(X,Y+s);pc.lineTo(X-s,Y+s*.5);pc.fill();
+      pc.fillStyle=shade(color,.62); pc.beginPath(); pc.moveTo(X+s,Y-s*.5);pc.lineTo(X,Y);pc.lineTo(X,Y+s);pc.lineTo(X+s,Y+s*.5);pc.fill();
+    }
+    function drawPreview() {
+      pc.clearRect(0,0,preview.width,preview.height); pc.fillStyle="#0d121a"; pc.fillRect(0,0,preview.width,preview.height);
+      const [w,h,d]=size, s=Math.min(28, 300/Math.max(w,d)), ox=preview.width/2, oy=110+h*s;
+      for (let sum=0; sum<w+d; sum++) for (let y=0; y<h; y++) for (let z=0; z<d; z++) {
+        const x=sum-z; if(x<0||x>=w) continue; const k=layers[y][z][x]; if(k!==".") cube(x,y,z,MATERIALS[k]?.color||"#f0f",ox,oy,s);
+      }
+      pc.fillStyle="#fff"; pc.beginPath();pc.arc(ox,oy+Math.floor((w+d)/2)*s*.5,4,0,Math.PI*2);pc.fill();
+      pc.fillStyle="#ffd75e";pc.font="bold 14px sans-serif";pc.fillText("ENTRADA SUR ↓",12,24);
+    }
+
+    function paint(ev, erase=false) {
+      ev.preventDefault();
+      const r=grid.getBoundingClientRect(), x=Math.floor((ev.clientX-r.left)/r.width*size[0]), z=Math.floor((ev.clientY-r.top)/r.height*size[2]);
+      if(x>=0&&z>=0&&x<size[0]&&z<size[2]) { layers[layer][z][x]=erase?".":selected; drawGrid(); }
+    }
+    grid.onmousedown=e=>paint(e,e.button===2); grid.oncontextmenu=e=>e.preventDefault();
+    grid.onwheel=e=>{ e.preventDefault(); layer=Math.max(0,Math.min(size[1]-1,layer+(e.deltaY>0?1:-1))); $("layer").value=layer; updateLayer(); };
+    $("layer").oninput=e=>{layer=+e.target.value;updateLayer();};
+    function updateLayer(){ $("layerLabel").textContent=`Y = ${layer}`;drawGrid(); }
+
+    $("resize").onclick=()=>{
+      const ns=[+$("sx").value,+$("sy").value,+$("sz").value].map(v=>Math.max(1,Math.min(32,v|0)));
+      const next=makeLayers(...ns);
+      for(let y=0;y<Math.min(size[1],ns[1]);y++)for(let z=0;z<Math.min(size[2],ns[2]);z++)for(let x=0;x<Math.min(size[0],ns[0]);x++)next[y][z][x]=layers[y][z][x];
+      size=ns;layers=next;layer=Math.min(layer,size[1]-1);$("layer").max=size[1]-1;$("layer").value=layer;updateLayer();
+    };
+    $("clearLayer").onclick=()=>{ layers[layer].forEach(r=>r.fill("."));drawGrid(); };
+    $("fillLayer").onclick=()=>{ layers[layer].forEach(r=>r.fill(selected));drawGrid(); };
+
+    function toJSON() {
+      const [w,h,d]=size;
+      return {
+        schema_version:1,id:$("id").value.trim()||"prefab",name:$("name").value.trim()||"Prefab",
+        size:[w,h,d],anchor:[Math.floor(w/2),0,Math.floor(d/2)],
+        entrance:{position:[Math.floor(w/2),1,0],facing:"south"},
+        lot:{width:+$("lotW").value||w+2,depth:+$("lotD").value||d+2},
+        palette:Object.fromEntries(Object.entries(NAMES)),layers:layers.map(L=>L.map(row=>row.join("")))
+      };
+    }
+    $("export").onclick=()=>{
+      const data=JSON.stringify(toJSON(),null,2), blob=new Blob([data],{type:"application/json"}), a=document.createElement("a");
+      a.href=URL.createObjectURL(blob);a.download=(`${$("id").value||"prefab"}.json`).replace(/[^a-z0-9_.-]/gi,"_");a.click();URL.revokeObjectURL(a.href);
+      $("status").textContent=`Exportado ${a.download}`;
+    };
+    $("import").onclick=()=>$("file").click();
+    $("file").onchange=async e=>{
+      try{
+        const data=JSON.parse(await e.target.files[0].text()), [w,h,d]=data.size;
+        size=[w,h,d];layers=data.layers.map(L=>L.map(row=>row.split("")));
+        $("id").value=data.id||"prefab";$("name").value=data.name||"Prefab";$("sx").value=w;$("sy").value=h;$("sz").value=d;
+        $("lotW").value=data.lot?.width||w+2;$("lotD").value=data.lot?.depth||d+2;
+        layer=0;$("layer").max=h-1;$("layer").value=0;updateLayer();$("status").textContent=`Importado ${data.id}`;
+      }catch(err){$("status").textContent=`Error: ${err.message}`;}
+    };
+    defaultHouse(); drawGrid();
+  </script>
+</body>
+</html>

@@ -1,0 +1,20 @@
+{
+  "id": "special1_sword",
+  "name": "Espada especial",
+  "model": "assets/items/special1_sword.json",
+  "max_durability": 120,
+  "dig": {
+    "dirt_cost": 2,
+    "stone_cost": 8,
+    "dirt_ms": 400,
+    "stone_ms": 1600
+  },
+  "attach": {
+    "scale": 1.16,
+    "wrist": [0.2, -3.75, 0.25],
+    "grip": [0.0, 1.6, 0.0],
+    "orient": "sword",
+    "swing_arc_deg": 55.0,
+    "swing_speed": 1.2
+  }
+}

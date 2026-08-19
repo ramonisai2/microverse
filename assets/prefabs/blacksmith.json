@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "id": "blacksmith",
+  "name": "Herrería",
+  "size": [7, 6, 7],
+  "anchor": [3, 0, 3],
+  "entrance": { "position": [3, 1, 0], "facing": "south" },
+  "lot": { "width": 9, "depth": 9 },
+  "palette": {
+    ".": "air",
+    "S": "village_stone",
+    "C": "cobblestone",
+    "W": "wood_planks",
+    "G": "glass",
+    "R": "wood_roof",
+    "D": "door",
+    "K": "black_stone"
+  },
+  "layers": [
+    [
+      "CCCCCCC",
+      "CCCCCCC",
+      "CCCCCCC",
+      "CCCCCCC",
+      "CCCCCCC",
+      "CCCCCCC",
+      "CCCCCCC"
+    ],
+    [
+      "CCCDCCC",
+      "C.....C",
+      "C..K..C",
+      "C.KKK.C",
+      "C..K..C",
+      "C.....C",
+      "CCCCCCC"
+    ],
+    [
+      "CCCDCCC",
+      "C.....C",
+      "C..K..C",
+      "W.....W",
+      "G.....G",
+      "C.....C",
+      "CCCGCCC"
+    ],
+    [
+      "CCCCCCC",
+      "C.....C",
+      "C..K..C",
+      "W.....W",
+      "W.....W",
+      "C.....C",
+      "CCCCCCC"
+    ],
+    [
+      "RRRRRRR",
+      "RRRRRRR",
+      "RR.K.RR",
+      "RRRRRRR",
+      "RRRRRRR",
+      "RRRRRRR",
+      "RRRRRRR"
+    ],
+    [
+      ".......",
+      ".......",
+      "..KKK..",
+      ".......",
+      ".......",
+      ".......",
+      "......."
+    ]
+  ]
+}
