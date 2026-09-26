@@ -34,6 +34,8 @@ pub enum BiomeId {
     /// Cold arid flats (pale ground, sparse conifers).
     IceDesert,
     Wetland,
+    /// Orilla arenosa junto al mar (arena, poca hierba, casi sin árboles).
+    Beach,
     Savanna,
     /// Fantasy: violet canopy / mist.
     EnchantedForest,
@@ -95,6 +97,7 @@ impl BiomeId {
             Self::HotDesert => "DESIERTO",
             Self::IceDesert => "DESIERTO HELADO",
             Self::Wetland => "HUMEDAL",
+            Self::Beach => "PLAYA",
             Self::Savanna => "SABANA",
             Self::EnchantedForest => "BOSQUE ENCANTADO",
             Self::DarkForest => "BOSQUE OSCURO",
@@ -102,41 +105,47 @@ impl BiomeId {
     }
 
     /// Top-face / grass tapa albedo. Meadow matches [`Material::Grass`] exactly.
+    /// Neighbor biomes are pushed apart on purpose (2026-09): pine = deep
+    /// conifer, deciduous = bright lime, hills = dry khaki, dry band split
+    /// straw (tropical) / olive (savanna) / sage (scrub).
     pub fn grass_rgb(self) -> [f32; 3] {
         use crate::world::Material;
         match self {
             Self::TemperateMeadow => Material::Grass.color_rgb(),
-            Self::PineOakForest => [0.34, 0.58, 0.30],
-            Self::DeciduousForest => [0.30, 0.56, 0.28],
+            Self::PineOakForest => [0.24, 0.50, 0.30],
+            Self::DeciduousForest => [0.40, 0.64, 0.24],
             Self::BorealForest => [0.28, 0.48, 0.36],
-            Self::Hills => [0.40, 0.58, 0.30],
+            Self::Hills => [0.47, 0.55, 0.31],
             Self::CloudForest => [0.26, 0.55, 0.38],
-            Self::TropicalDryForest => [0.48, 0.58, 0.26],
-            Self::DesertScrub => [0.58, 0.52, 0.28],
+            Self::TropicalDryForest => [0.62, 0.58, 0.22],
+            Self::DesertScrub => [0.52, 0.54, 0.32],
             Self::HotDesert => [0.72, 0.62, 0.34],
             Self::IceDesert => [0.62, 0.72, 0.70],
             Self::Wetland => [0.24, 0.50, 0.32],
-            Self::Savanna => [0.52, 0.60, 0.28],
+            Self::Beach => [0.55, 0.60, 0.34],
+            Self::Savanna => [0.55, 0.62, 0.26],
             Self::EnchantedForest => [0.42, 0.28, 0.62],
             Self::DarkForest => [0.18, 0.28, 0.22],
         }
     }
 
     /// Exposed dirt / skirt tone for this climate. Meadow matches [`Material::Dirt`].
+    /// Pine duff reads dark, deciduous loam rich; dry band split red / pale.
     pub fn dirt_rgb(self) -> [f32; 3] {
         use crate::world::Material;
         match self {
             Self::TemperateMeadow => Material::Dirt.color_rgb(),
-            Self::PineOakForest => [0.48, 0.36, 0.22],
-            Self::DeciduousForest => [0.46, 0.34, 0.22],
+            Self::PineOakForest => [0.38, 0.28, 0.20],
+            Self::DeciduousForest => [0.52, 0.38, 0.24],
             Self::BorealForest => [0.42, 0.34, 0.28],
             Self::Hills => [0.50, 0.40, 0.28],
             Self::CloudForest => [0.40, 0.32, 0.24],
-            Self::TropicalDryForest => [0.56, 0.40, 0.24],
-            Self::DesertScrub => [0.62, 0.48, 0.30],
+            Self::TropicalDryForest => [0.60, 0.42, 0.22],
+            Self::DesertScrub => [0.66, 0.52, 0.32],
             Self::HotDesert => [0.70, 0.52, 0.28],
             Self::IceDesert => [0.55, 0.58, 0.60],
             Self::Wetland => [0.36, 0.30, 0.20],
+            Self::Beach => [0.72, 0.62, 0.40],
             Self::Savanna => [0.58, 0.44, 0.26],
             Self::EnchantedForest => [0.38, 0.28, 0.42],
             Self::DarkForest => [0.22, 0.18, 0.16],
@@ -158,20 +167,22 @@ impl BiomeId {
     }
 
     /// Near-surface fog / clear colour. Meadow matches legacy `fog_color_for_altitude`.
+    /// Pine haze cool, deciduous warm, cloud forest bright mist.
     pub fn fog_surface_rgb(self) -> [f32; 3] {
         match self {
             Self::TemperateMeadow => [0.48, 0.70, 0.42],
-            Self::PineOakForest => [0.42, 0.62, 0.40],
-            Self::DeciduousForest => [0.40, 0.60, 0.38],
+            Self::PineOakForest => [0.36, 0.56, 0.44],
+            Self::DeciduousForest => [0.46, 0.64, 0.38],
             Self::BorealForest => [0.40, 0.52, 0.50],
             Self::Hills => [0.50, 0.62, 0.44],
-            Self::CloudForest => [0.52, 0.66, 0.58],
-            Self::TropicalDryForest => [0.58, 0.62, 0.38],
+            Self::CloudForest => [0.60, 0.70, 0.66],
+            Self::TropicalDryForest => [0.62, 0.60, 0.34],
             Self::DesertScrub => [0.68, 0.58, 0.40],
             Self::HotDesert => [0.78, 0.64, 0.38],
             Self::IceDesert => [0.62, 0.72, 0.78],
             Self::Wetland => [0.36, 0.58, 0.48],
-            Self::Savanna => [0.60, 0.66, 0.40],
+            Self::Beach => [0.50, 0.68, 0.62],
+            Self::Savanna => [0.58, 0.68, 0.38],
             Self::EnchantedForest => [0.48, 0.32, 0.62],
             Self::DarkForest => [0.22, 0.26, 0.24],
         }
@@ -191,6 +202,7 @@ impl BiomeId {
             Self::HotDesert => [0.70, 0.78, 0.92],
             Self::IceDesert => [0.55, 0.68, 0.88],
             Self::Wetland => [0.40, 0.58, 0.78],
+            Self::Beach => [0.46, 0.64, 0.90],
             Self::Savanna => [0.55, 0.70, 0.90],
             Self::EnchantedForest => [0.45, 0.38, 0.72],
             Self::DarkForest => [0.28, 0.32, 0.40],
@@ -218,6 +230,18 @@ impl BiomeId {
             Self::HotDesert | Self::DesertScrub => [0.10, 0.07, 0.05],
             Self::IceDesert => [0.06, 0.08, 0.12],
             _ => [0.07, 0.09, 0.12],
+        }
+    }
+
+    /// Air density for the exponential fog: mist forests close in, clear dry
+    /// lands read far. Meadow returns [`crate::world::FOG_DENSITY`].
+    pub fn fog_density(self) -> f32 {
+        match self {
+            Self::CloudForest => 0.012,
+            Self::DarkForest => 0.010,
+            Self::EnchantedForest | Self::Wetland => 0.009,
+            Self::HotDesert | Self::IceDesert | Self::DesertScrub | Self::Savanna => 0.004,
+            _ => crate::world::FOG_DENSITY,
         }
     }
 }
@@ -262,11 +286,36 @@ pub fn climate_at(x: i32, z: i32) -> (f32, f32) {
     (temp, moist)
 }
 
-fn biome_from_climate(x: i32, z: i32) -> BiomeId {
-    let (temp, moist) = climate_at(x, z);
-    let h = terrain_height_f(x, z);
-    let slope = terrain_slope(x, z);
+/// Relief multiplier from climate only (no height feedback, no recursion —
+/// safe to call inside `terrain_height_f`). Deserts and drowned lowlands
+/// flatten toward the average; boreal and cloud belts rise. Smoothstep fences
+/// so region borders never cut a wall. Spawn climate (~0.48, ~0.42) reads 1.0.
+pub fn relief_scale_for_climate(temp: f32, moist: f32) -> f32 {
+    let ss = |a: f32, b: f32, x: f32| -> f32 {
+        let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
+    // Flat pull: hot/dry deserts fully, very wet lowlands partially.
+    let desert_flat = ss(0.60, 0.72, temp) * (1.0 - ss(0.20, 0.32, moist));
+    let wet_flat = ss(0.62, 0.74, moist);
+    let flat = desert_flat.max(wet_flat * 0.7);
+    // Rugged pull: cold moist belt (boreal) and warm wet belt (cloud forest).
+    let boreal_up = (1.0 - ss(0.20, 0.30, temp)) * ss(0.30, 0.42, moist);
+    let cloud_up = ss(0.55, 0.65, moist) * ss(0.30, 0.38, temp) * (1.0 - ss(0.62, 0.70, temp));
+    let up = (boreal_up * 0.5 + cloud_up * 0.5).min(1.0);
+    (1.0 - 0.55 * flat + 0.30 * up).clamp(0.45, 1.35)
+}
 
+/// Climate + height + slope → biome decision (the pure part of
+/// [`biome_from_climate`] so commit paths that already know temp/moist/h/slope
+/// skip re-sampling terrain noise per column).
+pub fn biome_from_climate_slope(    x: i32,
+    z: i32,
+    temp: f32,
+    moist: f32,
+    h: f32,
+    slope: f32,
+) -> BiomeId {
     // Rare fantasy pockets (outside spawn pull) — same climate layer, separate noise.
     let enchant = fantasy_sample(x, z, 3.1);
     let umbra = fantasy_sample(x, z, 9.7);
@@ -279,6 +328,14 @@ fn biome_from_climate(x: i32, z: i32) -> BiomeId {
 
     if slope > 1.35 && h > 28.0 {
         return BiomeId::Hills;
+    }
+    // Orilla del mar: arena solo en la franja del nivel con agua al lado
+    // (anillo de playa real, no todo el relieve medio).
+    if h >= crate::world::SEA_LEVEL as f32 - 1.0
+        && h <= crate::world::SEA_LEVEL as f32 + 2.0
+        && crate::world::shore_water_near(x, z)
+    {
+        return BiomeId::Beach;
     }
     if moist > 0.72 && h < 16.0 {
         return BiomeId::Wetland;
@@ -320,6 +377,13 @@ fn biome_from_climate(x: i32, z: i32) -> BiomeId {
     BiomeId::TemperateMeadow
 }
 
+fn biome_from_climate(x: i32, z: i32) -> BiomeId {
+    let (temp, moist) = climate_at(x, z);
+    let h = terrain_height_f(x, z);
+    let slope = terrain_slope(x, z);
+    biome_from_climate_slope(x, z, temp, moist, h, slope)
+}
+
 /// Biome at block column. Spawn disk is always temperate meadow.
 pub fn biome_at(x: i32, z: i32) -> BiomeId {
     let dx = x - SPAWN_X;
@@ -330,12 +394,24 @@ pub fn biome_at(x: i32, z: i32) -> BiomeId {
     biome_from_climate(x, z)
 }
 
+/// Same as [`biome_at`] but takes already-computed climate/height/slope — used
+/// by the streaming commit so it samples each once per column, not once per
+/// decision call.
+pub fn biome_at_slope(x: i32, z: i32, temp: f32, moist: f32, h: f32, slope: f32) -> BiomeId {
+    let dx = x - SPAWN_X;
+    let dz = z - SPAWN_Z;
+    if dx * dx + dz * dz <= SPAWN_MEADOW_RADIUS * SPAWN_MEADOW_RADIUS {
+        return BiomeId::TemperateMeadow;
+    }
+    biome_from_climate_slope(x, z, temp, moist, h, slope)
+}
+
 pub fn flora_for(biome: BiomeId) -> FloraProfile {
     match biome {
         BiomeId::TemperateMeadow => FloraProfile {
             tree_chance: 0.38,
             tree_cell: 10,
-            grass_bare_chance: 0.82,
+            grass_bare_chance: 0.50,
             species: &[(TreeSpecies::Oak, 10)],
             bush_chance: 0.0,
             bush_cell: 12,
@@ -457,6 +533,17 @@ pub fn flora_for(biome: BiomeId) -> FloraProfile {
             sand_chance: 0.04,
             sand_cell: 10,
         },
+        BiomeId::Beach => FloraProfile {
+            tree_chance: 0.02,
+            tree_cell: 18,
+            grass_bare_chance: 0.90,
+            species: &[(TreeSpecies::Willow, 10)],
+            bush_chance: 0.06,
+            bush_cell: 10,
+            bushes: &[(BushKind::Scrub, 10)],
+            sand_chance: 0.55,
+            sand_cell: 5,
+        },
         BiomeId::Savanna => FloraProfile {
             tree_chance: 0.14,
             tree_cell: 14,
@@ -533,7 +620,12 @@ pub fn pick_bush_kind(x: i32, z: i32, biome: BiomeId) -> Option<BushKind> {
 
 /// Coherent surface sand patches driven by biome flora profile.
 pub fn column_has_sand_surface(x: i32, z: i32) -> bool {
-    let flora = flora_for(biome_at(x, z));
+    column_has_sand_surface_biome(biome_at(x, z), x, z)
+}
+
+/// [`column_has_sand_surface`] for a caller that already knows the biome.
+pub fn column_has_sand_surface_biome(biome: BiomeId, x: i32, z: i32) -> bool {
+    let flora = flora_for(biome);
     if flora.sand_chance <= 0.0 {
         return false;
     }
@@ -563,11 +655,34 @@ mod tests {
     #[test]
     fn spawn_is_temperate_meadow() {
         assert_eq!(biome_at(SPAWN_X, SPAWN_Z), BiomeId::TemperateMeadow);
-        assert_eq!(biome_at(SPAWN_X + 10, SPAWN_Z - 5), BiomeId::TemperateMeadow);
+        assert_eq!(
+            biome_at(SPAWN_X + 10, SPAWN_Z - 5),
+            BiomeId::TemperateMeadow
+        );
         assert_eq!(
             biome_at(SPAWN_X + SPAWN_MEADOW_RADIUS, SPAWN_Z),
             BiomeId::TemperateMeadow
         );
+    }
+
+    #[test]
+    fn relief_scale_flattens_deserts_and_keeps_spawn() {
+        // Spawn climate must not reshape the meadow.
+        let (t, m) = climate_at(SPAWN_X, SPAWN_Z);
+        assert!((relief_scale_for_climate(t, m) - 1.0).abs() < 1e-5);
+        // Hot arid flattens hard, wet lowlands partially, boreal rises.
+        assert!(relief_scale_for_climate(0.85, 0.10) < 0.6);
+        assert!(relief_scale_for_climate(0.50, 0.80) < 1.0);
+        assert!(relief_scale_for_climate(0.15, 0.50) > 1.0);
+        // Temperate mid stays neutral.
+        assert!((relief_scale_for_climate(0.50, 0.45) - 1.0).abs() < 0.05);
+        // Bounded everywhere on the climate square.
+        for ti in 0..=10 {
+            for mi in 0..=10 {
+                let s = relief_scale_for_climate(ti as f32 / 10.0, mi as f32 / 10.0);
+                assert!((0.45..=1.35).contains(&s), "s={s} at {ti},{mi}");
+            }
+        }
     }
 
     #[test]
@@ -603,7 +718,8 @@ mod tests {
         let f = flora_for(BiomeId::TemperateMeadow);
         assert!((f.tree_chance - 0.38).abs() < 1e-5);
         assert_eq!(f.tree_cell, 10);
-        assert!((f.grass_bare_chance - 0.82).abs() < 1e-5);
+        // Retuned 2026-09: meadow reads green (~50% tufts, was 0.82 bare).
+        assert!((f.grass_bare_chance - 0.50).abs() < 1e-5);
         assert_eq!(
             pick_tree_species(SPAWN_X, SPAWN_Z, BiomeId::TemperateMeadow),
             TreeSpecies::Oak
@@ -648,6 +764,34 @@ mod tests {
         assert!((legacy[2] - biome[2]).abs() < 1e-5);
         let desert = fog_color_for_biome(eye, surf, BiomeId::DesertScrub);
         assert!((desert[0] - biome[0]).abs() > 0.05 || (desert[1] - biome[1]).abs() > 0.05);
+    }
+
+    #[test]
+    fn neighbor_biomes_read_apart() {
+        // Green family must not cluster: pine deep, deciduous lime, meadow mid.
+        let pine = BiomeId::PineOakForest.grass_rgb();
+        let deci = BiomeId::DeciduousForest.grass_rgb();
+        let meadow = BiomeId::TemperateMeadow.grass_rgb();
+        assert!((pine[1] - deci[1]).abs() > 0.08);
+        assert!((deci[2] - meadow[2]).abs() > 0.05);
+        // Dirt: pine duff dark vs deciduous loam.
+        assert!(
+            BiomeId::PineOakForest.dirt_rgb()[0]
+                < BiomeId::DeciduousForest.dirt_rgb()[0] - 0.08
+        );
+        // Dry band: straw vs olive vs sage spread apart.
+        let tdf = BiomeId::TropicalDryForest.grass_rgb();
+        let sav = BiomeId::Savanna.grass_rgb();
+        let scr = BiomeId::DesertScrub.grass_rgb();
+        assert!(tdf[0] > sav[0] + 0.03 && sav[1] > scr[1] + 0.03);
+    }
+
+    #[test]
+    fn fog_density_spread() {
+        use crate::world::FOG_DENSITY;
+        assert!((BiomeId::TemperateMeadow.fog_density() - FOG_DENSITY).abs() < 1e-6);
+        assert!(BiomeId::CloudForest.fog_density() > FOG_DENSITY);
+        assert!(BiomeId::HotDesert.fog_density() < FOG_DENSITY);
     }
 
     #[test]

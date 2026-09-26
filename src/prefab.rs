@@ -15,6 +15,22 @@ const BLACKSMITH_JSON: &str = include_str!("../assets/prefabs/blacksmith.json");
 const PHARMACY_JSON: &str = include_str!("../assets/prefabs/pharmacy.json");
 const RESTAURANT_JSON: &str = include_str!("../assets/prefabs/restaurant.json");
 const WIZARD_TOWER_JSON: &str = include_str!("../assets/prefabs/wizard_tower.json");
+const WATCHTOWER_JSON: &str = include_str!("../assets/prefabs/watchtower.json");
+const MISSION_BOARD_JSON: &str = include_str!("../assets/prefabs/mission_board.json");
+const TAVERN_JSON: &str = include_str!("../assets/prefabs/tavern.json");
+const BARN_JSON: &str = include_str!("../assets/prefabs/barn.json");
+const CHAPEL_JSON: &str = include_str!("../assets/prefabs/chapel.json");
+const HERBALIST_JSON: &str = include_str!("../assets/prefabs/herbalist.json");
+const STABLE_JSON: &str = include_str!("../assets/prefabs/stable.json");
+const SAWMILL_JSON: &str = include_str!("../assets/prefabs/sawmill.json");
+const LIBRARY_JSON: &str = include_str!("../assets/prefabs/library.json");
+const BARRACKS_JSON: &str = include_str!("../assets/prefabs/barracks.json");
+const LIGHTHOUSE_JSON: &str = include_str!("../assets/prefabs/lighthouse.json");
+const MARKET_STALL_JSON: &str = include_str!("../assets/prefabs/market_stall.json");
+const SMITH_STALL_JSON: &str = include_str!("../assets/prefabs/smith_stall.json");
+const POTION_STALL_JSON: &str = include_str!("../assets/prefabs/potion_stall.json");
+const BARTER_STALL_JSON: &str = include_str!("../assets/prefabs/barter_stall.json");
+const CART_JSON: &str = include_str!("../assets/prefabs/cart.json");
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Prefab {
@@ -46,6 +62,11 @@ fn material_from_name(name: &str) -> Option<Material> {
         "stone" => Some(Material::Stone),
         "village_stone" => Some(Material::VillageStone),
         "cobble" | "cobblestone" => Some(Material::Cobblestone),
+        "road_cobble" | "road_cobblestone" => Some(Material::RoadCobble),
+        "torch" | "torchflame" => Some(Material::Torch),
+        "apple" | "apples" => Some(Material::Apple),
+        "beehive" | "hive" => Some(Material::Beehive),
+        "mana_crystal" | "mana" | "crystal" => Some(Material::ManaCrystal),
         "black_stone" | "blackstone" => Some(Material::BlackStone),
         "wood" | "wood_planks" | "wood_roof" => Some(Material::WoodPlanks),
         "wood_log" | "log" => Some(Material::Wood),
@@ -53,6 +74,8 @@ fn material_from_name(name: &str) -> Option<Material> {
         "glass" => Some(Material::Glass),
         "door" => Some(Material::Door),
         "water" => Some(Material::Water),
+        "mud" => Some(Material::Mud),
+        "thermal_water" => Some(Material::ThermalWater),
         "leaves" => Some(Material::Leaves),
         "sand" => Some(Material::Sand),
         "emerald" => Some(Material::Emerald),
@@ -135,6 +158,22 @@ fn bundled_prefab_json(path: &str) -> Option<&'static str> {
         "pharmacy.json" => Some(PHARMACY_JSON),
         "restaurant.json" => Some(RESTAURANT_JSON),
         "wizard_tower.json" => Some(WIZARD_TOWER_JSON),
+        "watchtower.json" => Some(WATCHTOWER_JSON),
+        "mission_board.json" => Some(MISSION_BOARD_JSON),
+        "tavern.json" => Some(TAVERN_JSON),
+        "barn.json" => Some(BARN_JSON),
+        "chapel.json" => Some(CHAPEL_JSON),
+        "herbalist.json" => Some(HERBALIST_JSON),
+        "stable.json" => Some(STABLE_JSON),
+        "sawmill.json" => Some(SAWMILL_JSON),
+        "library.json" => Some(LIBRARY_JSON),
+        "barracks.json" => Some(BARRACKS_JSON),
+        "lighthouse.json" => Some(LIGHTHOUSE_JSON),
+        "market_stall.json" => Some(MARKET_STALL_JSON),
+        "smith_stall.json" => Some(SMITH_STALL_JSON),
+        "potion_stall.json" => Some(POTION_STALL_JSON),
+        "barter_stall.json" => Some(BARTER_STALL_JSON),
+        "cart.json" => Some(CART_JSON),
         _ => None,
     }
 }
@@ -198,6 +237,11 @@ pub fn voxel_for_material(material: Material) -> Voxel {
         | Material::WoodPlanks
         | Material::VillageStone
         | Material::Cobblestone
+        | Material::RoadCobble
+        | Material::Torch
+        | Material::Apple
+        | Material::Beehive
+        | Material::ManaCrystal
         | Material::Glass
         | Material::Door
         | Material::Water => Voxel::solid(material),
@@ -216,14 +260,14 @@ mod tests {
         let p = load_prefab(DEFAULT_HOUSE_PREFAB).expect("load");
         assert_eq!(p.size, [7, 5, 7]);
         assert_eq!(p.anchor, [3, 0, 3]);
-        assert!(p.solids.iter().any(|&(x, y, z, m)| {
-            x == 0 && y == 0 && z == 0 && m == Material::VillageStone
-        }));
-        assert!(
-            p.solids
-                .iter()
-                .any(|&(_, y, _, m)| y == 4 && m == Material::WoodPlanks)
-        );
+        assert!(p
+            .solids
+            .iter()
+            .any(|&(x, y, z, m)| { x == 0 && y == 0 && z == 0 && m == Material::VillageStone }));
+        assert!(p
+            .solids
+            .iter()
+            .any(|&(_, y, _, m)| y == 4 && m == Material::WoodPlanks));
         assert!(
             p.solids.iter().any(|&(_, _, _, m)| m == Material::Glass),
             "house_basic should include glass window cells"

@@ -121,11 +121,7 @@ pub enum BreakOutcome {
 }
 
 /// Remove one solid diggable cell, wear the pick, clear floating grass above.
-pub fn break_solid_cell(
-    world: &mut World,
-    pos: IVec3,
-    pick: &mut ToolInstance,
-) -> BreakOutcome {
+pub fn break_solid_cell(world: &mut World, pos: IVec3, pick: &mut ToolInstance) -> BreakOutcome {
     let Some(material) = world.dig_material_at(pos) else {
         // Still clear stray grass if present.
         let above = pos + IVec3::Y;
@@ -162,7 +158,44 @@ pub fn break_solid_cell(
     BreakOutcome::Broke { material, ore }
 }
 
-/// Bare-hand break: wood-tier materials only, no durability wear.
+/// Dulled (broken) pick: mines what the pick could mine at 2× time, no wear.
+/// Durability is already 0 — no further cost is charged.
+pub fn break_solid_cell_dulled(
+    world: &mut World,
+    pos: IVec3,
+    pick: &ToolInstance,
+) -> BreakOutcome {
+    let Some(material) = world.dig_material_at(pos) else {
+        // Still clear stray grass if present.
+        let above = pos + IVec3::Y;
+        if world
+            .get_voxel(above)
+            .is_some_and(|v| v.material == Material::Grass)
+        {
+            let _ = world.remove_voxel_player(above);
+        }
+        return BreakOutcome::Skipped;
+    };
+
+    if !pick.def.can_mine(material) {
+        return BreakOutcome::ToolBlocked;
+    }
+
+    // Sample ore before the cell disappears.
+    let ore = world.ore_drop_at(pos);
+
+    if !world.remove_voxel_player(pos) {
+        return BreakOutcome::Skipped;
+    }
+    let above = pos + IVec3::Y;
+    if world
+        .get_voxel(above)
+        .is_some_and(|v| v.material == Material::Grass)
+    {
+        let _ = world.remove_voxel_player(above);
+    }
+    BreakOutcome::Broke { material, ore }
+}
 pub fn break_solid_cell_bare(world: &mut World, pos: IVec3) -> BreakOutcome {
     let Some(material) = world.dig_material_at(pos) else {
         let above = pos + IVec3::Y;
@@ -240,10 +273,7 @@ mod tests {
     fn break_cell_wears_and_clears_grass() {
         let mut world = World::new();
         world.set_voxel(IVec3::new(0, 5, 0), Voxel::dirt());
-        world.set_voxel(
-            IVec3::new(0, 6, 0),
-            Voxel::grass_from_seed(1),
-        );
+        world.set_voxel(IVec3::new(0, 6, 0), Voxel::grass_from_seed(1));
         let mut pick = spawn_wooden_pickaxe();
         let before = pick.durability;
         assert_eq!(
@@ -288,6 +318,30 @@ mod tests {
     #[test]
     fn max_reach_matches_edit_reach() {
         assert!((MAX_REACH - EDIT_REACH).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dulled_pick_breaks_without_wear() {
+        let mut world = World::new();
+        world.set_voxel(IVec3::new(4, 3, 4), Voxel::stone());
+        let mut pick = spawn_wooden_pickaxe();
+        pick.durability = 0;
+        assert!(pick.is_broken());
+        // El pico sano rechazaría la piedra rota...
+        assert_eq!(
+            break_solid_cell(&mut world, IVec3::new(4, 3, 4), &mut pick),
+            BreakOutcome::ToolBlocked
+        );
+        // ...pero desafilado pica igual (al doble de tiempo, sin desgaste).
+        assert!(matches!(
+            break_solid_cell_dulled(&mut world, IVec3::new(4, 3, 4), &pick),
+            BreakOutcome::Broke {
+                material: Material::Stone,
+                ..
+            }
+        ));
+        assert_eq!(pick.durability, 0);
+        assert!(world.get_voxel(IVec3::new(4, 3, 4)).is_none());
     }
 
     #[test]

@@ -115,17 +115,13 @@ fn terrain_uv(pos: [f32; 3], neighbor: glam::IVec3) -> [f32; 2] {
 /// - Stone cells → stone grain tile.
 /// - +Y (tapa): grass-top only on the natural undug surface; dug / buried lids = dirt.
 /// - Sides / bottom: plain dirt (never the grass-block side with a green fringe stripe).
-fn terrain_tile_for_block(
-    world: &World,
-    block_pos: glam::IVec3,
-    neighbor: glam::IVec3,
-) -> f32 {
+fn terrain_tile_for_block(world: &World, block_pos: glam::IVec3, neighbor: glam::IVec3) -> f32 {
     use crate::world::Material;
     match world.get_voxel(block_pos).map(|v| v.material) {
         Some(Material::Stone) => return TERRAIN_TILE_STONE,
         Some(Material::WoodPlanks) => return TERRAIN_TILE_PLANKS,
         Some(Material::VillageStone) => return TERRAIN_TILE_VILLAGE_STONE,
-        Some(Material::Cobblestone) => return TERRAIN_TILE_COBBLE,
+        Some(Material::Cobblestone) | Some(Material::RoadCobble) => return TERRAIN_TILE_COBBLE,
         Some(Material::Sand) => return TERRAIN_TILE_SAND,
         _ => {}
     }
@@ -150,7 +146,11 @@ fn dirt_top_is_grassy(world: &World, block_pos: glam::IVec3) -> bool {
     ) {
         return false;
     }
-    block_pos.y == terrain_height(block_pos.x, block_pos.z)
+    if block_pos.y != terrain_height(block_pos.x, block_pos.z) {
+        return false;
+    }
+    // Settlement ground is trodden dirt/sand, never a grass lid.
+    !crate::settlements::settlement_claims_block_cached(block_pos.x, block_pos.z)
 }
 
 /// Grass density / state keys use the player focus in HD-2D (not the lens).
@@ -310,8 +310,91 @@ fn stencil_occluded_non_player() -> wgpu::StencilState {
     }
 }
 
-/// Slightly under 1536² to cut fill cost while keeping soft contacts (HD-2D budget).
-const SHADOW_MAP_SIZE: u32 = 1024;
+/// 640² shadow map: ~30% menos fill que 768² en el shadow pass.
+/// El PCF 9-tap de `shader.wgsl` compensa el texel más grande.
+/// En Android (GPU de móvil) 256²: el kernel del shader es relativo
+/// (texel 1/960 fijo); sombras blandas, ~6× menos fill que en PC.
+const SHADOW_MAP_SIZE: u32 = if cfg!(target_os = "android") {
+    256
+} else {
+    640
+};
+
+/// [Opt A — normalizado a 1.0] Antes el pase de escena iba a 2/3 y el blur
+/// lo upscaleaba (Linear). El usuario pidió nitidez normalizada en ambos
+/// modos, así que escena y blur van a resolución nativa; el FPS se gana
+/// con shadow 640 + hierba leve en vez de con downscale.
+/// En Android (GPU de móvil) 0.66 de base (la dinámica baja hasta 0.45):
+/// en 6" denso el upscale lo enmascara el bokeh.
+const SCENE_INTERNAL_SCALE: f32 = if cfg!(target_os = "android") {
+    0.66
+} else {
+    1.0
+};
+
+fn scene_internal_size(w: u32, h: u32) -> (u32, u32) {
+    (
+        ((w as f32 * SCENE_INTERNAL_SCALE).round().max(1.0)) as u32,
+        ((h as f32 * SCENE_INTERNAL_SCALE).round().max(1.0)) as u32,
+    )
+}
+
+/// [A-ext] FP nítido + diorama interno: primera persona va a resolución
+/// nativa (1:1), el diorama HD-2D sigue a 2/3. Mismo umbral que el culling
+/// de secciones (`hd2d_amount >= 0.25`) para no mezclar estados.
+/// NOTA: con `SCENE_INTERNAL_SCALE = 1.0` ambos modos son nativos y esta
+/// función devuelve nativo en los dos casos (se mantiene para no reabrir
+/// el downscale sin querer y para que el blur texel siga coherente).
+fn scene_internal_size_for(w: u32, h: u32, diorama: bool) -> (u32, u32) {
+    if diorama {
+        scene_internal_size(w, h)
+    } else {
+        (w.max(1), h.max(1))
+    }
+}
+
+/// Tope de superficie en Android: el lado largo se capa a 1440. El pase de
+/// blur→swapchain y el HUD van a resolución nativa (2400+ en gama alta);
+/// capar recorta ~64% del fill de esos pases con un upscale que el bokeh
+/// enmascara. En PC devuelve el tamaño tal cual.
+fn capped_surface_size(w: u32, h: u32) -> (u32, u32) {
+    if !cfg!(target_os = "android") {
+        return (w.max(1), h.max(1));
+    }
+    let longest = w.max(h).max(1) as f32;
+    let s = (1440.0 / longest).min(1.0);
+    (
+        ((w as f32 * s).round().max(1.0)) as u32,
+        ((h as f32 * s).round().max(1.0)) as u32,
+    )
+}
+
+/// Peldaños de la escala dinámica (Android): 0.66 base, 0.55, 0.45 suelo.
+/// Pura para tests; la aplica `Renderer::auto_scene_scale`.
+fn dyn_scale_step(cur: f32, fps: f32) -> f32 {
+    const LADDER: [f32; 3] = [0.66, 0.55, 0.45];
+    if fps < 45.0 {
+        LADDER
+            .iter()
+            .find(|&&s| s < cur - 1e-4)
+            .copied()
+            .unwrap_or(cur)
+    } else if fps > 57.0 {
+        LADDER
+            .iter()
+            .rev()
+            .find(|&&s| s > cur + 1e-4)
+            .copied()
+            .unwrap_or(cur)
+    } else {
+        cur
+    }
+}
+
+#[inline]
+fn is_diorama_view(camera: &Camera) -> bool {
+    crate::world::ENABLE_HD2D && camera.hd2d_amount() >= 0.25
+}
 
 fn light_view_proj(camera_pos: Vec3) -> Mat4 {
     let light_dir = Vec3::new(-0.4, 0.9, -0.2).normalize();
@@ -366,20 +449,36 @@ pub struct Renderer {
     _terrain_view: wgpu::TextureView,
     _terrain_sampler: wgpu::Sampler,
     terrain_bind_group: wgpu::BindGroup,
-    /// Per-chunk GPU meshes kept in VRAM (LRU beyond the loaded world bubble).
-    chunk_meshes: std::collections::HashMap<(i32, i32), ChunkMeshEntry>,
+    /// Per-section GPU meshes (16³ B-split keys `(cx, cy, cz)`) kept in VRAM
+    /// (LRU beyond the loaded world bubble).
+    chunk_meshes: std::collections::HashMap<(i32, i32, i32), ChunkMeshEntry>,
     /// Monotonic frame counter for LRU.
     frame_index: u64,
     /// Last frustum/horizon-visible set (draw order).
-    visible_chunks: Vec<(i32, i32)>,
-    /// Chunks waiting for a remesh (amortized). O(1) membership via hash set.
-    chunk_rebuild_queue: rustc_hash::FxHashSet<(i32, i32)>,
-    /// Player-edit chunks — rebuilt before streaming / LOD upgrades (anti ghost solid).
-    edit_priority: rustc_hash::FxHashSet<(i32, i32)>,
+    visible_chunks: Vec<(i32, i32, i32)>,
+    /// Sections waiting for a remesh (amortized). O(1) membership via hash set.
+    chunk_rebuild_queue: rustc_hash::FxHashSet<(i32, i32, i32)>,
+    /// Player-edit sections — rebuilt before streaming / LOD upgrades (anti ghost solid).
+    edit_priority: rustc_hash::FxHashSet<(i32, i32, i32)>,
     /// Soft cap on dirty chunks meshed per frame (time budget is the real limit).
     chunk_rebuilds_per_frame: usize,
+    /// Instrumentación (log `perf` en Android): ms de mallado, ms de upload
+    /// y secciones reconstruidas del último `render()`. Solo medición, no
+    /// cambian ninguna decisión del loop.
+    last_mesh_ms: f32,
+    last_upload_ms: f32,
+    last_rebuilt: usize,
+    /// Huecos del anillo keep en el último `render()` (pantalla de carga).
+    /// Empieza en MAX para que el primer frame ya marque cargando.
+    last_ring_holes: usize,
     /// Last blur amount uploaded (skip uniform write when stable).
     cached_blur_amount: Option<f32>,
+    /// Fast-path key: skip the streaming scan + rebuild when the camera hasn't
+    /// left its chunk (and hasn't drifted >8 blocks), nothing is dirty and no
+    /// orbit preload waits. Streaming itself discovers new chunks, so it must
+    /// still run on moves — just not on stationary frames.
+    last_stream_origin: Option<Vec3>,
+    last_stream_chunk: Option<(i32, i32)>,
     frame_buffer: wgpu::Buffer,
     frame_bind_group: wgpu::BindGroup,
     /// Uniform-only bind group for the shadow pass (must not bind the shadow map).
@@ -391,6 +490,12 @@ pub struct Renderer {
     shadow_view: wgpu::TextureView,
     scene_texture: wgpu::Texture,
     scene_view: wgpu::TextureView,
+    /// Qué escala tiene el target actual: true = diorama 2/3, false = FP nativo.
+    /// Se recrea solo al cruzar el umbral (no cada frame del blend).
+    scene_is_diorama: bool,
+    /// Escala interna de escena efectiva (Android: la mueve `auto_scene_scale`
+    /// 0.75↔0.68↔0.60 según fps; en PC siempre `SCENE_INTERNAL_SCALE`).
+    dyn_scale: f32,
     blur_pipeline: wgpu::RenderPipeline,
     blur_bind_group_layout: wgpu::BindGroupLayout,
     blur_bind_group: wgpu::BindGroup,
@@ -413,6 +518,23 @@ pub struct Renderer {
     ghost_vb_cap: u64,
     ghost_ib_cap: u64,
     ghost_index_count: u32,
+    /// FP block highlights (target white / stood-on cyan): same tinted cubes
+    /// but outset and depth-tested — no X-ray, occluded by nearer terrain.
+    highlight_pipeline: wgpu::RenderPipeline,
+    /// Agua traslúcida real (mezcla alfa, sin dither): se dibuja tras lo opaco.
+    water_pipeline: wgpu::RenderPipeline,
+    hl_vb: Option<wgpu::Buffer>,
+    hl_ib: Option<wgpu::Buffer>,
+    hl_vb_cap: u64,
+    hl_ib_cap: u64,
+    hl_index_count: u32,
+    /// Grieta de rotura (velo oscuro por etapas, alfa ~0.12).
+    crack_pipeline: wgpu::RenderPipeline,
+    crack_vb: Option<wgpu::Buffer>,
+    crack_ib: Option<wgpu::Buffer>,
+    crack_vb_cap: u64,
+    crack_ib_cap: u64,
+    crack_index_count: u32,
     /// On-screen stair controls (clip-space quads + icon atlas).
     hud_pipeline: wgpu::RenderPipeline,
     hud_bind_group: wgpu::BindGroup,
@@ -430,8 +552,16 @@ struct ChunkGpuMesh {
     index_buffer: wgpu::Buffer,
     num_vertices: u32,
     num_indices: u32,
+    /// Per-direction index ranges `[(start, count); 6]` in [+X,-X,+Y,-Y,+Z,-Z]
+    /// order — the main pass draws only front-facing buckets (Fase 2b), the
+    /// shadow pass draws the full buffer.
+    dir_ranges: [(u32, u32); 6],
     grass_instance_buffer: Option<wgpu::Buffer>,
     num_grass: u32,
+    /// Agua separada: se dibuja traslúcida tras lo opaco (sin dither).
+    water_vertex_buffer: Option<wgpu::Buffer>,
+    water_index_buffer: Option<wgpu::Buffer>,
+    num_water: u32,
 }
 
 struct ChunkMeshEntry {
@@ -444,13 +574,27 @@ struct ChunkMeshEntry {
     last_used: u64,
     /// Frame when we first noticed a filled chunk without GPU mesh (Chunk Guardian).
     hole_since: Option<u64>,
+    /// Empty rebuilds seen while `section_may_have_content` still claims the
+    /// section could hold geometry — bounded retries before sealing "clean".
+    empty_retries: u32,
 }
 
 /// Soft CPU budget for meshing + GPU upload inside one render frame.
 const FRAME_MESH_BUDGET_MS: u64 = 4;
-/// Max chunk meshes retained in VRAM (loaded + recently unloaded LRU).
-/// ~2× a 8-shunk view ring: enough to walk back without remesh spikes.
-const MAX_VRAM_CHUNK_MESHES: usize = 512;
+/// Extra stream budget while a Q/E snap waits for its target view to preload
+/// (faster fill of the bubble toward the pending direction).
+const ORBIT_PRELOAD_STREAM_BUDGET_MS: u64 = 18;
+/// Extra mesh budget per frame while the orbit preload gate is active.
+const ORBIT_PRELOAD_MESH_BUDGET_MS: u64 = 8;
+/// Max empty-mesh rebuild retries before a section is accepted as genuinely
+/// empty (the Chunk Guardian stops retrying after that). Prevents a streaming
+/// fill / spillover racing this mesh pass from being sealed as a permanent
+/// 16×16 corner hole.
+const EMPTY_MESH_RETRY_LIMIT: u32 = 3;
+/// Max section meshes retained in VRAM (loaded + recently unloaded LRU).
+/// 4× the old 512-column budget would be 2048; empty upper slabs are never
+/// stored, so 1536 covers the same view ring with headroom for the split.
+const MAX_VRAM_CHUNK_MESHES: usize = 1536;
 
 /// Grow-only dynamic GPU buffer: recreate only when capacity is too small.
 fn write_dynamic_buffer(
@@ -511,13 +655,90 @@ fn write_dynamic_opt_buffer(
     }
 }
 
+/// Index-bucket order: [+X, -X, +Y, -Y, +Z, -Z].
+fn bucket_for_normal(n: [f32; 3]) -> usize {
+    let ax = n[0].abs();
+    let ay = n[1].abs();
+    let az = n[2].abs();
+    if ax >= ay && ax >= az {
+        if n[0] >= 0.0 { 0 } else { 1 }
+    } else if ay >= az {
+        if n[1] >= 0.0 { 2 } else { 3 }
+    } else if n[2] >= 0.0 {
+        4
+    } else {
+        5
+    }
+}
+
+/// Reorder triangles into 6 contiguous direction ranges for front-only draw.
+/// Every emitter uses uniform-normal tris, so the first vertex decides the
+/// bucket. Returns `(indices, [(start, count); 6])` covering each input index
+/// exactly once (empty input → zeroed ranges).
+fn sort_indices_by_direction(vertices: &[Vertex], indices: &[u32]) -> (Vec<u32>, [(u32, u32); 6]) {
+    let mut buckets: [Vec<u32>; 6] = Default::default();
+    for tri in indices.chunks_exact(3) {
+        let b = tri
+            .first()
+            .copied()
+            .and_then(|i| vertices.get(i as usize))
+            .map(|v| bucket_for_normal(v.normal))
+            .unwrap_or(0);
+        buckets[b].extend_from_slice(tri);
+    }
+    let mut out = Vec::with_capacity(indices.len());
+    let mut ranges = [(0u32, 0u32); 6];
+    for (b, bucket) in buckets.iter().enumerate() {
+        let start = out.len() as u32;
+        out.extend_from_slice(bucket);
+        ranges[b] = (start, bucket.len() as u32);
+    }
+    // Any trailing partial triangle (shouldn't happen) goes to bucket 0.
+    let rem = indices.len() % 3;
+    if rem > 0 {
+        let start = out.len() as u32;
+        out.extend_from_slice(&indices[indices.len() - rem..]);
+        ranges[0].1 += rem as u32;
+        let _ = start;
+    }
+    (out, ranges)
+}
+
+/// Front-facing direction buckets for one 16³ slab from `cam` (bit i =
+/// draw bucket i). Padded by the slab half-diagonal so near/grazing quads are
+/// never wrongly culled; camera inside the slab draws everything.
+fn section_face_mask(cam: Vec3, cx: i32, cy: i32, cz: i32) -> u64 {
+    use crate::world::{mesh_section_center, MESH_CHUNK_SIZE, MESH_SECTION_HEIGHT};
+    let c = mesh_section_center(cx, cy, cz);
+    let hx = MESH_CHUNK_SIZE as f32 * 0.5 + 1.0;
+    let hy = MESH_SECTION_HEIGHT as f32 * 0.5 + 1.0;
+    if (cam.x - c.x).abs() <= hx && (cam.y - c.y).abs() <= hy && (cam.z - c.z).abs() <= hx {
+        return 0x3F;
+    }
+    // Half-diagonal of the 16³ slab: worst-case center-vs-corner divergence.
+    const PAD: f32 = 13.9;
+    let dx = cam.x - c.x;
+    let dy = cam.y - c.y;
+    let dz = cam.z - c.z;
+    let mut mask = 0u64;
+    if dx > -PAD { mask |= 1 << 0; }
+    if dx < PAD { mask |= 1 << 1; }
+    if dy > -PAD { mask |= 1 << 2; }
+    if dy < PAD { mask |= 1 << 3; }
+    if dz > -PAD { mask |= 1 << 4; }
+    if dz < PAD { mask |= 1 << 5; }
+    mask
+}
+
 fn upload_chunk_gpu(
     device: &wgpu::Device,
     vertices: &[Vertex],
     indices: &[u32],
     grass: &[GrassInstance],
+    water_vertices: &[Vertex],
+    water_indices: &[u32],
 ) -> Option<ChunkGpuMesh> {
-    if indices.is_empty() && grass.is_empty() {
+    if indices.is_empty() && grass.is_empty() && water_indices.is_empty() {
         return None;
     }
     // Enforce GPU budget caps (same limits as mesh tests).
@@ -543,6 +764,8 @@ fn upload_chunk_gpu(
     } else {
         indices
     };
+    // Front-only draw buckets (same triangles, reordered — no extra memory).
+    let (indices, dir_ranges) = sort_indices_by_direction(vertices, indices);
     let vertex_buffer = if vertices.is_empty() {
         device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("chunk_vb_empty"),
@@ -567,27 +790,56 @@ fn upload_chunk_gpu(
     } else {
         device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("chunk_ib"),
-            contents: bytemuck::cast_slice(indices),
+            contents: bytemuck::cast_slice(indices.as_slice()),
             usage: wgpu::BufferUsages::INDEX,
         })
     };
     let n_grass = grass.len().min(MAX_GRASS_INSTANCES as usize) as u32;
     let grass_instance_buffer = if n_grass > 0 {
-        Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("chunk_grass_ib"),
-            contents: bytemuck::cast_slice(&grass[..n_grass as usize]),
-            usage: wgpu::BufferUsages::VERTEX,
-        }))
+        Some(
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("chunk_grass_ib"),
+                contents: bytemuck::cast_slice(&grass[..n_grass as usize]),
+                usage: wgpu::BufferUsages::VERTEX,
+            }),
+        )
     } else {
         None
+    };
+    let num_water = water_indices.len() as u32;
+    let water_vertex_buffer = if water_vertices.is_empty() {
+        None
+    } else {
+        Some(
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("chunk_water_vb"),
+                contents: bytemuck::cast_slice(water_vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            }),
+        )
+    };
+    let water_index_buffer = if water_indices.is_empty() {
+        None
+    } else {
+        Some(
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("chunk_water_ib"),
+                contents: bytemuck::cast_slice(water_indices),
+                usage: wgpu::BufferUsages::INDEX,
+            }),
+        )
     };
     Some(ChunkGpuMesh {
         vertex_buffer,
         index_buffer,
         num_vertices: vertices.len() as u32,
         num_indices: indices.len() as u32,
+        dir_ranges,
         grass_instance_buffer,
         num_grass: n_grass,
+        water_vertex_buffer,
+        water_index_buffer,
+        num_water,
     })
 }
 
@@ -623,46 +875,36 @@ fn chunk_state_key(camera: &Camera, cx: i32, cz: i32) -> u64 {
     use crate::world::chunk_dist_sq_xz;
     let origin = mesh_stream_origin(camera);
     let band = chunk_distance_band(chunk_dist_sq_xz(origin, cx, cz)) as u64;
-    // Face mask still uses the real lens (back-face LOD).
-    let facing = visible_face_dir_mask(camera.position, cx, cz);
-    hash_u64_parts(&[cx as u64, cz as u64, band, facing])
+    // Do not bake camera facing into the key — HD-2D orbit was remeshing the
+    // whole bubble every few frames and leaving 16×16 holes.
+    hash_u64_parts(&[cx as u64, cz as u64, band])
 }
 
-/// Bitmask of the 6 axis directions whose faces can face `camera_pos` from the chunk.
-fn visible_face_dir_mask(camera_pos: Vec3, cx: i32, cz: i32) -> u64 {
-    let c = crate::world::mesh_chunk_center(cx, cz);
-    let dirs = [
-        glam::IVec3::X,
-        glam::IVec3::NEG_X,
-        glam::IVec3::Y,
-        glam::IVec3::NEG_Y,
-        glam::IVec3::Z,
-        glam::IVec3::NEG_Z,
-    ];
-    let mut mask = 0u64;
-    for (i, n) in dirs.into_iter().enumerate() {
-        if face_faces_camera(n, c, camera_pos) {
-            mask |= 1 << i;
-        }
-    }
-    mask
-}
-
-/// True if an opaque face with outward `normal` is front-facing from `cam`.
-#[inline]
-fn face_faces_camera(normal: glam::IVec3, face_center: Vec3, cam: Vec3) -> bool {
-    // Face-debug orbit must keep all sides; tests exercise the cull path.
-    if crate::world::DEBUG_FACE_VISIBILITY && !cfg!(test) {
-        return true;
-    }
-    let n = Vec3::new(normal.x as f32, normal.y as f32, normal.z as f32);
-    n.dot(cam - face_center) > 1e-4
+/// Per-section state key for the 16³ B-split (adds `cy` to the column key).
+/// Camera-independent on purpose: NO facing is baked at build anymore (every
+/// unoccluded face is emitted; GPU backface culling + draw-time direction
+/// buckets hide backfaces per frame). Orbiting, rising or pulling the lens
+/// therefore never invalidates meshes — only LOD band, grass density and
+/// edits/streaming do. (An earlier `lens_sector` design requeued the bubble
+/// on lens moves and caused remesh storms; measurement showed the bake saved
+/// <1% of vertices.)
+fn chunk_section_state_key(camera: &Camera, cx: i32, cy: i32, cz: i32) -> u64 {
+    use crate::world::chunk_dist_sq_xz;
+    let origin = mesh_stream_origin(camera);
+    let band = chunk_distance_band(chunk_dist_sq_xz(origin, cx, cz)) as u64;
+    hash_u64_parts(&[cx as u64, cy as u64, cz as u64, band])
 }
 
 fn grass_state_key(grass_origin: Vec3, cx: i32, cz: i32) -> u64 {
     use crate::world::{chunk_dist_sq_xz, grass_density_for_dist_sq};
     let dens = (grass_density_for_dist_sq(chunk_dist_sq_xz(grass_origin, cx, cz)) * 4.0) as u64;
     hash_u64_parts(&[cx as u64, cz as u64, dens])
+}
+
+fn grass_section_state_key(grass_origin: Vec3, cx: i32, cy: i32, cz: i32) -> u64 {
+    use crate::world::{chunk_dist_sq_xz, grass_density_for_dist_sq};
+    let dens = (grass_density_for_dist_sq(chunk_dist_sq_xz(grass_origin, cx, cz)) * 4.0) as u64;
+    hash_u64_parts(&[cx as u64, cy as u64, cz as u64, dens])
 }
 
 /// Frustum cull around the camera; nearest chunks listed first.
@@ -694,11 +936,143 @@ fn cull_chunks(camera: &Camera, world: &mut World, candidates: &[(i32, i32)]) ->
     out.into_iter().map(|(_, cx, cz)| (cx, cz)).collect()
 }
 
+/// Frustum cull per 16³ section with a tight 3D AABB (non-HD2D path).
+/// Underground slabs outside the frustum never reach the rebuild queue.
+fn cull_sections(
+    camera: &Camera,
+    world: &mut World,
+    candidates: &[(i32, i32, i32)],
+) -> Vec<(i32, i32, i32)> {
+    use crate::world::{mesh_section_range, MESH_CHUNK_SIZE};
+
+    let origin = mesh_stream_origin(camera);
+    let s = MESH_CHUNK_SIZE as f32;
+    let mut out: Vec<(f32, i32, i32, i32)> = candidates
+        .iter()
+        .copied()
+        .filter(|&(cx, cy, cz)| {
+            let (y0, y1) = mesh_section_range(cy);
+            let min = Vec3::new(cx as f32 * s - 1.0, y0 as f32 - 1.0, cz as f32 * s - 1.0);
+            let max = Vec3::new(
+                (cx as f32 + 1.0) * s + 1.0,
+                y1 as f32 + 1.0,
+                (cz as f32 + 1.0) * s + 1.0,
+            );
+            // Touch the height cache so cull stays consistent with the column path.
+            let _ = world.chunk_height_bounds(cx, cz);
+            camera.aabb_visible(min, max)
+        })
+        .map(|(cx, cy, cz)| {
+            let d = crate::world::chunk_dist_sq_xz(origin, cx, cz);
+            (d, cx, cy, cz)
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    out.into_iter().map(|(_, cx, cy, cz)| (cx, cy, cz)).collect()
+}
+
 /// GPU vertex/index caps — must stay under typical `max_buffer_size` (256 MiB).
 /// Vertex is 56 bytes; leave headroom for the index buffer too.
 const MAX_VERTICES: u64 = 4_194_304;
 const MAX_INDICES: u64 = 6_291_456;
 const MAX_GRASS_INSTANCES: u64 = 32_768;
+
+/// List every wgpu adapter and pick one. Optional `MICROVERSE_GPU`:
+/// index (`0`, `1`, …) or a name substring (`intel`, `amd`, `llvmpipe`).
+fn pick_adapter(instance: &wgpu::Instance, surface: &wgpu::Surface<'_>) -> wgpu::Adapter {
+    let adapters = instance.enumerate_adapters(wgpu::Backends::PRIMARY);
+    if adapters.is_empty() {
+        panic!("no se encontró ninguna GPU (Vulkan/DX12/Metal)");
+    }
+    for (i, adapter) in adapters.iter().enumerate() {
+        let info = adapter.get_info();
+        let ok = adapter.is_surface_supported(surface);
+        log::info!(
+            "GPU [{i}]: {} | {:?} | {:?} | driver={} | ventana={ok}",
+            info.name,
+            info.backend,
+            info.device_type,
+            info.driver
+        );
+        eprintln!(
+            "GPU [{i}]: {} ({:?}, {:?}){}",
+            info.name,
+            info.backend,
+            info.device_type,
+            if ok {
+                ""
+            } else {
+                " — no compatible con la ventana"
+            }
+        );
+    }
+
+    let idx = if let Ok(want) = std::env::var("MICROVERSE_GPU") {
+        if let Ok(i) = want.parse::<usize>() {
+            i.min(adapters.len().saturating_sub(1))
+        } else {
+            let want_l = want.to_lowercase();
+            adapters
+                .iter()
+                .position(|a| a.get_info().name.to_lowercase().contains(&want_l))
+                .unwrap_or(0)
+        }
+    } else {
+        adapters
+            .iter()
+            .position(|a| {
+                a.is_surface_supported(surface)
+                    && a.get_info().device_type == wgpu::DeviceType::DiscreteGpu
+            })
+            .or_else(|| {
+                adapters
+                    .iter()
+                    .position(|a| a.is_surface_supported(surface))
+            })
+            .unwrap_or(0)
+    };
+
+    let adapter = adapters.into_iter().nth(idx).expect("adapter index");
+    let info = adapter.get_info();
+    if !adapter.is_surface_supported(surface) {
+        log::warn!(
+            "GPU [{}] {} no declara soporte de superficie — se intenta igual",
+            idx,
+            info.name
+        );
+    }
+    eprintln!("Usando GPU [{idx}]: {}", info.name);
+    log::info!(
+        "usando GPU [{idx}]: {} vendor={} device={:#x} {:?}",
+        info.name,
+        info.vendor,
+        info.device,
+        info.backend
+    );
+    adapter
+}
+
+/// Mesh to draw in the editor instead of the player.
+///
+/// The editor has no player, so the body pass was empty and the selection only
+/// showed up as a coloured cell marker. This carries the selected entity's own
+/// model so it is drawn with the *same* buffer, pipeline and occlusion rules as
+/// the hero (CONVENTIONS: one occlusion rule, never a second one). The model
+/// pointer is `&'static` because [`crate::entity_model::preview_model`] caches
+/// and leaks one per path.
+#[derive(Clone, Copy, Debug)]
+pub struct EditorPreview {
+    pub model: &'static crate::entity_model::EntityModel,
+    /// Palette override for the active state (`None` = the mesh's own).
+    /// `&'static` for the same reason as `model`: cached and leaked per name.
+    pub palette: Option<&'static [[f32; 3]; crate::entity_model::PALETTE_LEN]>,
+    /// World position of the model's foot soles.
+    pub feet: Vec3,
+    /// Yaw in radians, same convention as the hero (`+X` = 0).
+    pub facing: f32,
+    /// Height in blocks; the model is scaled so it spans this tall.
+    pub body_height: f32,
+}
 
 impl Renderer {
     pub async fn new(window: Arc<Window>, world: &World, camera: &Camera) -> Self {
@@ -710,14 +1084,7 @@ impl Renderer {
         let surface = instance
             .create_surface(window.clone())
             .expect("create surface");
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            })
-            .await
-            .expect("no suitable GPU adapter");
+        let adapter = pick_adapter(&instance, &surface);
 
         let (device, queue) = adapter
             .request_device(
@@ -744,11 +1111,13 @@ impl Renderer {
         let present_mode = wgpu::PresentMode::Fifo;
         log::info!("present_mode: {present_mode:?}");
 
+        // En Android la superficie se capa a 1920 (ver `capped_surface_size`).
+        let (cfg_w, cfg_h) = capped_surface_size(size.width, size.height);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
-            width: size.width.max(1),
-            height: size.height.max(1),
+            width: cfg_w.max(1),
+            height: cfg_h.max(1),
             present_mode,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
@@ -769,25 +1138,33 @@ impl Renderer {
             usage: wgpu::BufferUsages::INDEX,
         });
 
-        // Warm per-chunk meshes and upload each chunk's GPU buffers independently.
+        // Warm per-section meshes and upload each section's GPU buffers independently.
         let mut chunk_meshes = std::collections::HashMap::new();
         let stream_origin = mesh_stream_origin(camera);
-        let visible = world.chunk_coords_near(stream_origin, crate::world::dirt_mesh_max_dist());
+        let visible = world.chunk_sections_near(stream_origin, crate::world::dirt_mesh_max_dist());
         let grass_origin = grass_density_origin(camera);
-        for &(cx, cz) in &visible {
-            let state_key = chunk_state_key(camera, cx, cz);
-            let grass_key = grass_state_key(grass_origin, cx, cz);
-            let (vertices, indices, grass) =
-                build_chunk_mesh(world, cx, cz, camera.position, grass_origin);
-            let gpu = upload_chunk_gpu(&device, &vertices, &indices, &grass);
+        for &(cx, cy, cz) in &visible {
+            let state_key = chunk_section_state_key(camera, cx, cy, cz);
+            let grass_key = grass_section_state_key(grass_origin, cx, cy, cz);
+            let (vertices, indices, grass, water_vertices, water_indices) =
+                build_section_mesh(world, cx, cy, cz, camera.position, grass_origin);
+            let gpu = upload_chunk_gpu(
+                &device,
+                &vertices,
+                &indices,
+                &grass,
+                &water_vertices,
+                &water_indices,
+            );
             chunk_meshes.insert(
-                (cx, cz),
+                (cx, cy, cz),
                 ChunkMeshEntry {
                     state_key,
                     grass_key,
                     gpu,
                     last_used: 0,
                     hole_since: None,
+                    empty_retries: 0,
                 },
             );
         }
@@ -816,8 +1193,17 @@ impl Renderer {
         let shadow_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("shadow_map"),
             size: wgpu::Extent3d {
-                width: SHADOW_MAP_SIZE,
-                height: SHADOW_MAP_SIZE,
+                // Android: mapa 1×1 (el shadow pass no corre; ver Pass 0).
+                width: if cfg!(target_os = "android") {
+                    1
+                } else {
+                    SHADOW_MAP_SIZE
+                },
+                height: if cfg!(target_os = "android") {
+                    1
+                } else {
+                    SHADOW_MAP_SIZE
+                },
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -828,6 +1214,32 @@ impl Renderer {
             view_formats: &[],
         });
         let shadow_view = shadow_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // Android: sin shadow pass (ver Pass 0) — limpiar el mapa 1×1 una vez
+        // a "todo iluminado" para que el PCF del shader lea luz.
+        if cfg!(target_os = "android") {
+            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("shadow_clear_once"),
+            });
+            {
+                let _pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("shadow_clear_once"),
+                    color_attachments: &[],
+                    depth_stencil_attachment: Some(
+                        wgpu::RenderPassDepthStencilAttachment {
+                            view: &shadow_view,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(1.0),
+                                store: wgpu::StoreOp::Store,
+                            }),
+                            stencil_ops: None,
+                        },
+                    ),
+                    occlusion_query_set: None,
+                    timestamp_writes: None,
+                });
+            }
+            queue.submit(Some(enc.finish()));
+        }
         let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("shadow_sampler"),
             compare: Some(wgpu::CompareFunction::LessEqual),
@@ -892,20 +1304,19 @@ impl Renderer {
         });
 
         // Shadow pass needs uniforms but must NOT bind the shadow map (write conflict).
-        let shadow_frame_bgl =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("shadow_frame_bgl"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }],
-            });
+        let shadow_frame_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shadow_frame_bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
         let shadow_frame_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("shadow_frame_bg"),
             layout: &shadow_frame_bgl,
@@ -943,15 +1354,16 @@ impl Renderer {
             bind_group_layouts: &[&frame_bind_group_layout, &terrain_bind_group_layout],
             push_constant_ranges: &[],
         });
-        let grass_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("grass_pipeline_layout"),
-            bind_group_layouts: &[
-                &frame_bind_group_layout,
-                &terrain_bind_group_layout,
-                &grass_bind_group_layout,
-            ],
-            push_constant_ranges: &[],
-        });
+        let grass_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("grass_pipeline_layout"),
+                bind_group_layouts: &[
+                    &frame_bind_group_layout,
+                    &terrain_bind_group_layout,
+                    &grass_bind_group_layout,
+                ],
+                push_constant_ranges: &[],
+            });
         let shadow_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("shadow_pipeline_layout"),
@@ -1199,6 +1611,123 @@ impl Renderer {
             cache: None,
         });
 
+        // FP highlights: same tinted cubes as the ghost, but depth-tested
+        // (LessEqual, no X-ray) so walls and floors occlude them properly.
+        let highlight_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("highlight_pipeline"),
+            layout: Some(&player_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[dirt_vertex_layout.clone()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_ghost"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: SCENE_DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        // Agua traslúcida real: mezcla alfa sobre lo opaco, sin escribir
+        // profundidad (las capas se acumulan) y sin cull (visible al bucear).
+        let water_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("water_pipeline"),
+            layout: Some(&player_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[dirt_vertex_layout.clone()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_water"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: SCENE_DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        // Grieta de rotura: mismo cubo que el resaltado pero con su propio
+        // alfa (~0.12, 90% más transparente) y sin X-ray.
+        let crack_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("crack_pipeline"),
+            layout: Some(&player_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[dirt_vertex_layout.clone()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_crack"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: SCENE_DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
         let grass_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("grass_pipeline"),
             layout: Some(&grass_pipeline_layout),
@@ -1269,52 +1798,56 @@ impl Renderer {
             cache: None,
         });
 
-        let shadow_grass_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("shadow_grass_pipeline"),
-            layout: Some(&shadow_grass_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_shadow_grass"),
-                buffers: &[dirt_vertex_layout, grass_instance_layout],
-                compilation_options: Default::default(),
-            },
-            // Cutout shadows: chroma discard in fs (no color target).
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_shadow_grass"),
-                targets: &[],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState {
-                    constant: 2,
-                    slope_scale: 1.5,
-                    clamp: 0.0,
+        let shadow_grass_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("shadow_grass_pipeline"),
+                layout: Some(&shadow_grass_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_shadow_grass"),
+                    buffers: &[dirt_vertex_layout, grass_instance_layout],
+                    compilation_options: Default::default(),
                 },
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
+                // Cutout shadows: chroma discard in fs (no color target).
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_shadow_grass"),
+                    targets: &[],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: true,
+                    depth_compare: wgpu::CompareFunction::Less,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState {
+                        constant: 2,
+                        slope_scale: 1.5,
+                        clamp: 0.0,
+                    },
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            });
 
-        let depth_view = create_depth_view(&device, config.width, config.height);
+        let (scene_w, scene_h) = scene_internal_size(config.width, config.height);
+        let depth_view = create_depth_view(&device, scene_w, scene_h);
         let (scene_texture, scene_view) =
-            create_scene_target(&device, config.width, config.height, config.format);
+            create_scene_target(&device, scene_w, scene_h, config.format);
 
         let blur_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("blur_sampler"),
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
+            // Linear so the HD-2D fisheye/blur upsamples the internal-res scene
+            // to the swapchain in the same pass (upscale smoothing).
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
@@ -1325,8 +1858,8 @@ impl Renderer {
             label: Some("blur_uniform"),
             contents: bytemuck::bytes_of(&BlurUniform {
                 amount: 0.0,
-                texel_x: 1.0 / config.width as f32,
-                texel_y: 1.0 / config.height as f32,
+                texel_x: 1.0 / scene_w.max(1) as f32,
+                texel_y: 1.0 / scene_h.max(1) as f32,
                 edge_blur: 0.0,
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
@@ -1378,12 +1911,11 @@ impl Renderer {
             source: wgpu::ShaderSource::Wgsl(include_str!("blur.wgsl").into()),
         });
 
-        let blur_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("blur_pipeline_layout"),
-                bind_group_layouts: &[&blur_bind_group_layout],
-                push_constant_ranges: &[],
-            });
+        let blur_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("blur_pipeline_layout"),
+            bind_group_layouts: &[&blur_bind_group_layout],
+            push_constant_ranges: &[],
+        });
 
         let blur_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("blur_pipeline"),
@@ -1415,10 +1947,16 @@ impl Renderer {
         });
 
         // Use available cores; [`FRAME_MESH_BUDGET_MS`] still caps hitch risk.
+        // Android: tope 4 remeshes/frame — los núcleos pequeños se atragantan
+        // con el greedy y el presupuesto de tiempo no basta contra el pico.
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
-        let chunk_rebuilds_per_frame = cores.max(4);
+        let chunk_rebuilds_per_frame = if cfg!(target_os = "android") {
+            4
+        } else {
+            cores.max(4)
+        };
         log::info!("chunk rebuilds / frame: {chunk_rebuilds_per_frame} (cores={cores})");
         if crate::world::DEBUG_HERO_CAMERA_FACES {
             log::info!(
@@ -1449,6 +1987,9 @@ impl Renderer {
             player_occluded_depth_pipeline,
             player_occluded_pipeline,
             ghost_pipeline,
+            highlight_pipeline,
+            crack_pipeline,
+            water_pipeline,
             grass_pipeline,
             shadow_pipeline,
             shadow_grass_pipeline,
@@ -1469,7 +2010,13 @@ impl Renderer {
             chunk_rebuild_queue: rustc_hash::FxHashSet::default(),
             edit_priority: rustc_hash::FxHashSet::default(),
             chunk_rebuilds_per_frame,
+            last_mesh_ms: 0.0,
+            last_upload_ms: 0.0,
+            last_rebuilt: 0,
+            last_ring_holes: usize::MAX,
             cached_blur_amount: None,
+            last_stream_origin: None,
+            last_stream_chunk: None,
             frame_buffer,
             frame_bind_group,
             shadow_frame_bind_group,
@@ -1478,6 +2025,8 @@ impl Renderer {
             shadow_view,
             scene_texture,
             scene_view,
+            scene_is_diorama: true,
+            dyn_scale: SCENE_INTERNAL_SCALE,
             blur_pipeline,
             blur_bind_group_layout,
             blur_bind_group,
@@ -1496,6 +2045,16 @@ impl Renderer {
             ghost_vb_cap: 0,
             ghost_ib_cap: 0,
             ghost_index_count: 0,
+            hl_vb: None,
+            hl_ib: None,
+            hl_vb_cap: 0,
+            hl_ib_cap: 0,
+            hl_index_count: 0,
+            crack_vb: None,
+            crack_ib: None,
+            crack_vb_cap: 0,
+            crack_ib_cap: 0,
+            crack_index_count: 0,
             hud_pipeline,
             hud_bind_group,
             _hud_texture: hud_texture,
@@ -1518,15 +2077,44 @@ impl Renderer {
         if new_size.width == 0 || new_size.height == 0 {
             return;
         }
+        // En Android la superficie se capa (ver `capped_surface_size`):
+        // `self.size` guarda la ventana real, `config` lo capado.
         self.size = new_size;
-        self.config.width = new_size.width;
-        self.config.height = new_size.height;
+        let (cw, ch) = capped_surface_size(new_size.width, new_size.height);
+        self.config.width = cw;
+        self.config.height = ch;
         self.surface.configure(&self.device, &self.config);
-        self.depth_view = create_depth_view(&self.device, self.config.width, self.config.height);
+        self.recreate_scene_targets();
+    }
+
+    /// Tamaño interno de escena con la escala dinámica (`dyn_scale`).
+    fn internal_size_for(&self, w: u32, h: u32, diorama: bool) -> (u32, u32) {
+        if diorama {
+            (
+                ((w as f32 * self.dyn_scale).round().max(1.0)) as u32,
+                ((h as f32 * self.dyn_scale).round().max(1.0)) as u32,
+            )
+        } else if self.dyn_scale >= 1.0 {
+            (w.max(1), h.max(1))
+        } else {
+            // FP con downscale (solo Android): misma escala, sin ventaja.
+            (
+                ((w as f32 * self.dyn_scale).round().max(1.0)) as u32,
+                ((h as f32 * self.dyn_scale).round().max(1.0)) as u32,
+            )
+        }
+    }
+
+    /// Recrea depth + target de escena + blur group al tamaño interno actual.
+    fn recreate_scene_targets(&mut self) {
+        let diorama = self.scene_is_diorama;
+        let (scene_w, scene_h) =
+            self.internal_size_for(self.config.width, self.config.height, diorama);
+        self.depth_view = create_depth_view(&self.device, scene_w, scene_h);
         let (scene_texture, scene_view) = create_scene_target(
             &self.device,
-            self.config.width,
-            self.config.height,
+            scene_w,
+            scene_h,
             self.config.format,
         );
         self.scene_texture = scene_texture;
@@ -1542,8 +2130,67 @@ impl Renderer {
         self.cached_blur_amount = None;
     }
 
+    /// Escala dinámica de escena (solo Android): baja peldaños si el fps
+    /// cae bajo 45, los recupera sobre 57 (0.66↔0.55↔0.45). `App` la llama
+    /// cada 60 frames. En PC no hace nada (siempre `SCENE_INTERNAL_SCALE`).
+    pub fn auto_scene_scale(&mut self, fps: f32) {
+        if !cfg!(target_os = "android") {
+            return;
+        }
+        let next = dyn_scale_step(self.dyn_scale, fps);
+        if (next - self.dyn_scale).abs() > 1e-4 {
+            self.dyn_scale = next;
+            self.recreate_scene_targets();
+            log::info!("dyn_scale → {next:.2} (fps {fps:.0})");
+        }
+    }
+
+    /// [A-ext] Recrea el target de escena solo al cruzar diorama↔FP.
+    /// Durante el blend (0.45 s) el umbral 0.25 se cruza una vez: un solo
+    /// recreate en la transición, no cada frame.
+    fn ensure_scene_scale(&mut self, diorama: bool) {
+        if self.scene_is_diorama == diorama {
+            return;
+        }
+        self.scene_is_diorama = diorama;
+        // Escala normalizada a 1.0: ambos modos usan el mismo tamaño, no hay
+        // nada que recrear al cruzar el umbral (evita el hitch de transición).
+        if self.dyn_scale >= 1.0 {
+            return;
+        }
+        // Con downscale ambos modos comparten escala: recrear solo si el
+        // tamaño realmente cambia.
+        let (w, h) =
+            self.internal_size_for(self.config.width, self.config.height, diorama);
+        let cur = self.scene_texture.size();
+        if cur.width == w && cur.height == h {
+            return;
+        }
+        self.recreate_scene_targets();
+    }
+
     pub fn size(&self) -> winit::dpi::PhysicalSize<u32> {
         self.size
+    }
+
+    /// Escala interna de escena efectiva (para el log de rendimiento).
+    pub fn scene_scale(&self) -> f32 {
+        self.dyn_scale
+    }
+
+    /// (secciones remalladas, ms de mallado, ms de upload a GPU del último frame).
+    pub fn mesh_timings(&self) -> (usize, f32, f32) {
+        (self.last_rebuilt, self.last_mesh_ms, self.last_upload_ms)
+    }
+
+    /// Huecos del anillo keep en el último frame (0 = mundo listo).
+    pub fn ring_holes_open(&self) -> usize {
+        self.last_ring_holes
+    }
+
+    /// Secciones esperando remallado (para el warn de slow frames).
+    pub fn rebuild_queue_len(&self) -> usize {
+        self.chunk_rebuild_queue.len()
     }
 
     /// GPU load of the last visible set — used to pull the HD-2D camera closer
@@ -1551,8 +2198,8 @@ impl Renderer {
     pub fn pop_pressure(&self) -> f32 {
         let mut grass = 0u32;
         let mut indices = 0u32;
-        for &(cx, cz) in &self.visible_chunks {
-            let Some(entry) = self.chunk_meshes.get(&(cx, cz)) else {
+        for &(cx, cy, cz) in &self.visible_chunks {
+            let Some(entry) = self.chunk_meshes.get(&(cx, cy, cz)) else {
                 continue;
             };
             let Some(gpu) = entry.gpu.as_ref() else {
@@ -1561,7 +2208,7 @@ impl Renderer {
             grass = grass.saturating_add(gpu.num_grass);
             indices = indices.saturating_add(gpu.num_indices);
         }
-        let chunks = self.visible_chunks.len() as f32;
+        let chunks = self.visible_chunks.len() as f32 / crate::world::MESH_SECTIONS_Y as f32;
         let pending = self.chunk_rebuild_queue.len() as f32;
         // Soft targets: below → calm, above → pressure ramps to 1.
         let chunk_p = ((chunks - 20.0) / 50.0).clamp(0.0, 1.0);
@@ -1573,25 +2220,33 @@ impl Renderer {
     }
 
     #[allow(dead_code)]
-    fn rebuild_chunk(&mut self, world: &World, camera: &Camera, cx: i32, cz: i32) {
+    fn rebuild_chunk(&mut self, world: &World, camera: &Camera, cx: i32, cy: i32, cz: i32) {
         let origin = mesh_stream_origin(camera);
-        let state_key = chunk_state_key(camera, cx, cz);
-        let grass_key = grass_state_key(origin, cx, cz);
-        let (vertices, indices, grass) =
+        let state_key = chunk_section_state_key(camera, cx, cy, cz);
+        let grass_key = grass_section_state_key(origin, cx, cy, cz);
+        let (vertices, indices, grass, water_vertices, water_indices) =
             if chunk_distance_band(crate::world::chunk_dist_sq_xz(origin, cx, cz)) >= 4 {
-                (Vec::new(), Vec::new(), Vec::new())
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
             } else {
-                build_chunk_mesh(world, cx, cz, camera.position, origin)
+                build_section_mesh(world, cx, cy, cz, camera.position, origin)
             };
-        let gpu = upload_chunk_gpu(&self.device, &vertices, &indices, &grass);
+        let gpu = upload_chunk_gpu(
+            &self.device,
+            &vertices,
+            &indices,
+            &grass,
+            &water_vertices,
+            &water_indices,
+        );
         self.chunk_meshes.insert(
-            (cx, cz),
+            (cx, cy, cz),
             ChunkMeshEntry {
                 state_key,
                 grass_key,
                 gpu,
                 last_used: self.frame_index,
                 hole_since: None,
+                empty_retries: 0,
             },
         );
     }
@@ -1601,62 +2256,79 @@ impl Renderer {
     /// Call once after world preload + GPU init so the first playable frame already
     /// has terrain meshes (no progressive hole-fill at startup).
     pub fn warm_start_meshes(&mut self, world: &mut World, camera: &Camera) {
-        use crate::world::dirt_mesh_max_dist;
+        use crate::world::{dirt_mesh_max_dist, MESH_SECTIONS_Y};
         use rayon::prelude::*;
         use std::time::Instant;
 
         let origin = mesh_stream_origin(camera);
         let grass_origin = grass_density_origin(camera);
-        for key in world.take_dirty_chunks() {
+        // Legacy column dirties (pre-section saves / tests) expand to all slabs.
+        for (cx, cz) in world.take_dirty_chunks() {
+            for cy in 0..MESH_SECTIONS_Y {
+                self.chunk_rebuild_queue.insert((cx, cy, cz));
+            }
+        }
+        for key in world.take_dirty_sections() {
             self.chunk_rebuild_queue.insert(key);
         }
-        for &(cx, cz) in &world.chunk_coords_near(origin, dirt_mesh_max_dist()) {
+        for key in world.take_dirty_sections_stream() {
+            self.chunk_rebuild_queue.insert(key);
+        }
+        for &(cx, cy, cz) in &world.chunk_sections_near(origin, dirt_mesh_max_dist()) {
             if world.chunk_filled(cx, cz) {
-                self.chunk_rebuild_queue.insert((cx, cz));
+                self.chunk_rebuild_queue.insert((cx, cy, cz));
             }
         }
 
-        let mut ordered: Vec<(i32, i32)> = self.chunk_rebuild_queue.drain().collect();
-        ordered.sort_by_key(|&(cx, cz)| {
+        let mut ordered: Vec<(i32, i32, i32)> = self.chunk_rebuild_queue.drain().collect();
+        ordered.sort_by_key(|&(cx, _, cz)| {
             crate::world::chunk_dist_sq_xz(origin, cx, cz).to_bits()
         });
         // Drop anything past the mesh LOD cut.
-        ordered.retain(|&(cx, cz)| {
+        ordered.retain(|&(cx, _, cz)| {
             world.chunk_filled(cx, cz)
                 && chunk_distance_band(crate::world::chunk_dist_sq_xz(origin, cx, cz)) < 4
         });
 
         let n = ordered.len();
-        log::info!("warm meshes: building {n} chunks before first frame");
+        log::info!("warm meshes: building {n} sections before first frame");
         let t0 = Instant::now();
 
         const BATCH: usize = 16;
         for chunk in ordered.chunks(BATCH) {
             let built: Vec<_> = chunk
                 .par_iter()
-                .map(|&(cx, cz)| {
-                    let (vertices, indices, grass) =
-                        build_chunk_mesh(world, cx, cz, camera.position, origin);
-                    (cx, cz, vertices, indices, grass)
+                .map(|&(cx, cy, cz)| {
+                    let (vertices, indices, grass, water_vertices, water_indices) =
+                        build_section_mesh(world, cx, cy, cz, camera.position, origin);
+                    (cx, cy, cz, vertices, indices, grass, water_vertices, water_indices)
                 })
                 .collect();
-            for (cx, cz, vertices, indices, grass) in built {
-                let gpu = upload_chunk_gpu(&self.device, &vertices, &indices, &grass);
+            for (cx, cy, cz, vertices, indices, grass, water_vertices, water_indices) in built {
+                let gpu = upload_chunk_gpu(
+                    &self.device,
+                    &vertices,
+                    &indices,
+                    &grass,
+                    &water_vertices,
+                    &water_indices,
+                );
                 self.chunk_meshes.insert(
-                    (cx, cz),
+                    (cx, cy, cz),
                     ChunkMeshEntry {
-                        state_key: chunk_state_key(camera, cx, cz),
-                        grass_key: grass_state_key(grass_origin, cx, cz),
+                        state_key: chunk_section_state_key(camera, cx, cy, cz),
+                        grass_key: grass_section_state_key(grass_origin, cx, cy, cz),
                         gpu,
                         last_used: self.frame_index,
                         hole_since: None,
+                        empty_retries: 0,
                     },
                 );
             }
         }
 
         log::info!(
-            "warm meshes done in {:.0} ms — {} GPU chunks ready",
+            "warm meshes done in {:.0} ms — {} GPU sections ready",
             t0.elapsed().as_secs_f32() * 1000.0,
             self.chunk_meshes.len()
         );
@@ -1665,14 +2337,14 @@ impl Renderer {
     /// Drop least-recently-used meshes that are no longer in the loaded world.
     /// Never evict meshes still in the frustum / keep ring (fallback until new Ready).
     fn evict_vram_cache(&mut self, world: &World) {
-        let visible: rustc_hash::FxHashSet<(i32, i32)> =
+        let visible: rustc_hash::FxHashSet<(i32, i32, i32)> =
             self.visible_chunks.iter().copied().collect();
         while self.chunk_meshes.len() > MAX_VRAM_CHUNK_MESHES {
             let victim = self
                 .chunk_meshes
                 .iter()
-                .filter(|(&(cx, cz), _)| {
-                    !visible.contains(&(cx, cz)) && !world.chunk_filled(cx, cz)
+                .filter(|(&(cx, cy, cz), _)| {
+                    !visible.contains(&(cx, cy, cz)) && !world.chunk_filled(cx, cz)
                 })
                 .min_by_key(|(_, e)| e.last_used)
                 .map(|(&k, _)| k)
@@ -1680,8 +2352,8 @@ impl Renderer {
                     // Second choice: unloaded + not visible (grace already elapsed).
                     self.chunk_meshes
                         .iter()
-                        .filter(|(&(cx, cz), _)| {
-                            !visible.contains(&(cx, cz)) && !world.has_chunk(cx, cz)
+                        .filter(|(&(cx, cy, cz), _)| {
+                            !visible.contains(&(cx, cy, cz)) && !world.has_chunk(cx, cz)
                         })
                         .min_by_key(|(_, e)| e.last_used)
                         .map(|(&k, _)| k)
@@ -1693,102 +2365,190 @@ impl Renderer {
         }
     }
 
-    fn ensure_mesh_cached(&mut self, camera: &Camera, world: &mut World) {
-        use crate::world::dirt_mesh_max_dist;
-        use rayon::prelude::*;
-        use rustc_hash::FxHashSet;
-        use std::time::{Duration, Instant};
+pub fn ensure_mesh_cached(&mut self, camera: &Camera, world: &mut World) {
+    use crate::world::dirt_mesh_max_dist;
+    use rayon::prelude::*;
+    use rustc_hash::FxHashSet;
+    use std::time::{Duration, Instant};
 
-        self.frame_index = self.frame_index.wrapping_add(1);
+    self.frame_index = self.frame_index.wrapping_add(1);
 
-        // Stream around focus in HD-2D so lens confine/pull-in does not thrash chunks.
-        let look = camera.forward();
-        let origin = mesh_stream_origin(camera);
-        world.stream_around_look(origin, look);
-        // Keep unloaded chunk meshes in VRAM (LRU); only evict when over budget.
-        self.evict_vram_cache(world);
-
-        // Player edits: keep GPU mesh until replacement uploads (never hole-punch).
-        // Prioritize these so solid ghost meshes don't linger >1 frame near the dig.
-        for (cx, cz) in world.take_dirty_edits() {
-            if let Some(entry) = self.chunk_meshes.get_mut(&(cx, cz)) {
-                entry.state_key = 0;
-            }
-            self.chunk_rebuild_queue.insert((cx, cz));
-            self.edit_priority.insert((cx, cz));
+    // Cheap origin/chunk key first — the streaming scan below (ring walk +
+    // sort + rayon waves) is the most expensive part of a stationary frame,
+    // so skip it entirely when nothing moved and nothing is dirty.
+    let origin = mesh_stream_origin(camera);
+    let c0 = crate::world::mesh_chunk_coord(origin.x.floor() as i32, origin.z.floor() as i32);
+    // Frustum cull depends on facing in FP mode: only take the fast path when
+    // the visible set is chunk-stable (diorama draws the whole bubble).
+    let diorama =
+        crate::world::ENABLE_HD2D && camera.hd2d_amount() >= 0.25
+            || crate::world::DEBUG_DISABLE_CULLING;
+    let has_edits = world.has_dirty_edits();
+    let has_sections = world.has_dirty_sections();
+    let has_stream = world.has_dirty_stream();
+    let has_sections_stream = world.has_dirty_sections_stream();
+    let has_pending = world.has_pending_chunks();
+    let orbit_snap = camera.pending_orbit().is_some();
+    let queues_empty =
+        self.chunk_rebuild_queue.is_empty() && self.edit_priority.is_empty();
+    let moved = match (self.last_stream_origin, self.last_stream_chunk) {
+        (Some(prev), Some(pc)) => {
+            pc != c0 || prev.distance_squared(origin) > 64.0 // >8 blocks
         }
+        _ => true, // first frame: full path
+    };
+    if diorama
+        && !has_edits
+        && !has_sections
+        && !has_stream
+        && !has_sections_stream
+        && !has_pending
+        && !orbit_snap
+        && !moved
+        && queues_empty
+    {
+        // Stationary + clean: refresh LRU stamps, keep VRAM budget, return
+        // WITHOUT the streaming ring scan or the rebuild pipeline.
+        self.evict_vram_cache(world);
+        for i in 0..self.visible_chunks.len() {
+            let key = self.visible_chunks[i];
+            if let Some(e) = self.chunk_meshes.get_mut(&key) {
+                e.last_used = self.frame_index;
+                e.hole_since = None;
+            }
+        }
+        return;
+    }
+
+    // Stream around focus in HD-2D so lens confine/pull-in does not thrash chunks.
+    // While a Q/E snap waits, bias streaming toward the pending view and give
+    // it a bigger budget so the target-side shunks finish before the turn.
+    let streaming_lock: Option<crate::camera::OrbitSnap> = camera.pending_orbit();
+    let look = camera
+        .pending_look()
+        .unwrap_or_else(|| camera.forward());
+    if crate::world::ENABLE_HD2D && streaming_lock.is_some() {
+        world.stream_around_timed_look(
+            origin,
+            look,
+            Duration::from_millis(ORBIT_PRELOAD_STREAM_BUDGET_MS),
+        );
+    } else {
+        world.stream_around_look(origin, look);
+    }
+    // Keep unloaded chunk meshes in VRAM (LRU); only evict when over budget.
+    self.evict_vram_cache(world);
+    self.last_stream_origin = Some(origin);
+    self.last_stream_chunk = Some(c0);
+
+    // Player edits: keep GPU mesh until replacement uploads (never hole-punch).
+    // Prioritize these so solid ghost meshes don't linger >1 frame near the dig.
+    // Per-section dirties carry the precision (only the touched 16³ slab);
+    // the legacy column sets are drained in parallel and discarded (mirrored).
+    let _ = world.take_dirty_edits();
+    let _ = world.take_dirty_stream();
+    for (cx, cy, cz) in world.take_dirty_sections() {
+        if let Some(entry) = self.chunk_meshes.get_mut(&(cx, cy, cz)) {
+            entry.state_key = 0;
+        }
+        self.chunk_rebuild_queue.insert((cx, cy, cz));
+        self.edit_priority.insert((cx, cy, cz));
+    }
+    // Streaming fills are soft: hot-gated below once `visible` is known.
+    let stream_sections = world.take_dirty_sections_stream();
 
         let grass_origin = grass_density_origin(camera);
-        let near = world.chunk_coords_near(origin, dirt_mesh_max_dist());
-        let visible = cull_chunks(camera, world, &near);
-        let visible_set: FxHashSet<(i32, i32)> = visible.iter().copied().collect();
+        let near = world.chunk_sections_near(origin, dirt_mesh_max_dist());
+        // HD-2D FOV is 25° — frustum-culling dropped filled shunks that still
+        // occupy the diorama (16×16 pits with exposed neighbor walls).
+        // Frustum culling. Only once the lens is clearly first-person: the iso
+        // diorama's 25° FOV + fisheye + edge ramp make the on-screen frustum much
+        // wider than the math cone, so real culling there dropped filled shunks
+        // that still station in the diorama (16×16 pits, exposed neighbor walls).
+        // In FP the lens is a standard wide frustum — cull and reclaim the fills
+        // behind/beside the hero (a big half of the 150→30 FPS cliff in caves).
+        let diorama = crate::world::ENABLE_HD2D && camera.hd2d_amount() >= 0.25;
+        let visible = if diorama || crate::world::DEBUG_DISABLE_CULLING {
+            near.clone()
+        } else {
+            cull_sections(camera, world, &near)
+        };
+        let visible_set: FxHashSet<(i32, i32, i32)> = visible.iter().copied().collect();
+        // Column visibility for the streaming hot-gate below.
+        let visible_cols: FxHashSet<(i32, i32)> =
+            visible.iter().map(|&(cx, _, cz)| (cx, cz)).collect();
 
         // Streaming dirties: queue rebuild but KEEP the old GPU mesh until the new
         // one uploads — removing first punched 16×16 holes (wireframe neighbor walls).
-        for (cx, cz) in world.take_dirty_stream() {
-            let hot = (-1..=1).any(|dx| {
-                (-1..=1).any(|dz| visible_set.contains(&(cx + dx, cz + dz)))
-            });
-            if let Some(entry) = self.chunk_meshes.get_mut(&(cx, cz)) {
+        // Hot-gate on the column: only sections near the visible set get queued.
+        for (cx, cy, cz) in stream_sections {
+            let hot = (-1..=1)
+                .any(|dx| (-1..=1).any(|dz| visible_cols.contains(&(cx + dx, cz + dz))));
+            if let Some(entry) = self.chunk_meshes.get_mut(&(cx, cy, cz)) {
                 entry.state_key = 0; // invalidate so LOD can't look "clean" while queued
             }
             if hot {
-                self.chunk_rebuild_queue.insert((cx, cz));
+                self.chunk_rebuild_queue.insert((cx, cy, cz));
             }
         }
 
-        for &(cx, cz) in &visible {
+        for &(cx, cy, cz) in &visible {
             // Reserved-but-empty chunks must not draw a stale VRAM mesh.
             if !world.chunk_filled(cx, cz) {
                 continue;
             }
-            let want = chunk_state_key(camera, cx, cz);
-            let want_grass = grass_state_key(grass_origin, cx, cz);
-            let missing_gpu = self
-                .chunk_meshes
-                .get(&(cx, cz))
-                .map(|e| e.gpu.is_none())
-                .unwrap_or(true);
-            if missing_gpu {
-                let entry = self.chunk_meshes.entry((cx, cz)).or_insert(ChunkMeshEntry {
+            let want = chunk_section_state_key(camera, cx, cy, cz);
+            let want_grass = grass_section_state_key(grass_origin, cx, cy, cz);
+            // Fresh-but-empty slabs (no GPU, keys current, no hole flag) are
+            // clean — only placeholders (hole_since set) or stale keys rebuild.
+            let dirty = match self.chunk_meshes.get(&(cx, cy, cz)) {
+                Some(e) => {
+                    e.hole_since.is_some() || e.state_key != want || e.grass_key != want_grass
+                }
+                None => true,
+            };
+            if dirty {
+                let entry = self.chunk_meshes.entry((cx, cy, cz)).or_insert(ChunkMeshEntry {
                     state_key: 0,
                     grass_key: 0,
                     gpu: None,
                     last_used: self.frame_index,
                     hole_since: Some(self.frame_index),
+                    empty_retries: 0,
                 });
                 if entry.hole_since.is_none() {
                     entry.hole_since = Some(self.frame_index);
                 }
-            }
-            let dirty = match self.chunk_meshes.get(&(cx, cz)) {
-                Some(e) => {
-                    e.gpu.is_none() || e.state_key != want || e.grass_key != want_grass
-                }
-                None => true,
-            };
-            if dirty {
-                self.chunk_rebuild_queue.insert((cx, cz));
-            } else if let Some(e) = self.chunk_meshes.get_mut(&(cx, cz)) {
+                self.chunk_rebuild_queue.insert((cx, cy, cz));
+            } else if let Some(e) = self.chunk_meshes.get_mut(&(cx, cy, cz)) {
                 e.last_used = self.frame_index;
                 e.hole_since = None;
             }
         }
 
         // Chunk Guardian: force mesh-ring holes + long-missing GPU to the front.
+        // Ring holes are columns; expand to the sections that may have content.
         let ring_holes = world.mesh_ring_holes(origin);
+        self.last_ring_holes = ring_holes.len();
         let mesh_ring_has_holes = !ring_holes.is_empty();
         for (cx, cz) in &ring_holes {
             if world.chunk_filled(*cx, *cz) {
-                self.chunk_rebuild_queue.insert((*cx, *cz));
-                self.edit_priority.insert((*cx, *cz));
+                for cy in 0..crate::world::MESH_SECTIONS_Y {
+                    if !crate::world::DEBUG_DISABLE_CULLING
+                        && !world.section_may_have_content(*cx, *cz, cy)
+                    {
+                        continue;
+                    }
+                    self.chunk_rebuild_queue.insert((*cx, cy, *cz));
+                    self.edit_priority.insert((*cx, cy, *cz));
+                }
             }
         }
-        for &(cx, cz) in &visible {
+        for &(cx, cy, cz) in &visible {
             if !world.chunk_filled(cx, cz) {
                 continue;
             }
-            let stuck = self.chunk_meshes.get(&(cx, cz)).and_then(|e| {
+            let stuck = self.chunk_meshes.get(&(cx, cy, cz)).and_then(|e| {
                 if e.gpu.is_some() {
                     None
                 } else {
@@ -1797,28 +2557,27 @@ impl Renderer {
             });
             if let Some(since) = stuck {
                 if self.frame_index.saturating_sub(since) >= 2 {
-                    self.chunk_rebuild_queue.insert((cx, cz));
-                    self.edit_priority.insert((cx, cz));
+                    self.chunk_rebuild_queue.insert((cx, cy, cz));
+                    self.edit_priority.insert((cx, cy, cz));
                 }
             }
         }
 
-        // Rebuild frustum chunks first (nearest last for pop), drop off-screen leftovers.
+        // Rebuild frustum sections first (nearest last for pop), drop off-screen leftovers.
         // Prefer: player edits / guardian holes → missing GPU mesh → LOD upgrades.
-        let mut ordered: Vec<(i32, i32)> = self
+        let mut ordered: Vec<(i32, i32, i32)> = self
             .chunk_rebuild_queue
             .iter()
             .copied()
             .filter(|k| visible_set.contains(k) || self.edit_priority.contains(k))
             .collect();
-        ordered.sort_by_key(|&(cx, cz)| {
+        ordered.sort_by_key(|&(cx, cy, cz)| {
             let d = crate::world::chunk_dist_sq_xz(origin, cx, cz);
             let missing = self
                 .chunk_meshes
-                .get(&(cx, cz))
-                .map(|e| e.gpu.is_none())
-                .unwrap_or(true);
-            let edit_pri = if self.edit_priority.contains(&(cx, cz)) {
+                .get(&(cx, cy, cz))
+                .is_none_or(|e| e.hole_since.is_some());
+            let edit_pri = if self.edit_priority.contains(&(cx, cy, cz)) {
                 0i64
             } else {
                 1
@@ -1840,25 +2599,62 @@ impl Renderer {
         } else {
             FRAME_MESH_BUDGET_MS
         };
+        // Q/E snap waiting on preload: spend more millis to close the bubble
+        // faster so the deferred rotation happens sooner.
+        let mesh_budget_ms = if camera.pending_orbit().is_some() {
+            mesh_budget_ms + ORBIT_PRELOAD_MESH_BUDGET_MS
+        } else {
+            mesh_budget_ms
+        };
         let mesh_budget = Duration::from_millis(mesh_budget_ms);
         let mesh_start = Instant::now();
         let mut rebuilt_count = 0usize;
-        // Feed rayon with up to min(cap, 16) chunks per par_iter burst.
         let batch_cap = self.chunk_rebuilds_per_frame.min(16);
+        self.last_mesh_ms = 0.0;
+        self.last_upload_ms = 0.0;
 
-        // Amortize: parallel batches sized to cores, stop when the frame budget is spent.
-        while rebuilt_count < self.chunk_rebuilds_per_frame
-            && mesh_start.elapsed() < mesh_budget
-        {
+        let missing_gpu =
+            |meshes: &std::collections::HashMap<(i32, i32, i32), ChunkMeshEntry>,
+             cx: i32,
+             cy: i32,
+             cz: i32| {
+                meshes
+                    .get(&(cx, cy, cz))
+                    .is_none_or(|e| e.hole_since.is_some())
+            };
+
+        loop {
+            let forcing = ordered.iter().any(|&(cx, cy, cz)| {
+                world.chunk_filled(cx, cz)
+                    && chunk_distance_band(crate::world::chunk_dist_sq_xz(origin, cx, cz)) < 4
+                    && missing_gpu(&self.chunk_meshes, cx, cy, cz)
+            });
+            if rebuilt_count > 0 && mesh_start.elapsed() >= mesh_budget && !forcing {
+                break;
+            }
+            if !forcing && rebuilt_count >= self.chunk_rebuilds_per_frame {
+                break;
+            }
+
             let mut batch = Vec::new();
             let mut deferred = Vec::new();
-            while batch.len() < batch_cap
-                && rebuilt_count + batch.len() < self.chunk_rebuilds_per_frame
-            {
-                let Some((cx, cz)) = ordered.pop() else {
+            let limit = if forcing { 16 } else { batch_cap };
+            while batch.len() < limit {
+                if !forcing && rebuilt_count + batch.len() >= self.chunk_rebuilds_per_frame {
+                    break;
+                }
+                let Some((cx, cy, cz)) = ordered.pop() else {
                     break;
                 };
                 if !world.chunk_filled(cx, cz) {
+                    continue;
+                }
+                // Empty upper slabs never enter the queue, but edits above the
+                // treetops (or unloaded extras) can still land here — skip.
+                // (Diagnostic `DEBUG_DISABLE_CULLING` bypasses the skip.)
+                if !crate::world::DEBUG_DISABLE_CULLING
+                    && !world.section_may_have_content(cx, cz, cy)
+                {
                     continue;
                 }
                 // Beyond mesh distance: keep any prior mesh, do not rebuild to empty.
@@ -1870,20 +2666,20 @@ impl Renderer {
                 // Filled chunk with no mesh + Reserved neighbor was a permanent 16×16 hole.
                 let has_gpu = self
                     .chunk_meshes
-                    .get(&(cx, cz))
+                    .get(&(cx, cy, cz))
                     .is_some_and(|e| e.gpu.is_some());
                 if has_gpu && !world.neighbors_ready_for_mesh(origin, cx, cz) {
-                    deferred.push((cx, cz));
+                    deferred.push((cx, cy, cz));
                     continue;
                 }
-                let want = chunk_state_key(camera, cx, cz);
-                let want_grass = grass_state_key(grass_origin, cx, cz);
-                if self.chunk_meshes.get(&(cx, cz)).is_some_and(|e| {
+                let want = chunk_section_state_key(camera, cx, cy, cz);
+                let want_grass = grass_section_state_key(grass_origin, cx, cy, cz);
+                if self.chunk_meshes.get(&(cx, cy, cz)).is_some_and(|e| {
                     e.gpu.is_some() && e.state_key == want && e.grass_key == want_grass
                 }) {
                     continue;
                 }
-                batch.push((cx, cz));
+                batch.push((cx, cy, cz));
             }
             // Re-queue chunks waiting on neighbors.
             ordered.extend(deferred);
@@ -1891,25 +2687,85 @@ impl Renderer {
                 break;
             }
 
+            let m0 = Instant::now();
             let rebuilt: Vec<_> = batch
                 .par_iter()
-                .map(|&(cx, cz)| {
-                    let state_key = chunk_state_key(camera, cx, cz);
-                    let grass_key = grass_state_key(grass_origin, cx, cz);
-                    let (vertices, indices, grass) =
-                        build_chunk_mesh(world, cx, cz, camera.position, grass_origin);
-                    ((cx, cz), state_key, grass_key, vertices, indices, grass)
+                .map(|&(cx, cy, cz)| {
+                    let state_key =
+                        chunk_section_state_key(camera, cx, cy, cz);
+                    let grass_key = grass_section_state_key(grass_origin, cx, cy, cz);
+                    let (vertices, indices, grass, water_vertices, water_indices) =
+                        build_section_mesh(world, cx, cy, cz, camera.position, grass_origin);
+                    (
+                        (cx, cy, cz),
+                        state_key,
+                        grass_key,
+                        vertices,
+                        indices,
+                        grass,
+                        water_vertices,
+                        water_indices,
+                    )
                 })
                 .collect();
+            self.last_mesh_ms += m0.elapsed().as_secs_f32() * 1000.0;
 
-            for (key, state_key, grass_key, vertices, indices, grass) in rebuilt {
-                let gpu = upload_chunk_gpu(&self.device, &vertices, &indices, &grass);
+            let u0 = Instant::now();
+            for (key, state_key, grass_key, vertices, indices, grass, water_vertices, water_indices) in rebuilt {
+                let gpu = upload_chunk_gpu(
+                    &self.device,
+                    &vertices,
+                    &indices,
+                    &grass,
+                    &water_vertices,
+                    &water_indices,
+                );
                 if gpu.is_none() {
-                    // Keep the previous mesh if upload produced nothing (never hole-punch).
-                    if let Some(entry) = self.chunk_meshes.get_mut(&key) {
+                    // Empty slab (e.g. upper air after an edit). Sealing it as
+                    // "clean" makes the Chunk Guardian stop retrying; a section
+                    // that still reads as possibly-contentful must retry a few
+                    // frames first, or a streaming fill / spillover racing this
+                    // mesh pass seals a permanent 16×16 corner hole.
+                    let retries = self
+                        .chunk_meshes
+                        .get(&key)
+                        .map(|e| e.empty_retries)
+                        .unwrap_or(0);
+                    let may_have = world.section_may_have_content(key.0, key.2, key.1);
+                    if may_have && retries < EMPTY_MESH_RETRY_LIMIT {
+                        self.chunk_meshes.insert(
+                            key,
+                            ChunkMeshEntry {
+                                state_key,
+                                grass_key,
+                                gpu: None,
+                                last_used: self.frame_index,
+                                hole_since: Some(self.frame_index),
+                                empty_retries: retries + 1,
+                            },
+                        );
+                        self.edit_priority.insert(key);
+                        rebuilt_count += 1;
+                        continue;
+                    }
+                    // Keep any previous mesh entry untouched otherwise.
+                    let had_entry = self.chunk_meshes.contains_key(&key);
+                    if !had_entry {
+                        self.chunk_meshes.insert(
+                            key,
+                            ChunkMeshEntry {
+                                state_key,
+                                grass_key,
+                                gpu: None,
+                                last_used: self.frame_index,
+                                hole_since: None,
+                                empty_retries: 0,
+                            },
+                        );
+                    } else if let Some(entry) = self.chunk_meshes.get_mut(&key) {
                         entry.last_used = self.frame_index;
                     }
-                    // Empty mesh for a filled chunk — guardian will retry next frames.
+                    self.edit_priority.remove(&key);
                     rebuilt_count += 1;
                     continue;
                 }
@@ -1922,16 +2778,23 @@ impl Renderer {
                         gpu,
                         last_used: self.frame_index,
                         hole_since: None,
+                        empty_retries: 0,
                     },
                 );
                 rebuilt_count += 1;
             }
-
-            // Always finish at least one batch; further batches respect the budget.
-            if rebuilt_count > 0 && mesh_start.elapsed() >= mesh_budget {
+            self.last_upload_ms += u0.elapsed().as_secs_f32() * 1000.0;
+            // Ni siquiera forzando se drena sin límite: 32 secciones/frame
+            // como máximo. Los huecos restantes esperan al siguiente frame
+            // (el guardián ya tolera huecos breves vía `hole_since`); sin
+            // este tope, arrancar con el anillo vacío metía decenas de
+            // segundos en UN frame porque `forcing` ignoraba presupuesto y
+            // tope de cantidad.
+            if rebuilt_count >= 32 {
                 break;
             }
         }
+        self.last_rebuilt = rebuilt_count;
 
         // Leftover dirty *visible* chunks wait for a later frame.
         self.chunk_rebuild_queue.extend(ordered);
@@ -1940,11 +2803,49 @@ impl Renderer {
         self.evict_vram_cache(world);
     }
 
+    /// True when every shunk inside the dirt mesh bubble is generated AND every
+    /// content-bearing section is settled (has a GPU mesh, or the mesh pass has
+    /// proven it genuinely empty). The HD-2D Q/E snap gates on this before
+    /// rotating, so the turn never exposes a 16×16 hole.
+    pub fn orbit_ready(&self, world: &World, camera: &Camera) -> bool {
+        use crate::world::{DEBUG_DISABLE_CULLING, dirt_mesh_max_dist};
+
+        if DEBUG_DISABLE_CULLING {
+            return true;
+        }
+        let origin = mesh_stream_origin(camera);
+        let radius = dirt_mesh_max_dist();
+        // Every shunk must be Filled — an Empty/Reserved bucket anywhere in the
+        // bubble would pop in as wireframe walls on the turn.
+        for (cx, cz) in world.chunk_coords_within(origin, radius) {
+            if !world.chunk_filled(cx, cz) {
+                return false;
+            }
+        }
+        // Every section the mesh pass could queue (same candidate list as
+        // `chunk_sections_near`) must be settled. A "settled" section either
+        // has a GPU mesh, or was meshed and proven empty (sealed clean), so a
+        // legitimately-empty slab never blocks the gate forever.
+        for (cx, cy, cz) in world.chunk_sections_near(origin, radius) {
+            let settled = self
+                .chunk_meshes
+                .get(&(cx, cy, cz))
+                .is_some_and(|e| e.gpu.is_some() || {
+                    e.hole_since.is_none() && e.empty_retries >= EMPTY_MESH_RETRY_LIMIT
+                });
+            if !settled {
+                return false;
+            }
+        }
+        true
+    }
+
     fn draw_visible_dirt<'a>(
         &'a self,
         pass: &mut wgpu::RenderPass<'a>,
         shadow: bool,
         world: &World,
+        camera_pos: Vec3,
     ) {
         if shadow {
             pass.set_pipeline(&self.shadow_pipeline);
@@ -1954,14 +2855,14 @@ impl Renderer {
             pass.set_bind_group(0, &self.frame_bind_group, &[]);
             pass.set_bind_group(1, &self.terrain_bind_group, &[]);
         }
-        for &(cx, cz) in &self.visible_chunks {
+        for &(cx, cy, cz) in &self.visible_chunks {
             if !world.chunk_filled(cx, cz) {
                 continue;
             }
-            let Some(entry) = self.chunk_meshes.get(&(cx, cz)) else {
+            let Some(entry) = self.chunk_meshes.get(&(cx, cy, cz)) else {
                 if crate::world::DEBUG_CHUNK_STREAM && self.frame_index % 45 == 0 {
                     log::warn!(
-                        "skip mesh ({cx},{cz}) state={:?} — no ChunkMeshEntry",
+                        "skip mesh ({cx},{cy},{cz}) state={:?} — no ChunkMeshEntry",
                         world.chunk_state(cx, cz)
                     );
                 }
@@ -1970,7 +2871,7 @@ impl Renderer {
             let Some(gpu) = entry.gpu.as_ref() else {
                 if crate::world::DEBUG_CHUNK_STREAM && self.frame_index % 45 == 0 {
                     log::warn!(
-                        "skip mesh ({cx},{cz}) state={:?} — gpu=None (hole_since={:?})",
+                        "skip mesh ({cx},{cy},{cz}) state={:?} — gpu=None (hole_since={:?})",
                         world.chunk_state(cx, cz),
                         entry.hole_since
                     );
@@ -1982,7 +2883,28 @@ impl Renderer {
             }
             pass.set_vertex_buffer(0, gpu.vertex_buffer.slice(..));
             pass.set_index_buffer(gpu.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..gpu.num_indices, 0, 0..1);
+            if shadow {
+                // Light comes from its own direction — draw every bucket.
+                pass.draw_indexed(0..gpu.num_indices, 0, 0..1);
+                continue;
+            }
+            // Front-only: backfacing buckets never reach the rasterizer.
+            // (Diagnostic `DEBUG_DISABLE_CULLING` draws every bucket.)
+            let mask = if crate::world::DEBUG_DISABLE_CULLING {
+                0x3F
+            } else {
+                section_face_mask(camera_pos, cx, cy, cz)
+            };
+            for b in 0..6 {
+                if mask & (1 << b) == 0 {
+                    continue;
+                }
+                let (start, count) = gpu.dir_ranges[b];
+                if count == 0 {
+                    continue;
+                }
+                pass.draw_indexed(start..start + count, 0, 0..1);
+            }
         }
     }
 
@@ -2002,11 +2924,11 @@ impl Renderer {
         pass.set_bind_group(2, &self.grass_bind_group, &[]);
         pass.set_vertex_buffer(0, self.grass_template_vb.slice(..));
         pass.set_index_buffer(self.grass_template_ib.slice(..), wgpu::IndexFormat::Uint32);
-        for &(cx, cz) in &self.visible_chunks {
+        for &(cx, cy, cz) in &self.visible_chunks {
             if !world.chunk_filled(cx, cz) {
                 continue;
             }
-            let Some(entry) = self.chunk_meshes.get(&(cx, cz)) else {
+            let Some(entry) = self.chunk_meshes.get(&(cx, cy, cz)) else {
                 continue;
             };
             let Some(gpu) = entry.gpu.as_ref() else {
@@ -2019,11 +2941,7 @@ impl Renderer {
                 continue;
             }
             pass.set_vertex_buffer(1, grass_buf.slice(..));
-            pass.draw_indexed(
-                0..self.grass_template_index_count,
-                0,
-                0..gpu.num_grass,
-            );
+            pass.draw_indexed(0..self.grass_template_index_count, 0, 0..gpu.num_grass);
         }
     }
 
@@ -2060,15 +2978,31 @@ impl Renderer {
         tool_id: Option<crate::items::ToolId>,
         tool_swing: f32,
         equip_blend: f32,
-        ghost_cells: &[glam::IVec3],
+        ghost_cells: &[(glam::IVec3, [f32; 3])],
+        highlight_cells: &[(glam::IVec3, [f32; 3])],
+        stood_disc: Option<(Vec3, [f32; 3])>,
+        crack_cells: &[(glam::IVec3, [f32; 3])],
+        // Editor: mesh of the selected entity. `None` in game and in the menu.
+        preview: Option<EditorPreview>,
         hud_mesh: Option<&crate::hud::HudMesh>,
     ) -> Result<(), wgpu::SurfaceError> {
         use crate::world::{blur_amount_for_distance, measure_shunk_distance, ENABLE_HD2D};
+
+        // [A-ext] FP nativo / diorama 2/3: conmutar el target al cruzar el
+        // mismo umbral que el culling (evita recrear cada frame del blend).
+        self.ensure_scene_scale(is_diorama_view(camera));
 
         self.ensure_mesh_cached(camera, world);
 
         if ENABLE_HD2D {
             if let Some(feet) = player_feet {
+                // 1ª persona: solo piernas/pies (1/3) para que al mirar abajo no
+                // muestre torso/cabeza. Umbral hd2d_amount<0.5 evita el pop
+                // durante el blend diorama→ojo.
+                let fp_legs_only = camera.hd2d_amount() < 0.5;
+                // Línea de flotación (mundo Y) — lo que queda por debajo se
+                // oscurece como mojada.
+                let wet_line = Self::water_surface_above(world, feet);
                 self.upload_player_hero(
                     feet,
                     player_facing,
@@ -2077,6 +3011,24 @@ impl Renderer {
                     tool_id,
                     tool_swing,
                     equip_blend,
+                    fp_legs_only,
+                    wet_line,
+                    None,
+                );
+            } else if let Some(p) = preview {
+                // Editor: no player, but the selection has a mesh. It reuses the
+                // body buffer so it gets the hero's occlusion for free.
+                self.upload_player_hero(
+                    p.feet,
+                    p.facing,
+                    camera.position,
+                    player_pose,
+                    None,
+                    0.0,
+                    0.0,
+                    false,
+                    None,
+                    Some(p),
                 );
             } else {
                 self.player_vb = None;
@@ -2085,6 +3037,8 @@ impl Renderer {
             self.player_vb = None;
         }
         self.upload_ghost_cells(ghost_cells);
+        self.upload_highlight_cells(highlight_cells, stood_disc);
+        self.upload_crack_cells(crack_cells);
         self.upload_hud_mesh(hud_mesh);
 
         let focus_dist = player_feet
@@ -2092,31 +3046,22 @@ impl Renderer {
             .unwrap_or(16.0);
 
         let (mut fog_rgb, mut surface_y, mut eye_y, mut focus_xz) = scene_altitude(camera, world);
-        // Dig cutaway: center on feet, then pull toward the HD-2D lens so the
-        // hole in the elevated lid projects over the feet (not the head).
-        let confine = if ENABLE_HD2D {
+        // T1 cutaway-dig ELIMINADO: sin agujero en la tapa, sin pull hacia el
+        // lens. focus_xz = pies del jugador (T2 indoor lo usa como centro).
+        if ENABLE_HD2D {
             if let Some(feet) = player_feet {
                 let gx = feet.x.floor() as i32;
                 let gz = feet.z.floor() as i32;
                 surface_y = crate::world::terrain_height(gx, gz) as f32;
-                eye_y = feet.y + 0.35; // just above soles — lid = anything overhead
-                // Clear/fog must use the corrected underground eye — otherwise the
-                // meadow green void shows through distant cave holes.
+                eye_y = feet.y + 0.35; // just above soles
+                                       // Clear/fog must use the corrected underground eye — otherwise the
+                                       // meadow green void shows through distant cave holes.
                 fog_rgb = crate::world::fog_color_for_biome(
                     eye_y,
                     surface_y,
                     crate::biomes::biome_at(gx, gz),
                 );
-                let fwd = camera.forward();
-                let flat_fwd = Vec3::new(fwd.x, 0.0, fwd.z).normalize_or_zero();
-                let lid_h = (surface_y + 0.5 - feet.y).max(0.5);
-                let pitch = camera.pitch.abs().max(0.2);
-                let pull = (lid_h / pitch.tan()).clamp(0.5, 6.0);
-                let center = feet - flat_fwd * pull;
-                focus_xz = [center.x, center.z];
-                world.hd2d_confine_factor(feet + Vec3::Y)
-            } else {
-                world.hd2d_confine_factor(camera.hd2d_focus())
+                focus_xz = [feet.x, feet.z];
             }
         } else if let Some(feet) = player_feet {
             focus_xz = [feet.x, feet.z];
@@ -2128,35 +3073,41 @@ impl Renderer {
                 surface_y,
                 crate::biomes::biome_at(gx, gz),
             );
-            0.0
-        } else {
-            0.0
         };
-        // Camera still uses `confine` for lens pull-in; the shader only needs it
-        // for dig cutaway (Bayer discard of the elevated lid).
-        let shader_confine = if crate::world::ENABLE_DIG_CUTAWAY {
-            confine
-        } else {
-            0.0
-        };
+        // T1 borrado → confine del shader siempre 0 (el shader ignora la tapa).
+        // T2 indoor se mantiene independiente de ENABLE_DIG_CUTAWAY, pero solo
+        // en diorama: en 1ª persona la habitación se ve al natural y disolver
+        // las paredes que miras es el bug reportado dentro de casas.
+        let shader_confine = 0.0;
         // Same cutaway pipeline for house interiors (camera-facing walls/roof).
-        let indoors = if crate::world::ENABLE_DIG_CUTAWAY {
-            if let Some(feet) = player_feet {
-                world.indoors_factor(feet + Vec3::Y * 1.1)
-            } else {
-                0.0
-            }
+        let indoors = if camera.hd2d_amount() < 0.5 {
+            0.0
+        } else if let Some(feet) = player_feet {
+            world.indoors_factor(feet + Vec3::Y * 1.1)
         } else {
             0.0
         };
         let time = self.start_time.elapsed().as_secs_f32();
+        // Air density follows the eye biome (mist closes in, deserts read far).
+        let eye_biome = player_feet.map(|feet| {
+            crate::biomes::biome_at(feet.x.floor() as i32, feet.z.floor() as i32)
+        });
+        // Diagnostic `DEBUG_DISABLE_CULLING`: no shader discard or cave mask —
+        // eye faked at the surface so burial/cutaway terms stay zero.
+        let (shader_confine, indoors, eye_y) = if crate::world::DEBUG_DISABLE_CULLING {
+            (0.0, 0.0, surface_y)
+        } else {
+            (shader_confine, indoors, eye_y)
+        };
         let uniform = FrameUniform {
             view_proj: camera.view_proj().to_cols_array_2d(),
             light_view_proj: light_view_proj(camera.position).to_cols_array_2d(),
             camera_pos: camera.position.to_array(),
             time,
             fog_color: fog_rgb,
-            fog_density: crate::world::FOG_DENSITY,
+            fog_density: eye_biome
+                .unwrap_or(crate::biomes::BiomeId::TemperateMeadow)
+                .fog_density(),
             focus_dist,
             shadow_bias: 0.0018,
             surface_y,
@@ -2170,27 +3121,52 @@ impl Renderer {
 
         let dist = measure_shunk_distance(camera.position).to_aabb;
         // HD-2D: light CoC + constant fisheye edge soft; FPS: distance ramp only.
-        let (blur_amount, edge_blur) = if ENABLE_HD2D {
+        // [A-ext] FP nítido: sin edge fisheye fuera del diorama.
+        let diorama_view = is_diorama_view(camera);
+        let (blur_amount, edge_blur) = if ENABLE_HD2D && diorama_view {
             let coc = ((dist - focus_dist).abs() / focus_dist.max(8.0)).clamp(0.0, 1.0);
             (
                 coc * crate::world::BLUR_MAX_AMOUNT * 0.45,
                 crate::world::HD2D_EDGE_BLUR,
             )
+        } else if ENABLE_HD2D {
+            let coc = ((dist - focus_dist).abs() / focus_dist.max(8.0)).clamp(0.0, 1.0);
+            (
+                coc * crate::world::BLUR_MAX_AMOUNT * 0.45,
+                0.0,
+            )
         } else {
             (blur_amount_for_distance(dist), 0.0)
         };
+        // Android: un cuarto de bokeh — la mayoría de píxeles caen en el
+        // early-out de 1 tap y casi ninguno llega al 9-tap (ver blur.wgsl).
+        let (blur_amount, edge_blur) = if cfg!(target_os = "android") {
+            (blur_amount * 0.25, edge_blur * 0.25)
+        } else {
+            (blur_amount, edge_blur)
+        };
+        // Blur texel must match the internal scene target dimensions
+        // (dinámico en Android vía `dyn_scale`; ver `recreate_scene_targets`).
+        let (scene_w, scene_h) = self.internal_size_for(
+            self.config.width.max(1),
+            self.config.height.max(1),
+            self.scene_is_diorama,
+        );
         let blur_changed = self
             .cached_blur_amount
             .is_none_or(|prev| (prev - blur_amount).abs() > 0.001);
         if blur_changed || self.cached_blur_amount.is_none() {
             let blur_uniform = BlurUniform {
                 amount: blur_amount,
-                texel_x: 1.0 / self.config.width.max(1) as f32,
-                texel_y: 1.0 / self.config.height.max(1) as f32,
+                texel_x: 1.0 / scene_w.max(1) as f32,
+                texel_y: 1.0 / scene_h.max(1) as f32,
                 edge_blur,
             };
-            self.queue
-                .write_buffer(&self.blur_uniform_buffer, 0, bytemuck::bytes_of(&blur_uniform));
+            self.queue.write_buffer(
+                &self.blur_uniform_buffer,
+                0,
+                bytemuck::bytes_of(&blur_uniform),
+            );
             self.cached_blur_amount = Some(blur_amount);
         }
 
@@ -2206,7 +3182,10 @@ impl Renderer {
             });
 
         // Pass 0: shadow map.
-        {
+        // Android: omitido — el mapa es 1×1 limpiado a plena luz en init,
+        // así el PCF lee "iluminado" sin dibujar nada (se ahorra todo el
+        // pase de vértices+fill de tierra/hierba/héroe). En PC normal.
+        if !cfg!(target_os = "android") {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("shadow_pass"),
                 color_attachments: &[],
@@ -2221,7 +3200,7 @@ impl Renderer {
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
-            self.draw_visible_dirt(&mut pass, true, world);
+            self.draw_visible_dirt(&mut pass, true, world, camera.position);
             self.draw_visible_grass(&mut pass, true, world);
             self.draw_player_billboard(&mut pass, true);
         }
@@ -2258,18 +3237,27 @@ impl Renderer {
                 timestamp_writes: None,
             });
 
-            self.draw_visible_dirt(&mut pass, false, world);
+            self.draw_visible_dirt(&mut pass, false, world, camera.position);
             // Solid first (marks stencil=1 where the hero wins depth). Then occluded:
             // Always + stencil==0 draws the full silhouette *in front of* trees and
             // applies Bayer screen-door transparency. Open air stays clean via stencil.
             // Grass after hero so blades don't punch holes into the body.
+            // En 1ª persona no hay X-ray: la cámara está en el ojo y el stencil
+            // del propio cuerpo generaría el bug de silueta fantasma.
             self.draw_player_billboard(&mut pass, false);
-            if crate::world::ENABLE_PLAYER_SCREEN_DOOR {
+            if crate::world::ENABLE_PLAYER_SCREEN_DOOR && camera.hd2d_amount() >= 0.5 {
                 self.draw_player_occluded(&mut pass);
             }
             self.draw_visible_grass(&mut pass, false, world);
+            // Agua traslúcida tras lo opaco (héroe incluido): tinta suave,
+            // sin tramado sobre el personaje.
+            self.draw_visible_water(&mut pass, world);
             // Stair ghost last: X-ray yellow through terrain (depth Always).
             self.draw_ghost(&mut pass);
+            // FP highlights last of all: depth-tested shells, no X-ray.
+            self.draw_highlight(&mut pass);
+            // Grieta de rotura encima de todo lo anterior (velo sutil).
+            self.draw_crack(&mut pass);
         }
 
         // Pass 2: blur → swapchain.
@@ -2323,6 +3311,61 @@ impl Renderer {
         Ok(())
     }
 
+    /// Presenta SOLO el HUD sobre un fondo plano, sin tocar el mundo: es la
+    /// ruta del menú y del editor. Nada de `ensure_mesh_cached` → nada de
+    /// streaming, así el mundo sigue sin generarse hasta que se elige
+    /// partida (y entonces los `player_edits` de la partida guardada se
+    /// aplican al generar, no hace falta reescribir voxels vivos).
+    pub fn render_ui_only(
+        &mut self,
+        hud_mesh: Option<&crate::hud::HudMesh>,
+    ) -> Result<(), wgpu::SurfaceError> {
+        self.upload_hud_mesh(hud_mesh);
+
+        let output = self.surface.get_current_texture()?;
+        let frame_view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("ui_encoder"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("ui_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &frame_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.03,
+                            g: 0.04,
+                            b: 0.07,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+            if self.hud_index_count > 0 {
+                pass.set_pipeline(&self.hud_pipeline);
+                pass.set_bind_group(0, &self.hud_bind_group, &[]);
+                if let (Some(vb), Some(ib)) = (self.hud_vb.as_ref(), self.hud_ib.as_ref()) {
+                    pass.set_vertex_buffer(0, vb.slice(..));
+                    pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..self.hud_index_count, 0, 0..1);
+                }
+            }
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+        output.present();
+        Ok(())
+    }
+
     fn upload_hud_mesh(&mut self, mesh: Option<&crate::hud::HudMesh>) {
         let Some(mesh) = mesh else {
             self.hud_index_count = 0;
@@ -2353,6 +3396,26 @@ impl Renderer {
         self.hud_index_count = mesh.indices.len() as u32;
     }
 
+    /// Superficie del agua sobre los pies (`None` = seco): la malla del héroe
+    /// oscurece lo que quede por debajo (mitad hundida mojada).
+    fn water_surface_above(world: &crate::world::World, feet: Vec3) -> Option<f32> {
+        let x = feet.x.floor() as i32;
+        let z = feet.z.floor() as i32;
+        let mut top: Option<f32> = None;
+        let base = feet.y.floor() as i32;
+        // Como mucho el cuerpo entero + margen.
+        let mut y = base;
+        while y < base + 4 && y <= crate::world::WORLD_MAX_Y {
+            if world.is_water_at(glam::IVec3::new(x, y, z)) {
+                top = Some(y as f32 + 1.0);
+            } else if top.is_some() {
+                break;
+            }
+            y += 1;
+        }
+        top
+    }
+
     fn upload_player_hero(
         &mut self,
         feet: Vec3,
@@ -2362,6 +3425,9 @@ impl Renderer {
         tool_id: Option<crate::items::ToolId>,
         tool_swing: f32,
         equip_blend: f32,
+        fp_legs_only: bool,
+        wet_line: Option<f32>,
+        preview: Option<EditorPreview>,
     ) {
         let (verts, indices, body_indices) = build_player_hero_mesh(
             feet,
@@ -2372,6 +3438,9 @@ impl Renderer {
             tool_id,
             tool_swing,
             equip_blend,
+            fp_legs_only,
+            wet_line,
+            preview,
         );
         if verts.is_empty() {
             self.player_vb = None;
@@ -2443,7 +3512,36 @@ impl Renderer {
         pass.draw_indexed(0..end, 0, 0..1);
     }
 
-    fn upload_ghost_cells(&mut self, cells: &[glam::IVec3]) {
+    /// Agua traslúcida real (mezcla alfa): se dibuja tras lo opaco para que
+    /// el héroe y el fondo se vean a través con tinta suave, sin tramado.
+    fn draw_visible_water<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, world: &World) {
+        pass.set_pipeline(&self.water_pipeline);
+        pass.set_bind_group(0, &self.frame_bind_group, &[]);
+        for &(cx, cy, cz) in &self.visible_chunks {
+            if !world.chunk_filled(cx, cz) {
+                continue;
+            }
+            let Some(entry) = self.chunk_meshes.get(&(cx, cy, cz)) else {
+                continue;
+            };
+            let Some(gpu) = entry.gpu.as_ref() else {
+                continue;
+            };
+            if gpu.num_water == 0 {
+                continue;
+            }
+            let (Some(vb), Some(ib)) =
+                (gpu.water_vertex_buffer.as_ref(), gpu.water_index_buffer.as_ref())
+            else {
+                continue;
+            };
+            pass.set_vertex_buffer(0, vb.slice(..));
+            pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..gpu.num_water, 0, 0..1);
+        }
+    }
+
+    fn upload_ghost_cells(&mut self, cells: &[(glam::IVec3, [f32; 3])]) {
         if cells.is_empty() {
             self.ghost_index_count = 0;
             return;
@@ -2483,36 +3581,172 @@ impl Renderer {
         pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..self.ghost_index_count, 0, 0..1);
     }
+
+    fn upload_highlight_cells(
+        &mut self,
+        cells: &[(glam::IVec3, [f32; 3])],
+        disc: Option<(Vec3, [f32; 3])>,
+    ) {
+        if cells.is_empty() && disc.is_none() {
+            self.hl_index_count = 0;
+            return;
+        }
+        let (mut verts, mut indices) = build_highlight_mesh(cells);
+        // Disco de sombra redonda bajo los pies (sombra gris, no cubo cian).
+        if let Some((center, color)) = disc {
+            append_foot_disc(&mut verts, &mut indices, center, 0.5, color);
+        }
+        write_dynamic_opt_buffer(
+            &self.device,
+            &self.queue,
+            &mut self.hl_vb,
+            &mut self.hl_vb_cap,
+            "hl_vb",
+            wgpu::BufferUsages::VERTEX,
+            bytemuck::cast_slice(&verts),
+        );
+        write_dynamic_opt_buffer(
+            &self.device,
+            &self.queue,
+            &mut self.hl_ib,
+            &mut self.hl_ib_cap,
+            "hl_ib",
+            wgpu::BufferUsages::INDEX,
+            bytemuck::cast_slice(&indices),
+        );
+        self.hl_index_count = indices.len() as u32;
+    }
+
+    /// Depth-tested highlight shells (no X-ray): occluded by nearer terrain.
+    fn draw_highlight<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+        let (Some(vb), Some(ib)) = (self.hl_vb.as_ref(), self.hl_ib.as_ref()) else {
+            return;
+        };
+        if self.hl_index_count == 0 {
+            return;
+        }
+        pass.set_pipeline(&self.highlight_pipeline);
+        pass.set_bind_group(0, &self.frame_bind_group, &[]);
+        pass.set_vertex_buffer(0, vb.slice(..));
+        pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..self.hl_index_count, 0, 0..1);
+    }
+
+    fn upload_crack_cells(&mut self, cells: &[(glam::IVec3, [f32; 3])]) {
+        if cells.is_empty() {
+            self.crack_index_count = 0;
+            return;
+        }
+        let (verts, indices) = build_highlight_mesh(cells);
+        write_dynamic_opt_buffer(
+            &self.device,
+            &self.queue,
+            &mut self.crack_vb,
+            &mut self.crack_vb_cap,
+            "crack_vb",
+            wgpu::BufferUsages::VERTEX,
+            bytemuck::cast_slice(&verts),
+        );
+        write_dynamic_opt_buffer(
+            &self.device,
+            &self.queue,
+            &mut self.crack_ib,
+            &mut self.crack_ib_cap,
+            "crack_ib",
+            wgpu::BufferUsages::INDEX,
+            bytemuck::cast_slice(&indices),
+        );
+        self.crack_index_count = indices.len() as u32;
+    }
+
+    /// Velo oscuro de grieta (alfa ~0.12): se dibuja tras el resaltado.
+    fn draw_crack<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+        let (Some(vb), Some(ib)) = (self.crack_vb.as_ref(), self.crack_ib.as_ref()) else {
+            return;
+        };
+        if self.crack_index_count == 0 {
+            return;
+        }
+        pass.set_pipeline(&self.crack_pipeline);
+        pass.set_bind_group(0, &self.frame_bind_group, &[]);
+        pass.set_vertex_buffer(0, vb.slice(..));
+        pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..self.crack_index_count, 0, 0..1);
+    }
 }
 
-/// Yellow translucent unit cubes for the stair blueprint (X-ray through terrain).
-fn build_ghost_mesh(cells: &[glam::IVec3]) -> (Vec<Vertex>, Vec<u32>) {
-    // Slightly inset so stacked steps don't z-fight as a solid yellow slab.
-    const INSET: f32 = 0.04;
-    const YELLOW: [f32; 3] = [1.0, 0.92, 0.22];
+/// Tinted translucent unit cubes. Color rides per cell (stair yellow, FP
+/// target white, stood-on cyan). `grow` expands (>0, highlight shell hugging
+/// the block from outside) or shrinks (<0, inset blueprint) the cube.
+fn build_tinted_cubes(cells: &[(glam::IVec3, [f32; 3])], grow: f32) -> (Vec<Vertex>, Vec<u32>) {
     let mut verts = Vec::with_capacity(cells.len() * 24);
     let mut indices = Vec::with_capacity(cells.len() * 36);
-    for &cell in cells {
+    for &(cell, color) in cells {
         let o = Vec3::new(cell.x as f32, cell.y as f32, cell.z as f32);
         for &(nx, ny, nz, corners) in &crate::hero::FACE_CORNERS {
             let na = [nx as f32, ny as f32, nz as f32];
             let mut world = [[0.0f32; 3]; 4];
             for (i, c) in corners.iter().enumerate() {
                 world[i] = [
-                    o.x + c[0] * (1.0 - INSET) + INSET * 0.5,
-                    o.y + c[1] * (1.0 - INSET) + INSET * 0.5,
-                    o.z + c[2] * (1.0 - INSET) + INSET * 0.5,
+                    o.x - grow + c[0] * (1.0 + 2.0 * grow),
+                    o.y - grow + c[1] * (1.0 + 2.0 * grow),
+                    o.z - grow + c[2] * (1.0 + 2.0 * grow),
                 ];
             }
             crate::hero::ensure_outward_quad(&mut world, na);
             let base = verts.len() as u32;
             for p in &world {
-                verts.push(Vertex::lit(*p, na, YELLOW, 1.0));
+                verts.push(Vertex::lit(*p, na, color, 1.0));
             }
             indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
         }
     }
     (verts, indices)
+}
+
+/// Stair blueprint cubes: slightly inset so stacked steps don't z-fight.
+fn build_ghost_mesh(cells: &[(glam::IVec3, [f32; 3])]) -> (Vec<Vertex>, Vec<u32>) {
+    build_tinted_cubes(cells, -0.02)
+}
+
+/// FP highlight shells: slightly outset so the shell hugs the block faces
+/// outside the terrain surface (depth-tested, no X-ray).
+fn build_highlight_mesh(cells: &[(glam::IVec3, [f32; 3])]) -> (Vec<Vertex>, Vec<u32>) {
+    build_tinted_cubes(cells, 0.02)
+}
+
+/// Sombra redonda bajo los pies: abanico plano (gris traslúcido vía el
+/// pipeline de resaltado). `center` = punto del suelo + epsilon.
+fn append_foot_disc(
+    verts: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    center: Vec3,
+    radius: f32,
+    color: [f32; 3],
+) {
+    const SEGMENTS: usize = 20;
+    let base = verts.len() as u32;
+    verts.push(Vertex::lit(
+        center.to_array(),
+        [0.0, 1.0, 0.0],
+        color,
+        1.0,
+    ));
+    for i in 0..SEGMENTS {
+        let a = i as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
+        verts.push(Vertex::lit(
+            [center.x + a.cos() * radius, center.y, center.z + a.sin() * radius],
+            [0.0, 1.0, 0.0],
+            color,
+            1.0,
+        ));
+    }
+    // (centro, siguiente, actual): normal +Y.
+    for i in 0..SEGMENTS {
+        let cur = base + 1 + i as u32;
+        let next = base + 1 + ((i + 1) % SEGMENTS) as u32;
+        indices.extend_from_slice(&[base, next, cur]);
+    }
 }
 
 fn push_quad_indices(indices: &mut Vec<u32>, base: u32, flip: bool) {
@@ -2715,6 +3949,10 @@ fn build_debug_hero_face_cube(feet: Vec3, facing: f32, flip: bool) -> (Vec<Verte
 
 /// Voxel hero mesh (body only — canopy and burial share one occluded pass).
 /// Returns `(verts, indices, body_index_count)`.
+/// `fp_legs_only`: en 1ª persona recorta todo por encima de ~1/3 (0.62m sobre
+/// los pies) para que al mirar abajo solo se vean piernas/pies estilo Minecraft.
+/// `wet_line`: línea de flotación (mundo Y) — lo que queda por debajo se
+/// oscurece como mojado.
 fn build_player_hero_mesh(
     feet: Vec3,
     facing: f32,
@@ -2724,6 +3962,9 @@ fn build_player_hero_mesh(
     tool_id: Option<crate::items::ToolId>,
     tool_swing: f32,
     equip_blend: f32,
+    fp_legs_only: bool,
+    wet_line: Option<f32>,
+    preview: Option<EditorPreview>,
 ) -> (Vec<Vertex>, Vec<u32>, u32) {
     if crate::world::DEBUG_HERO_FACE_CUBE {
         return build_debug_hero_face_cube(feet, facing, flip_winding);
@@ -2734,104 +3975,147 @@ fn build_player_hero_mesh(
     let mut face: Vec<([f32; 3], [f32; 3], [f32; 3])> = Vec::with_capacity(4);
     let debug_cam = crate::world::DEBUG_HERO_CAMERA_FACES;
 
-    let mut push_face_quad =
-        |face: &mut Vec<([f32; 3], [f32; 3], [f32; 3])>,
-         verts: &mut Vec<Vertex>,
-         indices: &mut Vec<u32>| {
-            if face.len() != 4 {
+    let push_face_quad = |face: &mut Vec<([f32; 3], [f32; 3], [f32; 3])>,
+                              verts: &mut Vec<Vertex>,
+                              indices: &mut Vec<u32>| {
+        if face.len() != 4 {
+            return;
+        }
+        let base = verts.len() as u32;
+        let corners = [face[0].0, face[1].0, face[2].0, face[3].0];
+        // 1ª persona: solo 1/3 inferior (piernas/pies). Descarta el quad si su
+        // centro queda por encima de feet + 0.62m (cabeza/torso/brazos/herramienta).
+        if fp_legs_only {
+            let cy = (corners[0][1] + corners[1][1] + corners[2][1] + corners[3][1]) * 0.25;
+            if cy > feet.y + 0.62 {
+                face.clear();
                 return;
             }
-            let base = verts.len() as u32;
-            let corners = [face[0].0, face[1].0, face[2].0, face[3].0];
-            let normal = face[0].1;
-            let (out_color, face_id, uvs) = if debug_cam {
-                let center = Vec3::new(
-                    (corners[0][0] + corners[1][0] + corners[2][0] + corners[3][0]) * 0.25,
-                    (corners[0][1] + corners[1][1] + corners[2][1] + corners[3][1]) * 0.25,
-                    (corners[0][2] + corners[1][2] + corners[2][2] + corners[3][2]) * 0.25,
-                );
-                let n_v = Vec3::from_array(normal);
-                let mut faces_cam = n_v.dot(camera_pos - center) > 1e-4;
-                if flip_winding {
-                    faces_cam = !faces_cam;
-                }
-                let id = hero_face_axis_id(normal);
-                let mut rgb = debug_face_color(normal);
-                if !faces_cam {
-                    rgb = [rgb[0] * 0.12, rgb[1] * 0.12, rgb[2] * 0.12];
-                }
-                (
-                    rgb,
-                    id as f32,
-                    [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
-                )
+        }
+        let normal = face[0].1;
+        // Mitad hundida mojada: oscurece + enfría por vértice (corte en la
+        // línea de flotación, degradado natural en la malla).
+        let wet_mul = |y: f32| -> [f32; 3] {
+            if wet_line.is_some_and(|w| y < w) {
+                [0.55, 0.60, 0.68]
             } else {
-                (
-                    face[0].2,
-                    0.0,
-                    [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
-                )
-            };
-            for (i, (p, nn, _)) in face.iter().enumerate() {
-                verts.push(Vertex {
-                    position: *p,
-                    normal: *nn,
-                    color: out_color,
-                    uv: uvs[i],
-                    flags: 0.0,
-                    seed: face_id,
-                    ao: 1.0,
-                });
+                [1.0, 1.0, 1.0]
             }
-            let tri_flip = flip_winding && !debug_cam;
-            push_quad_indices_for_normal(indices, base, corners, normal, tri_flip);
-            face.clear();
         };
-
-    crate::hero::for_each_hero_face(feet, facing, crate::player::PLAYER_HEIGHT, pose, |pos, n, color| {
-        face.push((pos, n, color));
-        if face.len() == 4 {
-            push_face_quad(&mut face, &mut verts, &mut indices);
-        }
-    });
-
-    // Equip blend drives draw-from-hip → settled grip (scale + wrist in hero).
-    let equip = equip_blend.clamp(0.0, 1.0);
-    let swing = tool_swing * equip;
-
-    match tool_id {
-        Some(crate::items::ToolId::Special1Sword) => {
-            crate::hero::for_each_held_sword_face(
-                feet,
-                facing,
-                crate::player::PLAYER_HEIGHT,
-                pose,
-                equip,
-                |pos, n, color| {
-                    face.push((pos, n, color));
-                    if face.len() == 4 {
-                        push_face_quad(&mut face, &mut verts, &mut indices);
-                    }
-                },
+        let (out_color, face_id, uvs) = if debug_cam {
+            let center = Vec3::new(
+                (corners[0][0] + corners[1][0] + corners[2][0] + corners[3][0]) * 0.25,
+                (corners[0][1] + corners[1][1] + corners[2][1] + corners[3][1]) * 0.25,
+                (corners[0][2] + corners[1][2] + corners[2][2] + corners[3][2]) * 0.25,
             );
+            let n_v = Vec3::from_array(normal);
+            let mut faces_cam = n_v.dot(camera_pos - center) > 1e-4;
+            if flip_winding {
+                faces_cam = !faces_cam;
+            }
+            let id = hero_face_axis_id(normal);
+            let mut rgb = debug_face_color(normal);
+            if !faces_cam {
+                rgb = [rgb[0] * 0.12, rgb[1] * 0.12, rgb[2] * 0.12];
+            }
+            (
+                rgb,
+                id as f32,
+                [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            )
+        } else {
+            (
+                face[0].2,
+                0.0,
+                [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
+            )
+        };
+        for (i, (p, nn, _)) in face.iter().enumerate() {
+            let m = wet_mul(p[1]);
+            verts.push(Vertex {
+                position: *p,
+                normal: *nn,
+                color: [out_color[0] * m[0], out_color[1] * m[1], out_color[2] * m[2]],
+                uv: uvs[i],
+                flags: 0.0,
+                seed: face_id,
+                ao: 1.0,
+            });
         }
-        Some(crate::items::ToolId::WoodenPickaxe) => {
-            crate::hero::for_each_held_pickaxe_face_ex(
-                feet,
-                facing,
-                crate::player::PLAYER_HEIGHT,
-                pose,
-                swing,
-                equip,
-                |pos, n, color| {
-                    face.push((pos, n, color));
-                    if face.len() == 4 {
-                        push_face_quad(&mut face, &mut verts, &mut indices);
-                    }
-                },
-            );
+        let tri_flip = flip_winding && !debug_cam;
+        push_quad_indices_for_normal(indices, base, corners, normal, tri_flip);
+        face.clear();
+    };
+
+    // `push_face_quad` closure stays shared by both bodies below.
+    if let Some(p) = preview {
+        // Editor preview: the selection's own mesh, unrigged, at its entity
+        // transform. No pose, no held tool — it is not the player. The palette
+        // is the active state's override, falling back to the mesh's own.
+        p.model.for_each_face(
+            p.palette.unwrap_or(&p.model.palette),
+            p.feet,
+            p.facing,
+            p.body_height,
+            |pos, n, color| {
+                face.push((pos, n, color));
+                if face.len() == 4 {
+                    push_face_quad(&mut face, &mut verts, &mut indices);
+                }
+            },
+        );
+    } else {
+        crate::hero::for_each_hero_face(
+            feet,
+            facing,
+            crate::player::PLAYER_HEIGHT,
+            pose,
+            |pos, n, color| {
+                face.push((pos, n, color));
+                if face.len() == 4 {
+                    push_face_quad(&mut face, &mut verts, &mut indices);
+                }
+            },
+        );
+
+        // Equip blend drives draw-from-hip → settled grip (scale + wrist in hero).
+        let equip = equip_blend.clamp(0.0, 1.0);
+        let swing = tool_swing * equip;
+
+        match tool_id {
+            Some(crate::items::ToolId::Special1Sword) => {
+                crate::hero::for_each_held_sword_face(
+                    feet,
+                    facing,
+                    crate::player::PLAYER_HEIGHT,
+                    pose,
+                    equip,
+                    |pos, n, color| {
+                        face.push((pos, n, color));
+                        if face.len() == 4 {
+                            push_face_quad(&mut face, &mut verts, &mut indices);
+                        }
+                    },
+                );
+            }
+            Some(crate::items::ToolId::WoodenPickaxe) => {
+                crate::hero::for_each_held_pickaxe_face_ex(
+                    feet,
+                    facing,
+                    crate::player::PLAYER_HEIGHT,
+                    pose,
+                    swing,
+                    equip,
+                    |pos, n, color| {
+                        face.push((pos, n, color));
+                        if face.len() == 4 {
+                            push_face_quad(&mut face, &mut verts, &mut indices);
+                        }
+                    },
+                );
+            }
+            Some(crate::items::ToolId::AxeStub) | None => {}
         }
-        Some(crate::items::ToolId::AxeStub) | None => {}
     }
 
     let body_index_count = indices.len() as u32;
@@ -3028,9 +4312,7 @@ fn build_grass_atlas() -> image::RgbaImage {
         let ox = i as u32 * tile_w + (tile_w - img.width()) / 2;
         // Bottom-align so roots sit on the dirt top across uneven sprite sizes.
         let oy = tile_h - img.height();
-        atlas
-            .copy_from(img, ox, oy)
-            .expect("grass atlas tile blit");
+        atlas.copy_from(img, ox, oy).expect("grass atlas tile blit");
     }
     atlas
 }
@@ -3484,9 +4766,7 @@ fn mesh_one_voxel(
     near_hires: bool,
     grass_density: f32,
 ) {
-    use crate::world::{
-        dirt_mesh_max_dist_sq, mix_seed, GrassLod, Material, GRASS_BLADE_FADE_END,
-    };
+    use crate::world::{dirt_mesh_max_dist_sq, grass_fade_end, mix_seed, GrassLod, Material};
 
     if voxel.is_empty() {
         return;
@@ -3504,6 +4784,7 @@ fn mesh_one_voxel(
         Material::Stone
         | Material::VillageStone
         | Material::Cobblestone
+        | Material::RoadCobble
         | Material::WoodPlanks
         | Material::BlackStone
         | Material::Bedrock => {
@@ -3513,16 +4794,20 @@ fn mesh_one_voxel(
         Material::Coal | Material::Sapphire | Material::Ruby | Material::Emerald => {
             // Crafted cubes are greedy-meshed with other solids when fully solid.
         }
-        Material::Chest | Material::Glass | Material::Door | Material::Water | Material::Sand => {
+        Material::Chest | Material::Glass | Material::Door | Material::Water | Material::ThermalWater | Material::Sand => {
             // Solid crate / pane / door / pond / sand via greedy_mesh_solid_dirt.
         }
-        Material::Dirt if voxel.is_fully_solid() => {
+        Material::Torch | Material::Apple | Material::Beehive | Material::ManaCrystal => {
+            // Settlement props (flame / fruit / hive / crystal) ride the same
+            // greedy solid path as crates and panes.
+        }
+        Material::Dirt | Material::Mud if voxel.is_fully_solid() => {
             if !near_hires || dist_sq > mesh_cut_sq {
                 return;
             }
             push_dirt_face_detail(vertices, indices, origin, *pos, world, camera_pos);
         }
-        Material::Dirt => {
+        Material::Dirt | Material::Mud => {
             if dist_sq > mesh_cut_sq {
                 return;
             }
@@ -3534,7 +4819,7 @@ fn mesh_one_voxel(
                 indices,
                 origin,
                 voxel,
-                Material::Dirt.color_rgb(),
+                voxel.material.color_rgb(),
                 camera_pos,
                 grass_lod,
                 None,
@@ -3613,7 +4898,7 @@ fn mesh_one_voxel(
             if grass_lod.max_blade_y.is_none() && !grass_lod.solid_carpet {
                 return;
             }
-            if dist >= GRASS_BLADE_FADE_END && !grass_lod.solid_carpet {
+            if dist >= grass_fade_end() && !grass_lod.solid_carpet {
                 return;
             }
             if grass_density < 1.0 {
@@ -3624,7 +4909,11 @@ fn mesh_one_voxel(
                 }
             }
             // Stable per-column pick across 7 sprites × horizontal flip (14 looks).
-            let h = mix_seed(crate::world::GRASS_SEED ^ 0xA71A_5EED, pos.x as u32, pos.z as u32);
+            let h = mix_seed(
+                crate::world::GRASS_SEED ^ 0xA71A_5EED,
+                pos.x as u32,
+                pos.z as u32,
+            );
             let variant = (h % GRASS_VARIANT_COUNT) as f32;
             grass.push(GrassInstance {
                 origin: origin.to_array(),
@@ -3667,22 +4956,26 @@ fn face_tangent_axes(normal: glam::IVec3) -> (glam::IVec3, glam::IVec3) {
 }
 
 /// Greedy-mesh solid dirt for mid chunk LOD (one LOD for the whole chunk).
+/// `y0..y1` clamps the slab (16³ B-split passes one 16-block section;
+/// the legacy column path passes the full `0..WORLD_MAX_HEIGHT`).
 fn greedy_mesh_solid_dirt(
     world: &World,
     cx: i32,
     cz: i32,
+    y0: i32,
+    y1: i32,
     band: u8,
     camera_pos: Vec3,
     vertices: &mut Vec<Vertex>,
     indices: &mut Vec<u32>,
 ) {
-    use crate::world::{MESH_CHUNK_SIZE, Material};
+    use crate::world::{Material, MESH_CHUNK_SIZE};
 
     let _ = band;
+    // Fase 2 (cuevas solo-frente) usará `camera_pos` para cull por quad aquí.
+    let _ = camera_pos;
     let x0 = cx * MESH_CHUNK_SIZE;
     let z0 = cz * MESH_CHUNK_SIZE;
-    let y0 = 0i32;
-    let y1 = crate::world::WORLD_MAX_HEIGHT;
 
     let solid = |x: i32, y: i32, z: i32| -> bool {
         world.get_voxel(glam::IVec3::new(x, y, z)).is_some_and(|v| {
@@ -3692,6 +4985,7 @@ fn greedy_mesh_solid_dirt(
                     | Material::Stone
                     | Material::VillageStone
                     | Material::Cobblestone
+                    | Material::RoadCobble
                     | Material::WoodPlanks
                     | Material::BlackStone
                     | Material::Bedrock
@@ -3702,8 +4996,12 @@ fn greedy_mesh_solid_dirt(
                     | Material::Chest
                     | Material::Glass
                     | Material::Door
-                    | Material::Water
+                    | Material::Torch
+                    | Material::Apple
+                    | Material::Beehive
+                    | Material::ManaCrystal
                     | Material::Sand
+                    | Material::Mud
             ) && v.is_fully_solid()
         })
     };
@@ -3718,6 +5016,9 @@ fn greedy_mesh_solid_dirt(
     ];
 
     for (axis, neighbor, normal) in dirs {
+        // `y0..y1` is the exclusive cell range of this slab — every emitted
+        // face belongs to exactly one slab, so stacked 16³ sections tile
+        // without gaps or duplicates (boundary faces are owned by their cell).
         let (u_axis, v_axis, slice_min, slice_max, u_min, u_max, v_min, v_max) = match axis {
             0 => (
                 1usize,
@@ -3725,7 +5026,7 @@ fn greedy_mesh_solid_dirt(
                 x0,
                 x0 + MESH_CHUNK_SIZE,
                 y0,
-                y1 + 1,
+                y1,
                 z0,
                 z0 + MESH_CHUNK_SIZE,
             ),
@@ -3733,7 +5034,7 @@ fn greedy_mesh_solid_dirt(
                 0usize,
                 2usize,
                 y0,
-                y1 + 1,
+                y1,
                 x0,
                 x0 + MESH_CHUNK_SIZE,
                 z0,
@@ -3747,7 +5048,7 @@ fn greedy_mesh_solid_dirt(
                 x0,
                 x0 + MESH_CHUNK_SIZE,
                 y0,
-                y1 + 1,
+                y1,
             ),
         };
 
@@ -3771,14 +5072,6 @@ fn greedy_mesh_solid_dirt(
                         continue;
                     }
                     if world.dirt_face_occluded(pos, neighbor) {
-                        continue;
-                    }
-                    let face_center = Vec3::new(
-                        pos.x as f32 + 0.5 + 0.5 * neighbor.x as f32,
-                        pos.y as f32 + 0.5 + 0.5 * neighbor.y as f32,
-                        pos.z as f32 + 0.5 + 0.5 * neighbor.z as f32,
-                    );
-                    if !face_faces_camera(neighbor, face_center, camera_pos) {
                         continue;
                     }
                     let idx = iu + iv * du;
@@ -3834,9 +5127,8 @@ fn greedy_mesh_solid_dirt(
 
                     // AO at rectangle corners using the nearest solid cell under each corner.
                     let mut corner_blocks = [glam::IVec3::ZERO; 4];
-                    for (i, (su, sv)) in [(-1, -1), (1, -1), (1, 1), (-1, 1)]
-                        .into_iter()
-                        .enumerate()
+                    for (i, (su, sv)) in
+                        [(-1, -1), (1, -1), (1, 1), (-1, 1)].into_iter().enumerate()
                     {
                         let mut p = [0i32; 3];
                         p[axis] = slice;
@@ -3887,6 +5179,7 @@ fn greedy_mesh_solid_dirt(
                             Material::Stone
                                 | Material::VillageStone
                                 | Material::Cobblestone
+                                | Material::RoadCobble
                                 | Material::WoodPlanks
                                 | Material::BlackStone
                                 | Material::Bedrock
@@ -3898,10 +5191,15 @@ fn greedy_mesh_solid_dirt(
                                 | Material::Sapphire
                                 | Material::Ruby
                                 | Material::Emerald
+                                | Material::ManaCrystal
                                 | Material::Chest
                                 | Material::Glass
                                 | Material::Door
+                                | Material::Torch
+                                | Material::Apple
+                                | Material::Beehive
                                 | Material::Water
+                    | Material::ThermalWater
                                 | Material::Sand
                         ) {
                             cell_mat.color_rgb()
@@ -3920,7 +5218,6 @@ fn greedy_mesh_solid_dirt(
                                 | Material::Chest
                                 | Material::Glass
                                 | Material::Door
-                                | Material::Water
                         ) {
                             vertices.push(Vertex::lit(corner, n, tint, ao));
                         } else {
@@ -3934,7 +5231,14 @@ fn greedy_mesh_solid_dirt(
                             ));
                         }
                     }
-                    indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+                    indices.extend_from_slice(&[
+                        base,
+                        base + 1,
+                        base + 2,
+                        base,
+                        base + 2,
+                        base + 3,
+                    ]);
                     iu += w;
                 }
             }
@@ -3971,6 +5275,10 @@ fn surface_albedo(world: &World, x: i32, z: i32, h: i32) -> [f32; 3] {
     }
     // Subsurface / dug tread — brown dirt tapa.
     if h != terrain_height(x, z) {
+        return dirt;
+    }
+    // Settlement ground is trodden dirt (or sand), never a grass lid.
+    if crate::settlements::settlement_claims_block_cached(x, z) {
         return dirt;
     }
     let base = biome.grass_rgb();
@@ -4011,11 +5319,11 @@ fn heightmap_mesh_chunk(
     world: &World,
     cx: i32,
     cz: i32,
-    camera_pos: Vec3,
+    _camera_pos: Vec3,
     vertices: &mut Vec<Vertex>,
     indices: &mut Vec<u32>,
 ) {
-    use crate::world::{MESH_CHUNK_SIZE, Material};
+    use crate::world::{Material, MESH_CHUNK_SIZE};
 
     let x0 = cx * MESH_CHUNK_SIZE;
     let z0 = cz * MESH_CHUNK_SIZE;
@@ -4029,43 +5337,36 @@ fn heightmap_mesh_chunk(
             let y = (h + 1) as f32;
             let xf = x as f32;
             let zf = z as f32;
-            let top_center = Vec3::new(xf + 0.5, y, zf + 0.5);
-            let emit_top = face_faces_camera(glam::IVec3::Y, top_center, camera_pos);
-            if emit_top {
-                let base = vertices.len() as u32;
-                // CCW from above: +Z then +X ( +X×+Z is −Y, so swap U/V order).
-                let c0 = [xf, y, zf];
-                let c1 = [xf, y, zf + 1.0];
-                let c2 = [xf + 1.0, y, zf + 1.0];
-                let c3 = [xf + 1.0, y, zf];
-                let block = glam::IVec3::new(x, h, z);
-                let ao0 =
-                    0.55 + 0.45 * corner_ao(world, block, glam::IVec3::Y, -1, -1);
-                let ao1 =
-                    0.55 + 0.45 * corner_ao(world, block, glam::IVec3::Y, -1, 1);
-                let ao2 =
-                    0.55 + 0.45 * corner_ao(world, block, glam::IVec3::Y, 1, 1);
-                let ao3 =
-                    0.55 + 0.45 * corner_ao(world, block, glam::IVec3::Y, 1, -1);
-                let n_up = [0.0, 1.0, 0.0];
-                let color = if crate::world::ENABLE_HD2D {
-                    surface_albedo(world, x, z, h)
-                } else {
-                    skirt_color
-                };
-                let tile = terrain_tile_for_block(world, block, glam::IVec3::Y);
-                for (c, ao) in [c0, c1, c2, c3].into_iter().zip([ao0, ao1, ao2, ao3]) {
-                    vertices.push(Vertex::terrain_face(
-                        c,
-                        n_up,
-                        terrain_uv(c, glam::IVec3::Y),
-                        tile,
-                        color,
-                        ao,
-                    ));
-                }
-                indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+            // Tops always emit (see state-key docs).
+            let base = vertices.len() as u32;
+            // CCW from above: +Z then +X ( +X×+Z is −Y, so swap U/V order).
+            let c0 = [xf, y, zf];
+            let c1 = [xf, y, zf + 1.0];
+            let c2 = [xf + 1.0, y, zf + 1.0];
+            let c3 = [xf + 1.0, y, zf];
+            let block = glam::IVec3::new(x, h, z);
+            let ao0 = 0.55 + 0.45 * corner_ao(world, block, glam::IVec3::Y, -1, -1);
+            let ao1 = 0.55 + 0.45 * corner_ao(world, block, glam::IVec3::Y, -1, 1);
+            let ao2 = 0.55 + 0.45 * corner_ao(world, block, glam::IVec3::Y, 1, 1);
+            let ao3 = 0.55 + 0.45 * corner_ao(world, block, glam::IVec3::Y, 1, -1);
+            let n_up = [0.0, 1.0, 0.0];
+            let color = if crate::world::ENABLE_HD2D {
+                surface_albedo(world, x, z, h)
+            } else {
+                skirt_color
+            };
+            let tile = terrain_tile_for_block(world, block, glam::IVec3::Y);
+            for (c, ao) in [c0, c1, c2, c3].into_iter().zip([ao0, ao1, ao2, ao3]) {
+                vertices.push(Vertex::terrain_face(
+                    c,
+                    n_up,
+                    terrain_uv(c, glam::IVec3::Y),
+                    tile,
+                    color,
+                    ao,
+                ));
             }
+            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 
             // Skirts where neighbor is lower (keeps cliffs from vanishing at HLOD).
             for (dx, dz, n, ni, a, b, c, d) in [
@@ -4114,14 +5415,7 @@ fn heightmap_mesh_chunk(
                 if nh >= h {
                     continue;
                 }
-                let skirt_center = Vec3::new(
-                    xf + 0.5 + 0.5 * ni.x as f32,
-                    (y + (nh + 1).max(0) as f32) * 0.5,
-                    zf + 0.5 + 0.5 * ni.z as f32,
-                );
-                if !face_faces_camera(ni, skirt_center, camera_pos) {
-                    continue;
-                }
+                // All 4 skirts emit; GPU + draw buckets cull backfaces.
                 let skirt_y = (nh + 1).max(0) as f32;
                 let mut ca = a;
                 let mut cb = b;
@@ -4133,6 +5427,183 @@ fn heightmap_mesh_chunk(
                 cd[1] = skirt_y;
                 let sb = vertices.len() as u32;
                 let skirt_tile = terrain_tile_for_block(world, glam::IVec3::new(x, h, z), ni);
+                for p in [ca, cb, cc, cd] {
+                    vertices.push(Vertex::terrain_face(
+                        p,
+                        n,
+                        terrain_uv(p, ni),
+                        skirt_tile,
+                        skirt_color,
+                        1.0,
+                    ));
+                }
+                indices.extend_from_slice(&[sb, sb + 1, sb + 2, sb, sb + 2, sb + 3]);
+            }
+        }
+    }
+}
+
+/// HLOD slab variant: same tops + skirts as [`heightmap_mesh_chunk`] clipped
+/// to the 16-block section `[sy0, sy1)`. Stacked slabs tile into the full
+/// column without gaps (top quads live in one slab, skirt bands are split).
+fn heightmap_mesh_section(
+    world: &World,
+    cx: i32,
+    cy: i32,
+    cz: i32,
+    _camera_pos: Vec3,
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    water_vertices: &mut Vec<Vertex>,
+    water_indices: &mut Vec<u32>,
+) {
+    use crate::world::{MESH_CHUNK_SIZE, MESH_SECTION_HEIGHT};
+
+    let sy0 = cy * MESH_SECTION_HEIGHT;
+    let sy1 = sy0 + MESH_SECTION_HEIGHT;
+    let sy0f = sy0 as f32;
+    let sy1f = sy1 as f32;
+
+    let x0 = cx * MESH_CHUNK_SIZE;
+    let z0 = cz * MESH_CHUNK_SIZE;
+
+    for z in z0..z0 + MESH_CHUNK_SIZE {
+        for x in x0..x0 + MESH_CHUNK_SIZE {
+            let Some(h) = hlod_column_height(world, x, z) else {
+                continue;
+            };
+            // Columna sumergida: el mar se ve a lo lejos como tapa de agua
+            // (malla traslúcida) MÁS el lecho de tierra debajo. Antes el
+            // `continue` saltaba tapa+skirts de tierra y la orilla quedaba con
+            // una pared de una sola cara → agujero al mirar de lado/bajo.
+            if h < crate::world::SEA_LEVEL {
+                let wy = (crate::world::SEA_LEVEL + 1) as f32;
+                if wy > sy0f && wy <= sy1f {
+                    let base = water_vertices.len() as u32;
+                    let mut tint = crate::world::Material::Water.color_rgb();
+                    if crate::biomes::biome_at(x, z) == crate::biomes::BiomeId::Wetland {
+                        tint = [0.36, 0.40, 0.20];
+                    }
+                    for c in [
+                        [x as f32, wy, z as f32],
+                        [x as f32, wy, z as f32 + 1.0],
+                        [x as f32 + 1.0, wy, z as f32 + 1.0],
+                        [x as f32 + 1.0, wy, z as f32],
+                    ] {
+                        water_vertices.push(Vertex::lit(c, [0.0, 1.0, 0.0], tint, 1.0));
+                    }
+                    water_indices.extend_from_slice(&[
+                        base,
+                        base + 1,
+                        base + 2,
+                        base,
+                        base + 2,
+                        base + 3,
+                    ]);
+                }
+                // Sin `continue`: cae al lecho de tierra + skirts de abajo.
+            }
+            let skirt_color = crate::biomes::biome_at(x, z).dirt_rgb();
+            let y = (h + 1) as f32;
+            let xf = x as f32;
+            let zf = z as f32;
+            // Top lid belongs to the slab containing `h + 1` (always emits).
+            if y > sy0f && y <= sy1f {
+                let base = vertices.len() as u32;
+                let c0 = [xf, y, zf];
+                let c1 = [xf, y, zf + 1.0];
+                let c2 = [xf + 1.0, y, zf + 1.0];
+                let c3 = [xf + 1.0, y, zf];
+                let block = glam::IVec3::new(x, h, z);
+                let ao0 = 0.55 + 0.45 * corner_ao(world, block, glam::IVec3::Y, -1, -1);
+                let ao1 = 0.55 + 0.45 * corner_ao(world, block, glam::IVec3::Y, -1, 1);
+                let ao2 = 0.55 + 0.45 * corner_ao(world, block, glam::IVec3::Y, 1, 1);
+                let ao3 = 0.55 + 0.45 * corner_ao(world, block, glam::IVec3::Y, 1, -1);
+                let n_up = [0.0, 1.0, 0.0];
+                let color = if crate::world::ENABLE_HD2D {
+                    surface_albedo(world, x, z, h)
+                } else {
+                    skirt_color
+                };
+                let tile = terrain_tile_for_block(world, block, glam::IVec3::Y);
+                for (c, ao) in [c0, c1, c2, c3].into_iter().zip([ao0, ao1, ao2, ao3]) {
+                    vertices.push(Vertex::terrain_face(
+                        c,
+                        n_up,
+                        terrain_uv(c, glam::IVec3::Y),
+                        tile,
+                        color,
+                        ao,
+                    ));
+                }
+                indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+            }
+
+            // Skirts clipped to this slab.
+            for (dx, dz, n, ni, a, b, c, d) in [
+                (
+                    0i32,
+                    -1,
+                    [0.0f32, 0.0, -1.0],
+                    glam::IVec3::NEG_Z,
+                    [xf, y, zf],
+                    [xf + 1.0, y, zf],
+                    [xf + 1.0, 0.0, zf],
+                    [xf, 0.0, zf],
+                ),
+                (
+                    0,
+                    1,
+                    [0.0, 0.0, 1.0],
+                    glam::IVec3::Z,
+                    [xf + 1.0, y, zf + 1.0],
+                    [xf, y, zf + 1.0],
+                    [xf, 0.0, zf + 1.0],
+                    [xf + 1.0, 0.0, zf + 1.0],
+                ),
+                (
+                    -1,
+                    0,
+                    [-1.0, 0.0, 0.0],
+                    glam::IVec3::NEG_X,
+                    [xf, y, zf + 1.0],
+                    [xf, y, zf],
+                    [xf, 0.0, zf],
+                    [xf, 0.0, zf + 1.0],
+                ),
+                (
+                    1,
+                    0,
+                    [1.0, 0.0, 0.0],
+                    glam::IVec3::X,
+                    [xf + 1.0, y, zf],
+                    [xf + 1.0, y, zf + 1.0],
+                    [xf + 1.0, 0.0, zf + 1.0],
+                    [xf + 1.0, 0.0, zf],
+                ),
+            ] {
+                let nh = hlod_column_height(world, x + dx, z + dz).unwrap_or(-1);
+                if nh >= h {
+                    continue;
+                }
+                let skirt_top = y.min(sy1f);
+                let skirt_bot = (nh + 1).max(0) as f32;
+                let skirt_bot = skirt_bot.max(sy0f);
+                if skirt_top <= skirt_bot {
+                    continue;
+                }
+                // All 4 skirts emit; GPU + draw buckets cull backfaces.
+                let mut ca = a;
+                let mut cb = b;
+                let mut cc = c;
+                let mut cd = d;
+                ca[1] = skirt_top;
+                cb[1] = skirt_top;
+                cc[1] = skirt_bot;
+                cd[1] = skirt_bot;
+                let sb = vertices.len() as u32;
+                let skirt_tile =
+                    terrain_tile_for_block(world, glam::IVec3::new(x, h, z), ni);
                 for p in [ca, cb, cc, cd] {
                     vertices.push(Vertex::terrain_face(
                         p,
@@ -4188,29 +5659,292 @@ fn greedy_face_corners(
     }
 }
 
-fn build_chunk_mesh(
+/// Altura de la superficie del agua (0..1 dentro de la celda): la fuente al
+/// 100% y la corriente baja 25% por nivel hasta desaparecer en el 4º.
+fn water_surface_h(level: u8) -> f32 {
+    1.0 - 0.25 * level.min(4) as f32
+}
+
+/// Malla de agua por celda (sin merge): tapas en rampa del lado que conecta
+/// con la fuente (100%) decayendo 25% por bloque hasta 0, laterales con el
+/// borde alto escalonado y escalones entre niveles distintos. Nada de cubos.
+fn mesh_water_section(
     world: &World,
     cx: i32,
     cz: i32,
+    y0: i32,
+    y1: i32,
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+) {
+    use crate::world::MESH_CHUNK_SIZE;
+    let x0 = cx * MESH_CHUNK_SIZE;
+    let z0 = cz * MESH_CHUNK_SIZE;
+    let mut quad = |corners: [[f32; 3]; 4], normal: [f32; 3], color: [f32; 3]| {
+        let mut corners = corners;
+        crate::hero::ensure_outward_quad(&mut corners, normal);
+        let base = vertices.len() as u32;
+        for p in &corners {
+            vertices.push(Vertex::lit(*p, normal, color, 1.0));
+        }
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    };
+    for y in y0..y1 {
+        for z in z0..z0 + MESH_CHUNK_SIZE {
+            for x in x0..x0 + MESH_CHUNK_SIZE {
+                let pos = glam::IVec3::new(x, y, z);
+                let Some(v) = world.get_voxel(pos) else {
+                    continue;
+                };
+                if !v.is_fully_solid() || !v.material.is_water() {
+                    continue;
+                }
+                let mut color = v.material.color_rgb();
+                // Pantano: el agua luce sucia (tinte por bioma, no por material).
+                if v.material == crate::world::Material::Water
+                    && crate::biomes::biome_at(x, z) == crate::biomes::BiomeId::Wetland
+                {
+                    color = [0.36, 0.40, 0.20];
+                }
+                let level = world.water_level(pos).unwrap_or(0);
+                let top = y as f32 + water_surface_h(level);                // Tapa (nivel 4 = altura 0: se omite).
+                let above = glam::IVec3::new(x, y + 1, z);
+                let above_water = world.get_voxel(above).is_some_and(|a| {
+                    !a.is_empty() && a.material.is_water()
+                });
+                if !above_water && level < crate::world::WATER_FLOW_MAX {
+                    let fx = x as f32;
+                    let fz = z as f32;
+                    quad(
+                        [
+                            [fx, top, fz],
+                            [fx, top, fz + 1.0],
+                            [fx + 1.0, top, fz + 1.0],
+                            [fx + 1.0, top, fz],
+                        ],
+                        [0.0, 1.0, 0.0],
+                        color,
+                    );
+                }
+                // Laterales: al aire (borde escalonado) o escalón entre niveles.
+                for (dx, dz, n) in [
+                    (1, 0, [1.0f32, 0.0, 0.0]),
+                    (-1, 0, [-1.0f32, 0.0, 0.0]),
+                    (0, 1, [0.0f32, 0.0, 1.0]),
+                    (0, -1, [0.0f32, 0.0, -1.0]),
+                ] {
+                    let np = glam::IVec3::new(x + dx, y, z + dz);
+                    let nlevel = world.water_level(np);
+                    if let Some(nl) = nlevel {
+                        // Vecino agua: escalón solo si esta celda está más alta.
+                        if nl >= level {
+                            continue;
+                        }
+                        let ntop = y as f32 + water_surface_h(nl);
+                        if my_top_le(top, ntop) {
+                            continue;
+                        }
+                        let (fx0, fz0, fx1, fz1) = side_span(x, z, dx, dz);
+                        quad(
+                            [
+                                [fx0, ntop, fz0],
+                                [fx1, ntop, fz1],
+                                [fx1, top, fz1],
+                                [fx0, top, fz0],
+                            ],
+                            n,
+                            color,
+                        );
+                        continue;
+                    }
+                    // Vecino no-agua: cara solo si hay aire (lo sólido oculta).
+                    if world.get_voxel(np).is_some() {
+                        continue;
+                    }
+                    let (fx0, fz0, fx1, fz1) = side_span(x, z, dx, dz);
+                    let yb = y as f32;
+                    quad(
+                        [
+                            [fx0, yb, fz0],
+                            [fx1, yb, fz1],
+                            [fx1, top, fz1],
+                            [fx0, top, fz0],
+                        ],
+                        n,
+                        color,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `true` si `a <= b` con epsilon (evita escalones degenerados).
+fn my_top_le(a: f32, b: f32) -> bool {
+    a <= b + 1e-4
+}
+
+/// Plano lateral de la celda en la dirección (`dx`, `dz`).
+fn side_span(x: i32, z: i32, dx: i32, dz: i32) -> (f32, f32, f32, f32) {
+    let fx = x as f32;
+    let fz = z as f32;
+    if dx == 1 {
+        (fx + 1.0, fz, fx + 1.0, fz + 1.0)
+    } else if dx == -1 {
+        (fx, fz + 1.0, fx, fz)
+    } else if dz == 1 {
+        (fx + 1.0, fz + 1.0, fx, fz + 1.0)
+    } else {
+        (fx, fz, fx + 1.0, fz)
+    }
+}
+
+fn build_section_mesh(
+    world: &World,
+    cx: i32,
+    cy: i32,
+    cz: i32,
     camera_pos: Vec3,
     grass_origin: Vec3,
-) -> (Vec<Vertex>, Vec<u32>, Vec<GrassInstance>) {
-    use crate::world::{chunk_dist_sq_xz, grass_density_for_dist_sq};
+) -> (
+    Vec<Vertex>,
+    Vec<u32>,
+    Vec<GrassInstance>,
+    Vec<Vertex>,
+    Vec<u32>,
+) {
+    use crate::world::{chunk_dist_sq_xz, grass_density_for_dist_sq, mesh_section_range};
 
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
     let mut grass = Vec::new();
+    let mut water_vertices = Vec::new();
+    let mut water_indices = Vec::new();
 
     // LOD distance uses grass_origin (= focus in HD-2D) so lens pull-in does not
     // thrash bands / empty the mesh cut. Face cull still uses camera_pos.
     let dist_sq = chunk_dist_sq_xz(grass_origin, cx, cz);
     let band = chunk_distance_band(dist_sq);
     if band >= 4 {
-        return (vertices, indices, grass);
+        return (vertices, indices, grass, water_vertices, water_indices);
+    }
+    // Empty upper slabs (air above the treetops) cost nothing: no scan, no GPU.
+    if !world.section_may_have_content(cx, cz, cy) {
+        return (vertices, indices, grass, water_vertices, water_indices);
     }
 
     // Density from player focus in HD-2D — camera zoom must not strip near grass.
-    let grass_density = if band >= 3 {
+    // (Diagnostic `DEBUG_DISABLE_CULLING` forces full density everywhere.)
+    let grass_density = if crate::world::DEBUG_DISABLE_CULLING {
+        1.0
+    } else if band >= 3 {
+        0.0
+    } else {
+        grass_density_for_dist_sq(chunk_dist_sq_xz(grass_origin, cx, cz))
+    };
+
+    match band {
+        0 | 1 | 2 => {
+            let (y0, y1) = mesh_section_range(cy);
+            // Greedy solids at every near/mid band — per-block tops painted as
+            // "grass" used to look like a separate jagged shell over the hill.
+            greedy_mesh_solid_dirt(
+                world,
+                cx,
+                cz,
+                y0,
+                y1,
+                band,
+                camera_pos,
+                &mut vertices,
+                &mut indices,
+            );
+            // Agua en rampa (malla traslúcida propia, sin cubos).
+            mesh_water_section(
+                world,
+                cx,
+                cz,
+                y0,
+                y1,
+                &mut water_vertices,
+                &mut water_indices,
+            );
+            // Coal / crystal flecks on exposed stone.
+            if band <= 2 {
+                mesh_ore_overlays_section(world, cx, cy, cz, camera_pos, &mut vertices, &mut indices);
+            }
+            world.for_voxels_in_section(cx, cy, cz, &mut |pos, voxel| {
+                use crate::world::Material;
+                let is_partial_dirt = voxel.material == Material::Dirt && !voxel.is_fully_solid();
+                let is_tree = voxel.material.is_tree_bark() || voxel.material.is_tree_foliage();
+                if is_partial_dirt || is_tree || voxel.material == Material::Grass {
+                    mesh_one_voxel(
+                        world,
+                        pos,
+                        voxel,
+                        camera_pos,
+                        &mut vertices,
+                        &mut indices,
+                        &mut grass,
+                        band == 0,
+                        grass_density,
+                    );
+                }
+            });
+        }
+        _ => {
+            // Band 3: heightmap HLOD slab — tops + skirts clipped to this section.
+            heightmap_mesh_section(
+                world,
+                cx,
+                cy,
+                cz,
+                camera_pos,
+                &mut vertices,
+                &mut indices,
+                &mut water_vertices,
+                &mut water_indices,
+            );
+        }
+    }
+
+    (vertices, indices, grass, water_vertices, water_indices)
+}
+
+fn build_chunk_mesh(
+    world: &World,
+    cx: i32,
+    cz: i32,
+    camera_pos: Vec3,
+    grass_origin: Vec3,
+) -> (
+    Vec<Vertex>,
+    Vec<u32>,
+    Vec<GrassInstance>,
+    Vec<Vertex>,
+    Vec<u32>,
+) {
+    use crate::world::{chunk_dist_sq_xz, grass_density_for_dist_sq};
+
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    let mut grass = Vec::new();
+    let mut water_vertices = Vec::new();
+    let mut water_indices = Vec::new();
+
+    // LOD distance uses grass_origin (= focus in HD-2D) so lens pull-in does not
+    // thrash bands / empty the mesh cut. Face cull still uses camera_pos.
+    let dist_sq = chunk_dist_sq_xz(grass_origin, cx, cz);
+    let band = chunk_distance_band(dist_sq);
+    if band >= 4 {
+        return (vertices, indices, grass, water_vertices, water_indices);
+    }
+
+    // Density from player focus in HD-2D — camera zoom must not strip near grass.
+    // (Diagnostic `DEBUG_DISABLE_CULLING` forces full density everywhere.)
+    let grass_density = if crate::world::DEBUG_DISABLE_CULLING {
+        1.0
+    } else if band >= 3 {
         0.0
     } else {
         grass_density_for_dist_sq(chunk_dist_sq_xz(grass_origin, cx, cz))
@@ -4220,17 +5954,35 @@ fn build_chunk_mesh(
         0 | 1 | 2 => {
             // Greedy solids at every near/mid band — per-block tops painted as
             // "grass" used to look like a separate jagged shell over the hill.
-            greedy_mesh_solid_dirt(world, cx, cz, band, camera_pos, &mut vertices, &mut indices);
+            greedy_mesh_solid_dirt(
+                world,
+                cx,
+                cz,
+                0,
+                crate::world::WORLD_MAX_HEIGHT,
+                band,
+                camera_pos,
+                &mut vertices,
+                &mut indices,
+            );
+            // Agua en rampa (malla traslúcida propia, sin cubos).
+            mesh_water_section(
+                world,
+                cx,
+                cz,
+                0,
+                crate::world::WORLD_MAX_HEIGHT,
+                &mut water_vertices,
+                &mut water_indices,
+            );
             // Coal / crystal flecks on exposed stone.
             if band <= 2 {
                 mesh_ore_overlays(world, cx, cz, camera_pos, &mut vertices, &mut indices);
             }
             world.for_voxels_in_chunk(cx, cz, &mut |pos, voxel| {
                 use crate::world::Material;
-                let is_partial_dirt =
-                    voxel.material == Material::Dirt && !voxel.is_fully_solid();
-                let is_tree =
-                    voxel.material.is_tree_bark() || voxel.material.is_tree_foliage();
+                let is_partial_dirt = voxel.material == Material::Dirt && !voxel.is_fully_solid();
+                let is_tree = voxel.material.is_tree_bark() || voxel.material.is_tree_foliage();
                 if is_partial_dirt || is_tree || voxel.material == Material::Grass {
                     mesh_one_voxel(
                         world,
@@ -4252,7 +6004,7 @@ fn build_chunk_mesh(
         }
     }
 
-    (vertices, indices, grass)
+    (vertices, indices, grass, water_vertices, water_indices)
 }
 
 /// Full visible mesh (unit tests).
@@ -4262,7 +6014,7 @@ fn build_mesh(world: &World, camera_pos: Vec3) -> (Vec<Vertex>, Vec<u32>) {
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
     for (cx, cz) in visible {
-        let (cv, ci, grass) = build_chunk_mesh(world, cx, cz, camera_pos, camera_pos);
+        let (cv, ci, grass, _, _) = build_chunk_mesh(world, cx, cz, camera_pos, camera_pos);
         let base = vertices.len() as u32;
         vertices.extend(cv);
         indices.extend(ci.into_iter().map(|i| i + base));
@@ -4347,19 +6099,11 @@ fn push_textured_block_faces(
     world: &World,
     tile: f32,
     tint: [f32; 3],
-    camera_pos: Vec3,
+    _camera_pos: Vec3,
 ) {
     for &(nx, ny, nz, corners) in &crate::hero::FACE_CORNERS {
         let neighbor = glam::IVec3::new(nx, ny, nz);
         if world.dirt_face_occluded(block_pos, neighbor) {
-            continue;
-        }
-        let face_center = Vec3::new(
-            block_pos.x as f32 + 0.5 + 0.5 * neighbor.x as f32,
-            block_pos.y as f32 + 0.5 + 0.5 * neighbor.y as f32,
-            block_pos.z as f32 + 0.5 + 0.5 * neighbor.z as f32,
-        );
-        if !face_faces_camera(neighbor, face_center, camera_pos) {
             continue;
         }
         let n = [nx as f32, ny as f32, nz as f32];
@@ -4397,19 +6141,11 @@ fn push_dirt_face_detail(
     origin: Vec3,
     block_pos: glam::IVec3,
     world: &World,
-    camera_pos: Vec3,
+    _camera_pos: Vec3,
 ) {
     for &(nx, ny, nz, corners) in &crate::hero::FACE_CORNERS {
         let neighbor = glam::IVec3::new(nx, ny, nz);
         if world.dirt_face_occluded(block_pos, neighbor) {
-            continue;
-        }
-        let face_center = Vec3::new(
-            block_pos.x as f32 + 0.5 + 0.5 * neighbor.x as f32,
-            block_pos.y as f32 + 0.5 + 0.5 * neighbor.y as f32,
-            block_pos.z as f32 + 0.5 + 0.5 * neighbor.z as f32,
-        );
-        if !face_faces_camera(neighbor, face_center, camera_pos) {
             continue;
         }
         let top_green = neighbor == glam::IVec3::Y && dirt_top_is_grassy(world, block_pos);
@@ -4445,6 +6181,12 @@ fn push_dirt_face_detail(
                     Some(Material::Stone)
                 ) {
                     Material::Stone.color_rgb()
+                } else if matches!(
+                    world.get_voxel(block_pos).map(|v| v.material),
+                    Some(Material::Mud)
+                ) {
+                    // Lodo húmedo: tono propio, no tierra del bioma.
+                    Material::Mud.color_rgb()
                 } else {
                     biome.dirt_rgb()
                 };
@@ -4550,12 +6292,85 @@ fn mesh_ore_overlays(
     vertices: &mut Vec<Vertex>,
     indices: &mut Vec<u32>,
 ) {
-    use crate::world::{ore_micros_visible, Material, MICROVOXEL_RES, ORE_FLECK_SIZE_MUL};
+    use crate::world::{chunk_dist_sq_xz, ore_micros_visible, Material, MICROVOXEL_RES, ORE_FLECK_SIZE_MUL};
 
     let cell = 1.0 / MICROVOXEL_RES as f32;
     let size = cell * ORE_FLECK_SIZE_MUL;
 
+    // Skip ore flecks beyond 48 blocks from the camera — too small to see.
+    let dist_sq = chunk_dist_sq_xz(camera_pos, cx, cz);
+    if dist_sq > 48.0 * 48.0 {
+        return;
+    }
+
     world.for_voxels_in_chunk(cx, cz, &mut |pos, voxel| {
+        if voxel.material != Material::Stone || !voxel.is_fully_solid() {
+            return;
+        }
+        let Some((kind, n, bits)) = ore_micros_visible(world, *pos) else {
+            return;
+        };
+        let color = kind.fleck_rgb();
+        let origin = Vec3::new(pos.x as f32, pos.y as f32, pos.z as f32);
+        for i in 0..n as usize {
+            let m = bits[i];
+            let edge = (MICROVOXEL_RES - 1) as u8;
+            let mut push = Vec3::ZERO;
+            if m.mx == edge {
+                push.x = 1.0;
+            } else if m.mx == 0 {
+                push.x = -1.0;
+            }
+            if m.my == edge {
+                push.y = 1.0;
+            } else if m.my == 0 {
+                push.y = -1.0;
+            }
+            if m.mz == edge {
+                push.z = 1.0;
+            } else if m.mz == 0 {
+                push.z = -1.0;
+            }
+            // Anchor on the micro cell, grow the fleck, then push it out of the face.
+            let micro_origin = origin
+                + Vec3::new(m.mx as f32, m.my as f32, m.mz as f32) * cell
+                + Vec3::splat((cell - size) * 0.5)
+                + push * (size * 0.35);
+            push_ore_fleck_cube(
+                vertices,
+                indices,
+                micro_origin,
+                size,
+                color,
+                camera_pos,
+                push,
+            );
+        }
+    });
+}
+
+/// Section variant of [`mesh_ore_overlays`]: flecks only inside slab `cy`.
+fn mesh_ore_overlays_section(
+    world: &World,
+    cx: i32,
+    cy: i32,
+    cz: i32,
+    camera_pos: Vec3,
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+) {
+    use crate::world::{chunk_dist_sq_xz, ore_micros_visible, Material, MICROVOXEL_RES, ORE_FLECK_SIZE_MUL};
+
+    let cell = 1.0 / MICROVOXEL_RES as f32;
+    let size = cell * ORE_FLECK_SIZE_MUL;
+
+    // Skip ore flecks beyond 48 blocks from the camera — too small to see.
+    let dist_sq = chunk_dist_sq_xz(camera_pos, cx, cz);
+    if dist_sq > 48.0 * 48.0 {
+        return;
+    }
+
+    world.for_voxels_in_section(cx, cy, cz, &mut |pos, voxel| {
         if voxel.material != Material::Stone || !voxel.is_fully_solid() {
             return;
         }
@@ -4608,22 +6423,13 @@ fn push_ore_fleck_cube(
     origin: Vec3,
     size: f32,
     color: [f32; 3],
-    camera_pos: Vec3,
+    _camera_pos: Vec3,
     outward: Vec3,
 ) {
     for &(nx, ny, nz, corners) in &crate::hero::FACE_CORNERS {
         let normal = [nx as f32, ny as f32, nz as f32];
-        let neighbor = glam::IVec3::new(nx, ny, nz);
         // Hide the face pressed into the parent stone.
         if outward.dot(Vec3::new(nx as f32, ny as f32, nz as f32)) < -0.5 {
-            continue;
-        }
-        let face_center = Vec3::new(
-            origin.x + size * 0.5 + 0.5 * size * nx as f32,
-            origin.y + size * 0.5 + 0.5 * size * ny as f32,
-            origin.z + size * 0.5 + 0.5 * size * nz as f32,
-        );
-        if !face_faces_camera(neighbor, face_center, camera_pos) {
             continue;
         }
         let mut world_c = [[0.0f32; 3]; 4];
@@ -4643,6 +6449,227 @@ fn push_ore_fleck_cube(
     }
 }
 
+/// A merged group of microvoxels inside one voxel, as inclusive cell ranges.
+/// This is the "stretchable piece" the mesh works with: N cells in a run become
+/// one box, so a stretched face costs 1 quad instead of N.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MicroRun {
+    x0: usize,
+    y0: usize,
+    z0: usize,
+    x1: usize,
+    y1: usize,
+    z1: usize,
+}
+
+/// One exposed face of a [`MicroRun`]: the plane it sits on (`cell` along
+/// `axis`) and which way it points.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MicroFace {
+    run: MicroRun,
+    axis: usize,
+    positive: bool,
+    cell: usize,
+}
+
+impl MicroFace {
+    /// Area of the face in whole cells — the invariant that says merging only
+    /// *grouped* exposed faces and never added or dropped one. Test-only: the
+    /// mesher itself works from the geometry, not from the count.
+    #[cfg(test)]
+    fn area(&self) -> usize {
+        let (u, v) = ((self.axis + 1) % 3, (self.axis + 2) % 3);
+        let lo = [self.run.x0, self.run.y0, self.run.z0];
+        let hi = [self.run.x1, self.run.y1, self.run.z1];
+        (hi[u] - lo[u] + 1) * (hi[v] - lo[v] + 1)
+    }
+
+    /// True when the face steps out of the voxel, so the neighbour *block*
+    /// decides whether it shows. The whole run shares one plane, so the test is
+    /// uniform across the merged face.
+    fn leaves_voxel(&self) -> bool {
+        use crate::world::MICROVOXEL_RES;
+        if self.positive {
+            self.cell + 1 >= MICROVOXEL_RES
+        } else {
+            self.cell == 0
+        }
+    }
+
+    fn block_delta(&self) -> glam::IVec3 {
+        let mut d = [0i32; 3];
+        d[self.axis] = if self.positive { 1 } else { -1 };
+        glam::IVec3::new(d[0], d[1], d[2])
+    }
+}
+
+/// Occupancy of one voxel's micro cells, in the same order as
+/// `Voxel::micro_index`.
+type MicroMask = [bool; crate::world::MICROVOXEL_RES * crate::world::MICROVOXEL_RES
+    * crate::world::MICROVOXEL_RES];
+
+/// Snapshot the micro mask with the LOD rules applied (`max_blade_y`,
+/// `solid_carpet`), so the six face masks below read one array instead of
+/// re-testing the voxel 6 × 4096 times.
+fn micro_mask(voxel: &crate::world::Voxel, lod: crate::world::GrassLod) -> MicroMask {
+    use crate::world::MICROVOXEL_RES;
+    let mut mask = [false; MICROVOXEL_RES * MICROVOXEL_RES * MICROVOXEL_RES];
+    for mz in 0..MICROVOXEL_RES {
+        for my in 0..MICROVOXEL_RES {
+            for mx in 0..MICROVOXEL_RES {
+                let i = mx + my * MICROVOXEL_RES + mz * MICROVOXEL_RES * MICROVOXEL_RES;
+                mask[i] = micro_present(voxel, mx as i32, my as i32, mz as i32, lod);
+            }
+        }
+    }
+    mask
+}
+
+/// Greedy-merge one voxel's exposed micro faces into the fewest rectangles.
+///
+/// Pure: it only knows the mask, so it cannot cull against the neighbour
+/// *block* (the caller does that per merged face via [`MicroFace::leaves_voxel`]).
+/// The exposed **set** is identical to the per-cell path — only the grouping
+/// changes — which is what `greedy_micro_faces_preserve_exposed_area` pins.
+fn greedy_micro_faces(mask: &MicroMask) -> Vec<MicroFace> {
+    use crate::world::MICROVOXEL_RES;
+    let n = MICROVOXEL_RES;
+    let at = |x: i32, y: i32, z: i32| -> bool {
+        if x < 0 || y < 0 || z < 0 {
+            return false;
+        }
+        let (x, y, z) = (x as usize, y as usize, z as usize);
+        if x >= n || y >= n || z >= n {
+            return false;
+        }
+        mask[x + y * n + z * n * n]
+    };
+    let mut out = Vec::new();
+    for axis in 0..3usize {
+        let (u_axis, v_axis) = ((axis + 1) % 3, (axis + 2) % 3);
+        for positive in [true, false] {
+            for cell in 0..n {
+                // Exposed along `axis` at plane `cell`?
+                let step = if positive { 1i32 } else { -1i32 };
+                let visible = |u: usize, v: usize| -> bool {
+                    let mut c = [0i32; 3];
+                    c[axis] = cell as i32;
+                    c[u_axis] = u as i32;
+                    c[v_axis] = v as i32;
+                    if !at(c[0], c[1], c[2]) {
+                        return false;
+                    }
+                    let mut nb = c;
+                    nb[axis] += step;
+                    !at(nb[0], nb[1], nb[2])
+                };
+                // Merge the n×n mask: runs along v, then carried across u while
+                // the v-range matches exactly.
+                let mut rects: Vec<([usize; 3], [usize; 3])> = Vec::new();
+                // (v0, v1, u_start, rect index) still extendable on this row.
+                let mut open: Vec<(usize, usize, usize, usize)> = Vec::new();
+                for u in 0..n {
+                    let mut next_open: Vec<(usize, usize, usize, usize)> = Vec::new();
+                    let mut v = 0;
+                    while v < n {
+                        if !visible(u, v) {
+                            v += 1;
+                            continue;
+                        }
+                        let mut v1 = v;
+                        while v1 + 1 < n && visible(u, v1 + 1) {
+                            v1 += 1;
+                        }
+                        match open.iter().position(|(a, b, _, _)| *a == v && *b == v1) {
+                            Some(k) => {
+                                let (_, _, u_start, idx) = open[k];
+                                let (lo, mut hi) = rects[idx];
+                                hi[u_axis] = u;
+                                rects[idx] = (lo, hi);
+                                next_open.push((v, v1, u_start, idx));
+                            }
+                            None => {
+                                let mut lo = [0usize; 3];
+                                let mut hi = [0usize; 3];
+                                lo[axis] = cell;
+                                hi[axis] = cell;
+                                lo[u_axis] = u;
+                                hi[u_axis] = u;
+                                lo[v_axis] = v;
+                                hi[v_axis] = v1;
+                                rects.push((lo, hi));
+                                next_open.push((v, v1, u, rects.len() - 1));
+                            }
+                        }
+                        v = v1 + 1;
+                    }
+                    open = next_open;
+                }
+                for (lo, hi) in rects {
+                    out.push(MicroFace {
+                        run: MicroRun {
+                            x0: lo[0],
+                            y0: lo[1],
+                            z0: lo[2],
+                            x1: hi[0],
+                            y1: hi[1],
+                            z1: hi[2],
+                        },
+                        axis,
+                        positive,
+                        cell,
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// World quad for one merged micro face. The winding is fixed afterwards by
+/// `ensure_outward_quad`, exactly like the per-cell path.
+fn push_micro_run_quad(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    origin: Vec3,
+    scale: f32,
+    color: [f32; 3],
+    face: &MicroFace,
+) {
+    let lo = [face.run.x0 as f32, face.run.y0 as f32, face.run.z0 as f32];
+    let hi = [
+        face.run.x1 as f32 + 1.0,
+        face.run.y1 as f32 + 1.0,
+        face.run.z1 as f32 + 1.0,
+    ];
+    let (a, b) = ((face.axis + 1) % 3, (face.axis + 2) % 3);
+    let plane = if face.positive { hi[face.axis] } else { lo[face.axis] };
+    let mut corners = [[0.0f32; 3]; 4];
+    // Same corner order as FACE_CORNERS: (0,0) (1,0) (1,1) (0,1) on (a, b).
+    for (i, (da, db)) in [(0.0f32, 0.0f32), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+        .into_iter()
+        .enumerate()
+    {
+        let mut p = [0.0f32; 3];
+        p[face.axis] = plane;
+        p[a] = lo[a] + da * (hi[a] - lo[a]);
+        p[b] = lo[b] + db * (hi[b] - lo[b]);
+        corners[i] = [
+            origin.x + p[0] * scale,
+            origin.y + p[1] * scale,
+            origin.z + p[2] * scale,
+        ];
+    }
+    let mut normal = [0.0f32; 3];
+    normal[face.axis] = if face.positive { 1.0 } else { -1.0 };
+    crate::hero::ensure_outward_quad(&mut corners, normal);
+    let base = vertices.len() as u32;
+    for p in &corners {
+        vertices.push(Vertex::solid(*p, normal, color));
+    }
+    indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+}
+
 fn push_microvoxel_mesh(
     world: &World,
     block_pos: glam::IVec3,
@@ -4658,44 +6685,59 @@ fn push_microvoxel_mesh(
     use crate::world::MICROVOXEL_RES;
     let scale = 1.0 / MICROVOXEL_RES as f32;
 
-    for mz in 0..MICROVOXEL_RES {
-        for my in 0..MICROVOXEL_RES {
-            if let Some(max_y) = lod.max_blade_y {
-                if my > max_y {
+    // Atlas-textured micro geometry (tree bark) keeps one quad per cell on
+    // purpose: its UVs come from world position (`terrain_uv`), so merging a
+    // run would stretch the grain instead of tiling it. Untextured micro
+    // geometry (grass / dirt detail) has no UVs and merges freely.
+    if atlas_tile.is_some() {
+        for mz in 0..MICROVOXEL_RES {
+            for my in 0..MICROVOXEL_RES {
+                if let Some(max_y) = lod.max_blade_y {
+                    if my > max_y {
+                        continue;
+                    }
+                } else if my > 0 {
                     continue;
                 }
-            } else if my > 0 {
-                continue;
-            }
-            for mx in 0..MICROVOXEL_RES {
-                let occupied = if lod.solid_carpet && my == 0 {
-                    true
-                } else {
-                    voxel.get_micro(mx, my, mz)
-                };
-                if !occupied {
-                    continue;
+                for mx in 0..MICROVOXEL_RES {
+                    let occupied = if lod.solid_carpet && my == 0 {
+                        true
+                    } else {
+                        voxel.get_micro(mx, my, mz)
+                    };
+                    if !occupied {
+                        continue;
+                    }
+                    let micro_origin =
+                        origin + Vec3::new(mx as f32, my as f32, mz as f32) * scale;
+                    push_exposed_micro_faces(
+                        vertices,
+                        indices,
+                        micro_origin,
+                        scale,
+                        color,
+                        camera_pos,
+                        voxel,
+                        mx,
+                        my,
+                        mz,
+                        lod,
+                        block_pos,
+                        world,
+                        atlas_tile,
+                    );
                 }
-                let micro_origin =
-                    origin + Vec3::new(mx as f32, my as f32, mz as f32) * scale;
-                push_exposed_micro_faces(
-                    vertices,
-                    indices,
-                    micro_origin,
-                    scale,
-                    color,
-                    camera_pos,
-                    voxel,
-                    mx,
-                    my,
-                    mz,
-                    lod,
-                    block_pos,
-                    world,
-                    atlas_tile,
-                );
             }
         }
+        return;
+    }
+
+    let mask = micro_mask(voxel, lod);
+    for face in greedy_micro_faces(&mask) {
+        if face.leaves_voxel() && world.solid_occludes(block_pos + face.block_delta()) {
+            continue;
+        }
+        push_micro_run_quad(vertices, indices, origin, scale, color, &face);
     }
 }
 
@@ -4825,54 +6867,505 @@ fn push_camera_facing_box(
 }
 
 #[cfg(test)]
+mod settlement_surface_tests {
+    use super::*;
+    use crate::realms::{realm_info, RealmId};
+    use crate::settlements::{plans_for_realm, SettlementKind, VILLAGE_WALL_RADIUS};
+    use crate::world::{terrain_height, Material, World, MESH_CHUNK_SIZE};
+    use glam::IVec3;
+
+    fn village_center() -> (i32, i32) {
+        for iz in -8..8 {
+            for ix in -8..8 {
+                let Some(info) = realm_info(RealmId { ix, iz }) else {
+                    continue;
+                };
+                if let Some(v) = plans_for_realm(&info)
+                    .iter()
+                    .find(|p| p.kind == SettlementKind::Village)
+                {
+                    return v.center_block;
+                }
+            }
+        }
+        panic!("aldea no encontrada");
+    }
+
+    fn world_around(x: i32, z: i32) -> World {
+        let mut world = World::new();
+        let (cx, cz) = crate::world::mesh_chunk_coord(x, z);
+        let window = VILLAGE_WALL_RADIUS / MESH_CHUNK_SIZE + 2;
+        for dz in -window..=window {
+            for dx in -window..=window {
+                let x0 = (cx + dx) * MESH_CHUNK_SIZE;
+                let z0 = (cz + dz) * MESH_CHUNK_SIZE;
+                for zz in z0..z0 + MESH_CHUNK_SIZE {
+                    for xx in x0..x0 + MESH_CHUNK_SIZE {
+                        if world.column_height(xx, zz).is_none() {
+                            world.fills_column_for_test(xx, zz, terrain_height(xx, zz));
+                        }
+                    }
+                }
+            }
+        }
+        world
+    }
+
+    #[test]
+    fn village_ground_is_dirt_not_grass() {
+        let (vx, vz) = village_center();
+        let world = world_around(vx, vz);
+        let mut checked = 0usize;
+        let r = VILLAGE_WALL_RADIUS - 2;
+        for z in vz - r..=vz + r {
+            for x in vx - r..=vx + r {
+                let h = terrain_height(x, z);
+                if !matches!(
+                    world.get_voxel(IVec3::new(x, h, z)).map(|v| v.material),
+                    Some(Material::Dirt)
+                ) {
+                    continue;
+                }
+                checked += 1;
+                assert!(
+                    !dirt_top_is_grassy(&world, IVec3::new(x, h, z)),
+                    "tapa de pasto dentro de la aldea en {x},{h},{z}"
+                );
+                let dirt = crate::biomes::biome_at(x, z).dirt_rgb();
+                let got = surface_albedo(&world, x, z, h);
+                for (i, c) in [0usize, 1, 2].into_iter().enumerate() {
+                    assert!(
+                        (got[i] - dirt[i]).abs() < 1e-5,
+                        "albedo verde dentro de la aldea en {x},{h},{z}: {got:?} vs dirt {dirt:?}"
+                    );
+                }
+            }
+        }
+        assert!(checked > 100, "solo se revisaron {checked} columnas");
+    }
+
+    #[test]
+    fn wilderness_ground_stays_grassy() {
+        let (vx, vz) = village_center();
+        let mut world = world_around(vx, vz);
+        // Offset well clear of the claim box (radius + 2 margin).
+        let (wx, wz) = (vx + VILLAGE_WALL_RADIUS + 24, vz);
+        let h = terrain_height(wx, wz);
+        world.fills_column_for_test(wx, wz, h);
+        assert!(
+            dirt_top_is_grassy(&world, IVec3::new(wx, h, wz)),
+            "la naturaleza selvatica dejo de ser verde en {wx},{h},{wz}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod micro_greedy_tests {
+    use super::*;
+    use crate::world::{GrassLod, Material, Voxel, World, MICROVOXEL_RES};
+
+    fn full_lod() -> GrassLod {
+        GrassLod {
+            max_blade_y: Some(MICROVOXEL_RES - 1),
+            solid_carpet: false,
+        }
+    }
+
+    /// Cuántas caras de celda expondría el camino por-celda (la referencia
+    /// contra la que se mide la fusión): una por celda ocupada y dirección sin
+    /// vecina ocupada.
+    fn per_cell_face_count(mask: &MicroMask) -> usize {
+        let n = MICROVOXEL_RES;
+        let at = |x: i32, y: i32, z: i32| -> bool {
+            if x < 0 || y < 0 || z < 0 {
+                return false;
+            }
+            let (x, y, z) = (x as usize, y as usize, z as usize);
+            if x >= n || y >= n || z >= n {
+                return false;
+            }
+            mask[x + y * n + z * n * n]
+        };
+        let mut count = 0;
+        for z in 0..n {
+            for y in 0..n {
+                for x in 0..n {
+                    if !at(x as i32, y as i32, z as i32) {
+                        continue;
+                    }
+                    for axis in 0..3 {
+                        for step in [1i32, -1] {
+                            let mut nb = [x as i32, y as i32, z as i32];
+                            nb[axis] += step;
+                            if !at(nb[0], nb[1], nb[2]) {
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        count
+    }
+
+    fn area(faces: &[MicroFace]) -> usize {
+        faces.iter().map(|f| f.area()).sum()
+    }
+
+    /// La invariante fuerte: fusionar agrupa caras, no las inventa ni las
+    /// borra. Se comprueba sobre un tronco, una hoja, hierba sembrada y dos
+    /// máscarasadoñadas a mano (escalera y damasco).
+    #[test]
+    fn greedy_micro_faces_preserve_exposed_area() {
+        let mut staircase = Voxel::empty(Material::Dirt);
+        for z in 0..MICROVOXEL_RES {
+            for x in 0..MICROVOXEL_RES {
+                for y in 0..(x + z).min(MICROVOXEL_RES) {
+                    staircase.set_micro(x, y, z, true);
+                }
+            }
+        }
+        let mut checker = Voxel::empty(Material::Dirt);
+        for z in 0..MICROVOXEL_RES {
+            for y in 0..MICROVOXEL_RES {
+                for x in 0..MICROVOXEL_RES {
+                    if (x + 2 * y + 3 * z) % 3 == 0 {
+                        checker.set_micro(x, y, z, true);
+                    }
+                }
+            }
+        }
+        for voxel in [
+            Voxel::wood_trunk(),
+            Voxel::wood_trunk_sized(Material::Wood, 4),
+            Voxel::leaves(),
+            Voxel::grass_from_seed(7),
+            staircase,
+            checker,
+        ] {
+            for lod in [full_lod(), GrassLod::for_distance(0.0)] {
+                let mask = micro_mask(&voxel, lod);
+                let before = per_cell_face_count(&mask);
+                let faces = greedy_micro_faces(&mask);
+                assert_eq!(
+                    area(&faces),
+                    before,
+                    "la fusion cambio la superficie expuesta ({:?})",
+                    voxel.material
+                );
+                assert!(
+                    faces.len() <= before,
+                    "fusionar nunca debe crecer el número de caras"
+                );
+            }
+        }
+    }
+
+    /// Un tronco de 8×16×8 son 6 caras (una por lado) en vez de 640, que es lo
+    /// que emitía el camino por-celda.
+    #[test]
+    fn a_tree_trunk_collapses_to_six_quads() {
+        let mask = micro_mask(&Voxel::wood_trunk(), full_lod());
+        let faces = greedy_micro_faces(&mask);
+        assert_eq!(faces.len(), 6, "caja 8×16×8 → 6 caras: {faces:?}");
+        // 2 tapas de 8×8 + 4 laterales de 8×16.
+        assert_eq!(area(&faces), 2 * 8 * 8 + 4 * 8 * 16);
+        // La referencia: el camino por-celda habría emitido una quad por celda expuesta.
+        assert_eq!(per_cell_face_count(&mask), 640);
+    }
+
+    /// Una alfombra de hierba sólida (lod `solid_carpet`) son 256 celdas: la
+    /// función pura las agrupa en 6 caras, y como la de arriba es un único quad
+    /// de 16×16 en vez de 256.
+    #[test]
+    fn a_solid_carpet_collapses_to_one_top_quad() {
+        let lod = GrassLod {
+            max_blade_y: Some(0),
+            solid_carpet: true,
+        };
+        let mask = micro_mask(&Voxel::empty(Material::Grass), lod);
+        let faces = greedy_micro_faces(&mask);
+        assert_eq!(faces.len(), 6, "{faces:?}");
+        let top = faces
+            .iter()
+            .find(|f| f.axis == 1 && f.positive)
+            .expect("cara superior");
+        assert_eq!(top.area(), MICROVOXEL_RES * MICROVOXEL_RES);
+        assert_eq!(per_cell_face_count(&mask), 2 * 16 * 16 + 4 * 16);
+
+        // Encerrada de bloques sólidos, solo queda la tapa: 1 quad de 256 celdas.
+        // (El suelo va en y=0 porque `set_voxel` ignora y < 0.)
+        let mut world = World::new();
+        let pos = glam::IVec3::new(0, 1, 0);
+        for d in [
+            glam::IVec3::new(1, 0, 0),
+            glam::IVec3::new(-1, 0, 0),
+            glam::IVec3::new(0, 1, 0),
+            glam::IVec3::new(0, -1, 0),
+            glam::IVec3::new(0, 0, 1),
+            glam::IVec3::new(0, 0, -1),
+        ] {
+            world.set_voxel(pos + d, Voxel::solid(Material::Stone));
+        }
+        let (mut v, mut i) = (Vec::new(), Vec::new());
+        push_microvoxel_mesh(
+            &world,
+            pos,
+            &mut v,
+            &mut i,
+            Vec3::new(0.0, 1.0, 0.0),
+            &Voxel::empty(Material::Grass),
+            Material::Grass.color_rgb(),
+            Vec3::ZERO,
+            lod,
+            None,
+        );
+        assert_eq!(i.len() / 6, 1, "solo la tapa: {} quads", i.len() / 6);
+    }
+
+    /// Una tira de 16×1×1 son 6 quads (4 laterales largos + 2 tapas de 1 celda)
+    /// en vez de 16 cubitos.
+    #[test]
+    fn a_single_run_becomes_long_quads() {
+        let mut v = Voxel::empty(Material::Dirt);
+        for x in 0..MICROVOXEL_RES {
+            v.set_micro(x, 5, 7, true);
+        }
+        let mask = micro_mask(&v, full_lod());
+        let faces = greedy_micro_faces(&mask);
+        assert_eq!(faces.len(), 6, "{faces:?}");
+        assert_eq!(area(&faces), 4 * 16 + 2);
+        assert_eq!(per_cell_face_count(&mask), 4 * 16 + 2);
+        // Las cuatro caras largas son de 16×1 celdas: una quad cada una.
+        let long = faces.iter().filter(|f| f.area() == 16).count();
+        assert_eq!(long, 4, "{faces:?}");
+    }
+
+    /// El camino sin texturar emite un quad por cara fusionada; el de textura
+    /// (corteza) sigue emitting uno por celda para no estirar el grano.
+    #[test]
+    fn untextured_micro_geometry_emits_merged_quads() {
+        let mut world = World::new();
+        world.fills_column_for_test(0, 0, 10);
+        let pos = glam::IVec3::new(0, 11, 0);
+        world.set_voxel(pos, Voxel::wood_trunk());
+        let origin = Vec3::new(0.0, 11.0, 0.0);
+        let color = Material::Dirt.color_rgb();
+        let full = full_lod();
+
+        let (mut v, mut i) = (Vec::new(), Vec::new());
+        push_microvoxel_mesh(
+            &world,
+            pos,
+            &mut v,
+            &mut i,
+            origin,
+            world.get_voxel(pos).expect("tronco"),
+            color,
+            origin,
+            full,
+            None,
+        );
+        // 6 caras fundidas, menos la de abajo: el bloque de abajo es sólido.
+        assert_eq!(i.len() / 6, 5, "sin texturar: 5 quads");
+        assert_eq!(v.len(), 5 * 4);
+
+        // Con atlas el tronco mantiene el grano: una quad por celda expuesta
+        // (640 menos las 64 de la base, que el bloque de abajo recorta).
+        let (mut v2, mut i2) = (Vec::new(), Vec::new());
+        push_microvoxel_mesh(
+            &world,
+            pos,
+            &mut v2,
+            &mut i2,
+            origin,
+            world.get_voxel(pos).expect("tronco"),
+            color,
+            origin,
+            full,
+            Some(0.0),
+        );
+        assert_eq!(i2.len() / 6, 576, "con atlas: 576 quads por celda");
+    }
+}
+
+#[cfg(test)]
 mod face_cull_tests {
     use super::*;
     use crate::world::World;
     use glam::Vec3;
 
     #[test]
+    fn water_faces_go_to_transparent_mesh() {
+        use crate::world::Material;
+        let mut world = World::new();
+        world.fills_column_for_test(0, 0, 10);
+        world.set_voxel(
+            glam::IVec3::new(0, 11, 0),
+            crate::world::Voxel::solid(Material::Water),
+        );
+        let cam = Vec3::new(8.0, 14.0, 8.0);
+        let (_, _, _, water_v, water_i) = build_section_mesh(&world, 0, 0, 0, cam, cam);
+        assert!(!water_i.is_empty(), "sin malla de agua");
+        assert!(!water_v.is_empty());
+        assert_eq!(water_i.len() % 3, 0);
+    }
+
+    #[test]
+    fn flow_surface_ramps_down_25_percent_steps() {
+        use crate::world::Material;
+        // Tira sin aldeas (el agua junto a poblados se estanca).
+        let (mut x0, mut z0) = (100, 100);
+        'strip: for zz in (0..2000).step_by(8) {
+            for xx in (0..2000).step_by(8) {
+                if (0..14).all(|dx| {
+                    !crate::settlements::settlement_claims_block(xx + dx, zz)
+                }) {
+                    x0 = xx;
+                    z0 = zz;
+                    break 'strip;
+                }
+            }
+        }
+        let mut world = World::new();
+        for dx in 0..12 {
+            world.fills_column_for_test(x0 + dx, z0, 4);
+        }
+        world.set_voxel(
+            glam::IVec3::new(x0, 5, z0),
+            crate::world::Voxel::solid(Material::Water),
+        );
+        world.refresh_water_around(x0 + 5, z0, 10);
+        let cam = Vec3::new(x0 as f32 + 8.0, 10.0, z0 as f32 + 8.0);
+        let section = crate::world::mesh_chunk_coord(x0, z0);
+        let (_, _, _, water_v, _) =
+            build_section_mesh(&world, section.0, 0, section.1, cam, cam);
+        // Tapas: fuente al 100% (6.0) y corriente 75/50/25%.
+        let mut tops = std::collections::HashSet::new();
+        for v in &water_v {
+            if v.normal == [0.0, 1.0, 0.0] {
+                tops.insert((v.position[1] * 100.0).round() as i32);
+            }
+        }
+        for want in [600, 575, 550, 525] {
+            assert!(tops.contains(&want), "falta tapa {want}: {tops:?}");
+        }
+    }
+
+    #[test]
+    fn wet_hero_darkens_below_waterline() {        let feet = Vec3::new(0.5, 10.0, 0.5);
+        let pose = crate::hero_pose::HeroPose::idle();
+        let (verts, _, _) = build_player_hero_mesh(
+            feet,
+            0.0,
+            Vec3::new(5.0, 12.0, 5.0),
+            &pose,
+            false,
+            None,
+            0.0,
+            1.0,
+            false,
+            Some(feet.y + 0.9),
+            None,
+        );
+        assert!(!verts.is_empty());
+        // Vértices bajo la línea: oscuros; sobre ella: intactos (misma cara).
+        let mut dark = 0u32;
+        let mut bright = 0u32;
+        for v in &verts {
+            // El color base del héroe nunca es negro: < 0.5 implica mojado.
+            let lum = v.color[0] + v.color[1] + v.color[2];
+            if v.position[1] < feet.y + 0.9 {
+                assert!(lum < 2.2, "bajo el agua sin oscurecer: {lum}");
+                dark += 1;
+            } else {
+                bright += 1;
+            }
+        }
+        assert!(dark > 0 && bright > 0, "sin corte en la línea");
+    }
+
+    #[test]
+    fn ghost_cells_keep_per_cell_color() {
+        let cells = [
+            (glam::IVec3::new(0, 0, 0), [1.0, 1.0, 1.0]),
+            (glam::IVec3::new(5, 5, 5), [0.35, 0.9, 1.0]),
+        ];
+        let (verts, indices) = build_ghost_mesh(&cells);
+        assert_eq!(indices.len(), 72, "two cubes = 12 quads");
+        assert!(verts.iter().any(|v| v.color == [1.0, 1.0, 1.0]));
+        assert!(verts.iter().any(|v| v.color == [0.35, 0.9, 1.0]));
+        assert!(verts.iter().all(|v| {
+            v.color == [1.0, 1.0, 1.0] || v.color == [0.35, 0.9, 1.0]
+        }));
+    }
+
+    #[test]
+    fn highlight_shell_outsets_block_bounds() {
+        // Outset shell hugs the block from outside so a depth-tested pass
+        // can show it (an inset cube would hide inside solid terrain).
+        let cells = [(glam::IVec3::new(0, 0, 0), [1.0, 1.0, 1.0])];
+        let (verts, _) = build_highlight_mesh(&cells);
+        assert_eq!(verts.len(), 24);
+        let min_c = verts.iter().map(|v| v.position[0]).fold(1.0f32, f32::min);
+        let max_c = verts.iter().map(|v| v.position[0]).fold(0.0f32, f32::max);
+        assert!(min_c < 0.0 && max_c > 1.0, "shell must exceed the block");
+        // Ghost blueprint stays inset (unchanged behavior).
+        let (gverts, _) = build_ghost_mesh(&cells);
+        let gmin = gverts.iter().map(|v| v.position[0]).fold(1.0f32, f32::min);
+        let gmax = gverts.iter().map(|v| v.position[0]).fold(0.0f32, f32::max);
+        assert!(gmin > 0.0 && gmax < 1.0);
+    }
+
+    #[test]
     fn dirt_emits_bottom_faces() {
         let world = World::with_dirt_cube();
         let (verts, _) = build_mesh(&world, Vec3::new(0.5, -2.0, 0.5));
-        let bottoms = verts.iter().filter(|v| v.normal == [0.0, -1.0, 0.0]).count();
+        let bottoms = verts
+            .iter()
+            .filter(|v| v.normal == [0.0, -1.0, 0.0])
+            .count();
         assert!(bottoms > 0, "floor faces must exist when viewed from below");
     }
 
     #[test]
     fn all_unoccluded_faces_are_emitted() {
         let world = World::with_dirt_cube();
-        // Corner view → three front faces (CPU camera cull; not all six).
+        // No camera face-cull in the greedy path anymore: the lone cube's six
+        // unoccluded faces all reach the mesh regardless of camera direction.
         let cam = Vec3::new(3.0, 3.0, 3.0);
         let (verts, indices) = build_mesh(&world, cam);
-        assert_eq!(indices.len(), 18, "three camera-facing quads");
-        for n in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]] {
+        assert_eq!(indices.len(), 36, "all six unoccluded quads");
+        for n in [
+            [1.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, -1.0],
+        ] {
             let count = verts.iter().filter(|v| v.normal == n).count();
-            assert!(count >= 4, "missing front face {n:?}");
-        }
-        for n in [[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]] {
-            assert!(
-                verts.iter().all(|v| v.normal != n),
-                "back face {n:?} must be culled"
-            );
+            assert!(count >= 4, "missing face {n:?}");
         }
     }
 
     #[test]
     fn floating_cube_emits_all_six_faces() {
         let world = World::with_face_debug();
-        // Camera above +X/+Z of the floating cube at (0,8,0).
+        // Floating cube at (0,8,0): every face reaches air, so all six emit.
         let (verts, indices) = build_mesh(&world, Vec3::new(4.5, 10.5, 4.5));
-        assert_eq!(indices.len(), 18, "three camera-facing quads");
-        for n in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]] {
+        assert_eq!(indices.len(), 36, "all six unoccluded quads");
+        for n in [
+            [1.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, -1.0],
+        ] {
             assert!(
                 verts.iter().any(|v| v.normal == n),
-                "floating cube missing front face {n:?}"
-            );
-        }
-        for n in [[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]] {
-            assert!(
-                !verts.iter().any(|v| v.normal == n),
-                "back face {n:?} must be culled"
+                "floating cube missing face {n:?}"
             );
         }
     }
@@ -4928,17 +7421,25 @@ mod face_cull_tests {
         let _ = world.take_dirty_chunks();
         assert!(world.has_chunk(0, 0));
 
-        // High +X corner: +X sides, +Y top, +Z side (bottom/-X/-Z culled).
+        // High +X corner: all exterior faces emit (no camera cull) — 4 merged
+        // vertical side quads + top lid + bottom (y=0 bedrock is absent in this
+        // hand-built test world, so the bottom quad is also present).
         let (verts, indices) = build_mesh(&world, Vec3::new(3.0, 8.0, 3.0));
-        assert_eq!(indices.len(), 18, "three exterior camera-facing quads");
+        assert_eq!(indices.len(), 36, "five-block stack exterior");
 
         // No +Y/-Y quads on the shared horizontal planes inside the stack.
-        let internal_horiz = verts.iter().filter(|v| {
-            let y = v.position[1];
-            let up_or_down = v.normal == [0.0, 1.0, 0.0] || v.normal == [0.0, -1.0, 0.0];
-            up_or_down && y > 1.01 && y < 5.99
-        }).count();
-        assert_eq!(internal_horiz, 0, "no internal horizontal faces between solids");
+        let internal_horiz = verts
+            .iter()
+            .filter(|v| {
+                let y = v.position[1];
+                let up_or_down = v.normal == [0.0, 1.0, 0.0] || v.normal == [0.0, -1.0, 0.0];
+                up_or_down && y > 1.01 && y < 5.99
+            })
+            .count();
+        assert_eq!(
+            internal_horiz, 0,
+            "no internal horizontal faces between solids"
+        );
     }
 
     #[test]
@@ -4953,14 +7454,17 @@ mod face_cull_tests {
         let _ = world.take_dirty_chunks();
 
         let (verts, indices) = build_mesh(&world, Vec3::new(3.0, 4.0, 3.0));
-        // Merged 2×1×1 box: three camera-facing exterior quads (shared face gone).
-        assert_eq!(indices.len(), 18, "shared face must not be emitted");
+        // Merged 2×1×1 box: six exterior quads (no camera cull, shared face gone).
+        assert_eq!(indices.len(), 36, "shared face must not be emitted");
 
         // No faces on the shared plane x=1 with ±X normals.
-        let shared = verts.iter().filter(|v| {
-            (v.normal == [1.0, 0.0, 0.0] || v.normal == [-1.0, 0.0, 0.0])
-                && (v.position[0] - 1.0).abs() < 1e-3
-        }).count();
+        let shared = verts
+            .iter()
+            .filter(|v| {
+                (v.normal == [1.0, 0.0, 0.0] || v.normal == [-1.0, 0.0, 0.0])
+                    && (v.position[0] - 1.0).abs() < 1e-3
+            })
+            .count();
         assert_eq!(shared, 0, "faces behind a solid neighbor must be culled");
     }
 
@@ -4979,12 +7483,18 @@ mod face_cull_tests {
                     && (v.seed - TERRAIN_TILE_DIRT).abs() < 0.1
             });
             // Floating test cube is not the natural surface → dirt tapa.
-            let tops_ok = verts.iter().filter(|v| v.normal == [0.0, 1.0, 0.0]).all(|v| {
-                (v.color[0] - dirt[0]).abs() < 1e-3
-                    && (v.color[1] - dirt[1]).abs() < 1e-3
-                    && (v.seed - TERRAIN_TILE_DIRT).abs() < 0.1
-            });
-            assert!(sides_ok, "HD-2D sides are brown dirt (no green fringe tile)");
+            let tops_ok = verts
+                .iter()
+                .filter(|v| v.normal == [0.0, 1.0, 0.0])
+                .all(|v| {
+                    (v.color[0] - dirt[0]).abs() < 1e-3
+                        && (v.color[1] - dirt[1]).abs() < 1e-3
+                        && (v.seed - TERRAIN_TILE_DIRT).abs() < 0.1
+                });
+            assert!(
+                sides_ok,
+                "HD-2D sides are brown dirt (no green fringe tile)"
+            );
             assert!(tops_ok, "non-surface dirt lids use dirt tapa");
             let _ = grass;
         } else {
@@ -5054,8 +7564,13 @@ mod face_cull_tests {
         }
 
         let mut world = World::new();
-        let x = 0;
-        let z = 0;
+        // Clear of the origin settlement: village ground is trodden dirt now,
+        // so a green tapa needs real wilderness.
+        let (x, z) = (9, 9);
+        assert!(
+            !crate::settlements::settlement_claims_block(x, z),
+            "la columna de test cae dentro de una aldea"
+        );
         let surface = terrain_height(x, z);
         // Build a short column whose top is the natural surface (green tapa).
         for y in 0..=surface {
@@ -5090,7 +7605,10 @@ mod face_cull_tests {
                     && (v.position[1] - y_top).abs() < 0.02
                     && v.color[1] > v.color[0]
             });
-            assert!(green_after, "natural surface tapa stays green without tufts");
+            assert!(
+                green_after,
+                "natural surface tapa stays green without tufts"
+            );
             let bad: Vec<_> = bare
                 .iter()
                 .filter(|v| v.normal[1].abs() < 0.5)
@@ -5126,8 +7644,8 @@ mod face_cull_tests {
     #[test]
     fn mid_range_dirt_uses_one_quad_per_face() {
         use crate::world::{
-            ENABLE_HD2D, HD2D_DIRT_HIRES_DIST, HD2D_DIRT_POLISHED_DIST, DIRT_HIRES_MAX_DIST,
-            DIRT_POLISHED_MAX_DIST,
+            DIRT_HIRES_MAX_DIST, DIRT_POLISHED_MAX_DIST, ENABLE_HD2D, HD2D_DIRT_HIRES_DIST,
+            HD2D_DIRT_POLISHED_DIST,
         };
         let world = World::with_dirt_cube();
         // Chunk center is (8,1,8). Polished band: hires..polished from center.
@@ -5136,10 +7654,11 @@ mod face_cull_tests {
         } else {
             (DIRT_HIRES_MAX_DIST + DIRT_POLISHED_MAX_DIST) * 0.5
         };
-        // Elevated corner so +X/+Y/+Z face the lens.
+        // Elevated corner so +X/+Y/+Z face the lens (back faces still emitted:
+        // greedy dirt does not camera-cull — that punched 16×16 holes).
         let (verts, indices) = build_mesh(&world, Vec3::new(8.0 + d1, 8.0, 8.0));
-        assert_eq!(indices.len(), 18, "three camera-facing quads");
-        assert_eq!(verts.len(), 12);
+        assert_eq!(indices.len(), 36, "isolated cube: six greedy quads");
+        assert_eq!(verts.len(), 24);
         // Isolated cube is not the natural surface lip → dirt tapa (not grass).
         let dirt = crate::world::Material::Dirt.color_rgb();
         assert!(
@@ -5164,8 +7683,7 @@ mod face_cull_tests {
         col.fills_column_for_test(0, 0, 4);
         let surface = crate::world::terrain_height(0, 0) as f32;
         // Camera must sit above the HLOD lid (natural surface), else +Y is culled.
-        let (verts, indices) =
-            build_mesh(&col, Vec3::new(8.0 + d2, surface + 24.0, 8.0));
+        let (verts, indices) = build_mesh(&col, Vec3::new(8.0 + d2, surface + 24.0, 8.0));
         assert!(
             indices.len() >= 6,
             "HLOD column emits at least a top quad; got {}",
@@ -5180,20 +7698,19 @@ mod face_cull_tests {
     #[test]
     fn far_chunk_uses_heightmap_hlod() {
         use crate::world::{
-            dirt_mesh_max_dist, ENABLE_HD2D, HD2D_DIRT_HEIGHTMAP_DIST, HD2D_DIRT_MESH_DIST,
-            DIRT_HEIGHTMAP_MAX_DIST, DIRT_MESH_MAX_DIST,
+            dirt_mesh_max_dist, DIRT_HEIGHTMAP_MAX_DIST, DIRT_MESH_MAX_DIST, ENABLE_HD2D,
+            HD2D_DIRT_HEIGHTMAP_DIST, HD2D_DIRT_MESH_DIST,
         };
         let world = World::with_shunk();
         let mesh_cut = dirt_mesh_max_dist();
         // Past mesh cut: no geometry.
-        let (verts, indices, grass) =
-            build_chunk_mesh(
-                &world,
-                0,
-                0,
-                Vec3::new(8.0 + mesh_cut + 8.0, 40.0, 8.0),
-                Vec3::new(8.0 + mesh_cut + 8.0, 40.0, 8.0),
-            );
+        let (verts, indices, grass, _, _) = build_chunk_mesh(
+            &world,
+            0,
+            0,
+            Vec3::new(8.0 + mesh_cut + 8.0, 40.0, 8.0),
+            Vec3::new(8.0 + mesh_cut + 8.0, 40.0, 8.0),
+        );
         assert!(grass.is_empty());
         assert!(verts.is_empty());
         assert!(indices.is_empty());
@@ -5204,14 +7721,13 @@ mod face_cull_tests {
         } else {
             (DIRT_HEIGHTMAP_MAX_DIST + DIRT_MESH_MAX_DIST) * 0.5
         };
-        let (verts, indices, _) =
-            build_chunk_mesh(
-                &world,
-                0,
-                0,
-                Vec3::new(8.0 + d_hm, 40.0, 8.0),
-                Vec3::new(8.0 + d_hm, 40.0, 8.0),
-            );
+        let (verts, indices, _, _, _) = build_chunk_mesh(
+            &world,
+            0,
+            0,
+            Vec3::new(8.0 + d_hm, 40.0, 8.0),
+            Vec3::new(8.0 + d_hm, 40.0, 8.0),
+        );
         assert!(indices.len() >= 6);
         let dirt = crate::world::Material::Dirt.color_rgb();
         let grass = crate::world::Material::Grass.color_rgb();
@@ -5297,8 +7813,7 @@ mod face_cull_tests {
             if !world.chunk_filled(cx, cz) {
                 continue;
             }
-            let (_, indices, _) =
-                build_chunk_mesh(&world, cx, cz, camera.position, origin);
+            let (_, indices, _, _, _) = build_chunk_mesh(&world, cx, cz, camera.position, origin);
             if indices.is_empty() {
                 continue;
             }
@@ -5316,8 +7831,7 @@ mod face_cull_tests {
             if !world.chunk_filled(cx, cz) {
                 continue;
             }
-            let (verts, indices, _) =
-                build_chunk_mesh(&world, cx, cz, camera.position, origin);
+            let (verts, indices, _, _, _) = build_chunk_mesh(&world, cx, cz, camera.position, origin);
             if indices.is_empty() {
                 continue;
             }
@@ -5366,9 +7880,7 @@ mod face_cull_tests {
             "by_axis +X={} -X={} +Y={} -Y={} +Z={} -Z={}",
             by_axis[0], by_axis[1], by_axis[2], by_axis[3], by_axis[4], by_axis[5]
         );
-        eprintln!(
-            "chunk AABB pad uses s={s}; face cull keeps ≤3 dirs/chunk from camera"
-        );
+        eprintln!("chunk AABB pad uses s={s}; face cull keeps ≤3 dirs/chunk from camera");
 
         assert!(screen_faces > 0, "expected dirt faces on screen");
         assert!(
@@ -5381,5 +7893,369 @@ mod face_cull_tests {
             "expect more +Y tops than bottoms from isometric cam"
         );
     }
+
+    }
+
+#[cfg(test)]
+mod scene_scale_tests {
+    use super::{capped_surface_size, dyn_scale_step, is_diorama_view, scene_internal_size_for, SCENE_INTERNAL_SCALE};
+
+    #[test]
+    fn diorama_uses_internal_scale_and_fp_is_native() {
+        // Escala normalizada a 1.0 (2026-09-22): ambos modos nativos.
+        let (dw, dh) = scene_internal_size_for(1920, 1080, true);
+        assert_eq!(dw, (1920.0 * SCENE_INTERNAL_SCALE).round() as u32);
+        assert_eq!(dh, (1080.0 * SCENE_INTERNAL_SCALE).round() as u32);
+        assert_eq!(scene_internal_size_for(1920, 1080, false), (1920, 1080));
+        assert_eq!((dw, dh), (1920, 1080));
+    }
+
+    #[test]
+    fn diorama_threshold_matches_section_cull() {
+        // `ensure_scene_scale` y el culling usan el mismo umbral 0.25:
+        // diorama = hd2d_amount >= 0.25.
+        let mut cam = crate::camera::Camera::hd2d_follow(glam::Vec3::ZERO);
+        assert!(is_diorama_view(&cam));
+        cam.request_first_person();
+        // Avanzar el blend 0.45 s completo → hd2d_amount = 0 → vista FP.
+        cam.update_mode(0.45);
+        assert!(!is_diorama_view(&cam));
+    }
+
+    #[test]
+    fn surface_cap_only_kicks_in_above_1440() {
+        // En host (no Android) el cap es identidad.
+        assert_eq!(capped_surface_size(2400, 1080), (2400, 1080));
+        assert_eq!(capped_surface_size(0, 0), (1, 1));
+        if cfg!(target_os = "android") {
+            assert_eq!(capped_surface_size(2400, 1080), (1440, 648));
+            assert_eq!(capped_surface_size(1280, 720), (1280, 720));
+        }
+    }
+
+    #[test]
+    fn dyn_scale_ladder_has_hysteresis() {
+        assert_eq!(dyn_scale_step(0.66, 40.0), 0.55);
+        assert_eq!(dyn_scale_step(0.55, 40.0), 0.45);
+        assert_eq!(dyn_scale_step(0.45, 10.0), 0.45, "suelo");
+        assert_eq!(dyn_scale_step(0.45, 60.0), 0.55);
+        assert_eq!(dyn_scale_step(0.66, 60.0), 0.66, "techo");
+        assert_eq!(dyn_scale_step(0.55, 50.0), 0.55, "histéresis 45..57");
+        assert_eq!(dyn_scale_step(0.66, 50.0), 0.66);
+    }
 }
 
+#[cfg(test)]
+mod section_split_tests {
+    use super::*;
+    use crate::world::{mesh_section_range, World, MESH_SECTIONS_Y};
+    use glam::Vec3;
+
+    /// Near top-down camera over chunk (0,0) → band 0 greedy path.
+    fn near_cam() -> Vec3 {
+        Vec3::new(8.0, 60.0, 8.0)
+    }
+
+    #[test]
+    fn sections_stay_within_slab() {
+        let world = World::with_shunk();
+        let cam = near_cam();
+        for cy in 0..MESH_SECTIONS_Y {
+            let (v, _, _, _, _) = build_section_mesh(&world, 1, cy, 1, cam, cam);
+            let (sy0, sy1) = mesh_section_range(cy);
+            for vert in &v {
+                let y = vert.position[1];
+                assert!(
+                    y >= sy0 as f32 - 1e-3 && y <= sy1 as f32 + 1e-3,
+                    "cy={cy} vert y={y} outside [{sy0},{sy1})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn section_tops_match_column_tops() {
+        // +Y lids belong to exactly one slab → the multiset of top verts must
+        // equal the column mesh tops (side quads may split, tops never do).
+        let world = World::with_shunk();
+        let cam = near_cam();
+        let (col_v, _, _, _, _) = build_chunk_mesh(&world, 1, 1, cam, cam);
+        let mut col_tops: Vec<u32> = col_v
+            .iter()
+            .filter(|v| v.normal == [0.0, 1.0, 0.0])
+            .flat_map(|v| v.position.map(|c| c.to_bits()))
+            .collect();
+        col_tops.sort();
+        let mut sec_tops = Vec::new();
+        for cy in 0..MESH_SECTIONS_Y {
+            let (v, _, _, _, _) = build_section_mesh(&world, 1, cy, 1, cam, cam);
+            sec_tops.extend(
+                v.iter()
+                    .filter(|v| v.normal == [0.0, 1.0, 0.0])
+                    .flat_map(|v| v.position.map(|c| c.to_bits())),
+            );
+        }
+        sec_tops.sort();
+        assert!(!col_tops.is_empty(), "column must emit tops");
+        assert_eq!(
+            sec_tops, col_tops,
+            "split slabs must preserve every top lid"
+        );
+    }
+
+    #[test]
+    fn empty_upper_section_emits_nothing() {
+        let mut world = World::new();
+        // Flat low terrain: slabs cy=2,3 are provably empty.
+        for z in 0..16 {
+            for x in 0..16 {
+                world.fills_column_for_test(x, z, 10);
+            }
+        }
+        let cam = Vec3::new(8.0, 30.0, 8.0);
+        for cy in 2..MESH_SECTIONS_Y {
+            assert!(!world.section_may_have_content(0, 0, cy));
+            let (v, i, g, _, _) = build_section_mesh(&world, 0, cy, 0, cam, cam);
+            assert!(v.is_empty() && i.is_empty() && g.is_empty());
+        }
+        // Surface slab still meshes.
+        let (v, i, _, _, _) = build_section_mesh(&world, 0, 0, 0, cam, cam);
+        assert!(!v.is_empty() && !i.is_empty());
+    }
+
+    #[test]
+    fn buckets_cover_every_index_once() {
+        let world = World::with_shunk();
+        let cam = near_cam();
+        for cy in 0..MESH_SECTIONS_Y {
+            let (v, i, _, _, _) = build_section_mesh(&world, 1, cy, 1, cam, cam);
+            if i.is_empty() {
+                continue;
+            }
+            let (sorted, ranges) = sort_indices_by_direction(&v, &i);
+            assert_eq!(sorted.len(), i.len());
+            // Ranges tile the reordered buffer without gaps/overlaps.
+            let mut cursor = 0u32;
+            for (start, count) in ranges {
+                assert_eq!(start, cursor, "bucket ranges must tile");
+                cursor += count;
+            }
+            assert_eq!(cursor as usize, i.len());
+            // Same multiset of indices (reordered, none lost/duplicated).
+            let mut a = sorted.clone();
+            let mut b = i.clone();
+            a.sort();
+            b.sort();
+            assert_eq!(a, b);
+            // Every triangle sits in the bucket of its own normal.
+            for (tri, b) in sorted.chunks_exact(3).zip(
+                ranges
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(bb, &(_, c))| std::iter::repeat(bb).take(c as usize / 3)),
+            ) {
+                let n = v[tri[0] as usize].normal;
+                assert_eq!(
+                    bucket_for_normal(n),
+                    b,
+                    "triangle normal {n:?} in wrong bucket"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn face_mask_culls_only_backfaces() {        // Section (0,0,0) center = (8,8,8). Far +X camera sees +X/+Y/+Z...
+        let mask = section_face_mask(Vec3::new(200.0, 8.0, 8.0), 0, 0, 0);
+        assert!(mask & (1 << 0) != 0, "+X must draw from +X, got {mask:b}");
+        assert!(mask & (1 << 1) == 0, "-X must cull from +X, got {mask:b}");
+        let mask = section_face_mask(Vec3::new(8.0, 200.0, 8.0), 0, 0, 0);
+        assert!(mask & (1 << 2) != 0, "+Y must draw from above");
+        assert!(mask & (1 << 3) == 0, "-Y must cull from above");
+        // Camera inside the slab → everything draws (never a hole).
+        assert_eq!(section_face_mask(Vec3::new(8.0, 8.0, 8.0), 0, 0, 0), 0x3F);
+    }
+
+    #[test]
+    fn section_key_ignores_lens() {
+        // No facing is baked at build anymore: orbit, rise, distance and
+        // FP/HD-2D must never invalidate meshes (only band/edits do).
+        // This is the anti-remesh-storm guarantee.
+        use crate::camera::Camera;
+        use std::f32::consts::FRAC_PI_4;
+        let focus = Vec3::new(8.0, 22.0, 8.0);
+        let cam = Camera::hd2d_follow(focus);
+        let base = chunk_section_state_key(&cam, 0, 1, 0);
+        let mut orbit = Camera::hd2d_follow(focus);
+        orbit.yaw += FRAC_PI_4;
+        assert_eq!(chunk_section_state_key(&orbit, 0, 1, 0), base);
+        let up = Camera::hd2d_follow(focus + Vec3::new(0.0, 8.0, 0.0));
+        assert_eq!(chunk_section_state_key(&up, 0, 1, 0), base);
+        let mut fp = Camera::hd2d_follow(focus);
+        fp.request_first_person();
+        fp.update_mode(10.0);
+        assert_eq!(chunk_section_state_key(&fp, 0, 1, 0), base);
+    }
+
+        #[test]
+    fn grassy_column_emits_instances_near_camera() {
+        use crate::world::Voxel;
+        use glam::IVec3;
+        let mut world = World::new();
+        world.fills_column_for_test(4, 4, 10);
+        world.set_voxel(IVec3::new(4, 11, 4), Voxel::grass_from_seed(1));
+        // Camera nearly overhead of the tuft → band 0, full density.
+        let cam = Vec3::new(4.5, 14.0, 4.5);
+        let (_, _, grass, _, _) = build_section_mesh(&world, 0, 0, 0, cam, cam);
+        assert_eq!(grass.len(), 1, "tuft must emit one instance");
+    }
+
+    #[test]
+    fn face_mask_top_bucket_uses_mesh_section_center() {
+        use crate::world::{mesh_section_range, MESH_CHUNK_SIZE, MESH_SECTION_HEIGHT};
+        // Regression: mesh sections are 16 tall (MESH_SECTION_HEIGHT), but the
+        // mask center used CHUNK_SECTION_HEIGHT (32) → +Y tops of section cy=1
+        // (y∈[16,32)) were culled below y≈34.1 even when the camera was above
+        // the ground. Ground tops are front-facing from any camera above them.
+        let cy = 1;
+        let (y0, y1) = mesh_section_range(cy);
+        assert_eq!((y0, y1), (16, 32));
+        // Camera horizontally outside the slab, still above its tops at y=26.
+        let cam = Vec3::new(8.0 + MESH_CHUNK_SIZE as f32 * 2.0, 26.0, 8.0);
+        let mask = section_face_mask(cam, 0, cy, 0);
+        assert!(
+            mask & (1 << 2) != 0,
+            "ground tops must draw while the camera is above the slab, got {mask:b}"
+        );
+        // Camera inside the slab → everything draws (never a hole).
+        let inside = Vec3::new(8.0, 24.0, 8.0);
+        assert_eq!(section_face_mask(inside, 0, cy, 0), 0x3F);
+    }
+
+    #[test]
+    fn hlod_tops_emit_from_below() {
+        // The missing-ground bug: far flat HLOD seen from a pit culled its
+        // tops at build (baked facing) and emitted nothing. Horizontal faces
+        // must always emit — GPU + draw buckets cull them when backfacing.
+        let mut world = World::new();
+        for z in 0..16 {
+            for x in 0..16 {
+                world.fills_column_for_test(x, z, 20);
+            }
+        }
+        // XZ dist 68 → band 3 (HLOD); lens 16 under the lids.
+        let cam = Vec3::new(8.0, 5.0, 76.0);
+        let (v, i, _, _, _) = build_section_mesh(&world, 0, 1, 0, cam, cam);
+        assert!(!i.is_empty(), "HLOD slab must mesh from below");
+        assert!(
+            v.iter().any(|vert| vert.normal == [0.0, 1.0, 0.0]),
+            "tops must emit even when the lens is underneath"
+        );
+    }
+
+    #[test]
+    fn fresh_terrain_tops_use_grass_tile() {
+        // "Tapa marrón" probe: in the SURFACE slab (cy=1) of fresh terrain,
+        // grass-top lids (seed 0) must dominate dirt lids (seed 2). Cave
+        // floors (cy=0) are correctly brown and live elsewhere.
+        let world = World::with_shunk();
+        let cam = near_cam();
+        let (v, _, _, _, _) = build_section_mesh(&world, 1, 1, 1, cam, cam);
+        let mut top = 0usize;
+        let mut dirt = 0usize;
+        for vert in &v {
+            if vert.normal != [0.0, 1.0, 0.0] || vert.flags < 1.5 {
+                continue;
+            }
+            let tile = vert.seed.floor() as i32;
+            if tile == 0 {
+                top += 1;
+            } else if tile == 2 {
+                dirt += 1;
+            }
+        }
+        assert!(top > 0, "surface slab must emit grass-top lids");
+        assert!(
+            top as f32 >= dirt as f32,
+            "grass tops ({top}) must dominate dirt tops ({dirt}) in the surface slab"
+        );
+    }
+
+    /// Every emitted triangle must agree with its attribute normal (CCW
+    /// outward) and every normal must be an exact world cardinal. Catches
+    /// inverted winding (faces visible from inside = "2-sided squares") and
+    /// skewed normals (flat wrong shading) on ANY emitter path.
+    fn assert_mesh_orientation(verts: &[Vertex], indices: &[u32], ctx: &str) {
+        const CARDINALS: [[f32; 3]; 6] = [
+            [1.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, -1.0],
+        ];
+        assert_eq!(indices.len() % 3, 0, "{ctx}: index count");
+        for tri in indices.chunks_exact(3) {
+            for &i in tri {
+                assert!(
+                    (i as usize) < verts.len(),
+                    "{ctx}: index {i} out of bounds ({} verts)",
+                    verts.len()
+                );
+            }
+            let a = verts[tri[0] as usize];
+            let n = Vec3::from_array(a.normal);
+            assert!(
+                CARDINALS.contains(&a.normal),
+                "{ctx}: non-cardinal normal {:?}",
+                a.normal
+            );
+            // All 3 verts of a flat-shaded tri share the normal.
+            for &i in &tri[1..] {
+                assert_eq!(
+                    verts[i as usize].normal, a.normal,
+                    "{ctx}: mixed normals in one triangle"
+                );
+            }
+            let b = verts[tri[1] as usize];
+            let c = verts[tri[2] as usize];
+            let e1 = Vec3::from_array(b.position) - Vec3::from_array(a.position);
+            let e2 = Vec3::from_array(c.position) - Vec3::from_array(a.position);
+            let geo = e1.cross(e2);
+            assert!(
+                geo.length_squared() > 1e-12,
+                "{ctx}: degenerate triangle"
+            );
+            assert!(
+                geo.dot(n) > 0.0,
+                "{ctx}: winding opposes normal {:?} (geo {:?})",
+                a.normal,
+                geo
+            );
+        }
+    }
+
+    #[test]
+    fn all_section_emitters_orient_faces_outward() {
+        let world = World::with_shunk();
+        // Near: greedy + per-voxel + ore + trees. Far: HLOD tops + skirts.
+        for (cam, ctx) in [
+            (near_cam(), "near"),
+            (Vec3::new(8.0, 30.0, -80.0), "hlod"),
+        ] {
+            for cy in 0..MESH_SECTIONS_Y {
+                let (v, i, _, _, _) = build_section_mesh(&world, 1, cy, 1, cam, cam);
+                if i.is_empty() {
+                    continue;
+                }
+                assert_mesh_orientation(&v, &i, &format!("{ctx} cy={cy}"));
+            }
+            let (v, i, _, _, _) = build_chunk_mesh(&world, 1, 1, cam, cam);
+            if !i.is_empty() {
+                assert_mesh_orientation(&v, &i, &format!("{ctx} column"));
+            }
+        }
+    }
+
+
+}

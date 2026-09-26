@@ -57,14 +57,18 @@ pub fn bare_hand_dig_interval(material: Material) -> Duration {
     const STONE_MS: u64 = 640;
     let ms = match material {
         Material::Bedrock => u64::MAX / 4,
-        Material::BlackStone => STONE_MS.saturating_mul(4).saturating_mul(BARE_HAND_DIG_MULT),
+        Material::BlackStone => STONE_MS
+            .saturating_mul(4)
+            .saturating_mul(BARE_HAND_DIG_MULT),
         Material::Stone
         | Material::VillageStone
         | Material::Cobblestone
+        | Material::RoadCobble
         | Material::Coal
         | Material::Sapphire
         | Material::Ruby
-        | Material::Emerald => STONE_MS.saturating_mul(BARE_HAND_DIG_MULT),
+        | Material::Emerald
+        | Material::ManaCrystal => STONE_MS.saturating_mul(BARE_HAND_DIG_MULT),
         _ => DIRT_MS.saturating_mul(BARE_HAND_DIG_MULT),
     };
     Duration::from_millis(ms.max(1))
@@ -76,7 +80,10 @@ impl ToolId {
             crate::hud::HotbarItem::Pickaxe => Some(Self::WoodenPickaxe),
             crate::hud::HotbarItem::Sword => Some(Self::Special1Sword),
             crate::hud::HotbarItem::Axe => Some(Self::AxeStub),
-            crate::hud::HotbarItem::Empty => None,
+            crate::hud::HotbarItem::Empty
+            | crate::hud::HotbarItem::Shield
+            | crate::hud::HotbarItem::Consumable
+            | crate::hud::HotbarItem::Magic => None,
         }
     }
 
@@ -194,11 +201,15 @@ impl ToolDef {
             Material::Stone
             | Material::VillageStone
             | Material::Cobblestone
+            | Material::RoadCobble
             | Material::Coal
             | Material::Sapphire
             | Material::Ruby
-            | Material::Emerald => self.dig.stone_cost.max(1),
-            Material::Dirt | Material::Grass | Material::Sand => self.dig.dirt_cost.max(1),
+            | Material::Emerald
+            | Material::ManaCrystal => self.dig.stone_cost.max(1),
+            Material::Dirt | Material::Grass | Material::Sand | Material::Mud => {
+                self.dig.dirt_cost.max(1)
+            }
             Material::Wood
             | Material::WoodPlanks
             | Material::Leaves
@@ -219,9 +230,11 @@ impl ToolDef {
             | Material::Chest
             | Material::Glass
             | Material::Door
-            | Material::Water => {
-                self.dig.dirt_cost.max(1)
-            }
+            | Material::Torch
+            | Material::Apple
+            | Material::Beehive
+            | Material::Water
+            | Material::ThermalWater => self.dig.dirt_cost.max(1),
         }
     }
 
@@ -232,10 +245,12 @@ impl ToolDef {
             Material::Stone
             | Material::VillageStone
             | Material::Cobblestone
+            | Material::RoadCobble
             | Material::Coal
             | Material::Sapphire
             | Material::Ruby
-            | Material::Emerald => self.dig.stone_ms,
+            | Material::Emerald
+            | Material::ManaCrystal => self.dig.stone_ms,
             _ => self.dig.dirt_ms,
         };
         Duration::from_millis(ms.max(1))

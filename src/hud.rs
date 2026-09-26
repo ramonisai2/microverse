@@ -12,7 +12,7 @@ const ATLAS_ROWS: u32 = 6;
 /// Hotbar capacity (weapon / tool slots).
 pub const HOTBAR_SLOTS: usize = 4;
 /// Atlas row for inventory item icons (dirt…emerald).
-const ITEM_ATLAS_ROW: u32 = 4;
+pub(crate) const ITEM_ATLAS_ROW: u32 = 4;
 /// Atlas row for stack-count digits 0–9.
 const DIGIT_ATLAS_ROW: u32 = 5;
 
@@ -45,6 +45,138 @@ pub enum HudAction {
     InventoryBackdrop,
     /// Beige panel body — absorb clicks without closing.
     InventoryPanel,
+    /// Main-menu row: brand new game (ignores the autosave).
+    MenuNewGame,
+    /// Main-menu row: continue the saved game.
+    MenuLoadGame,
+    /// Main-menu row: open the voxel editor.
+    MenuEditor,
+    /// Main-menu backdrop — swallow clicks, do nothing.
+    MenuBackdrop,
+    /// Editor placeholder: back to the main menu.
+    MenuBack,
+    /// Native editor: one intent (select, transform step, file action).
+    Ed(EditorAction),
+}
+
+/// What a native-editor button does. Every button is one discrete step so the
+/// same panel works with a mouse, a finger or the keyboard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditorAction {
+    /// Move the entity-list window.
+    ScrollPrev,
+    ScrollNext,
+    /// Pick another entity from the list.
+    SelPrev,
+    SelNext,
+    /// Cycle the type tag of the selected entity.
+    KindPrev,
+    KindNext,
+    /// File / scene actions.
+    Add,
+    Duplicate,
+    Delete,
+    Save,
+    Load,
+    Back,
+    /// Transform steps: position ±0.5 block.
+    PosXDec,
+    PosXInc,
+    PosYDec,
+    PosYInc,
+    PosZDec,
+    PosZInc,
+    /// Rotation ±15°.
+    RotXDec,
+    RotXInc,
+    RotYDec,
+    RotYInc,
+    RotZDec,
+    RotZInc,
+    /// Scale ±10 %.
+    SclXDec,
+    SclXInc,
+    SclYDec,
+    SclYInc,
+    SclZDec,
+    SclZInc,
+    /// Shear ±0.1.
+    SkewDec,
+    SkewInc,
+    /// Local box size ±0.5 block (bigger marker = more voxels in game).
+    SizeDec,
+    SizeInc,
+    /// Open one collapsible category panel (replaces "all controls at once").
+    OpenPanel(EditorPanel),
+    /// Close the open panel: back to just the entity list + the menu button.
+    ClosePanel,
+    /// Pick state `i` of the selected entity (`StateSel`, not a step).
+    StateSel(usize),
+    /// Cycle the active state (wraps; a no-op without states).
+    StatePrev,
+    StateNext,
+    /// Add a state seeded with the entity's own mesh, duplicate it, or drop it.
+    StateAdd,
+    StateDup,
+    StateDel,
+    /// Import the next animation clip from `assets/animations/`, or export the
+    /// open one to the editor's clip folder. The import cycles like `Load`
+    /// does for scenes (there is no file picker in the HUD).
+    ClipLoad,
+    ClipSave,
+    /// Undo / redo the last document change (Fase 6: blocking for refining
+    /// keyframes by hand).
+    Undo,
+    Redo,
+    /// Pick the active keyframe of the open clip (wraps), or move it in time.
+    KeyframeSel(usize),
+    KeyframePrev,
+    KeyframeNext,
+    /// `t` of the active keyframe, ±`KF_TIME_STEP` seconds.
+    KeyframeTimeDec,
+    KeyframeTimeInc,
+    /// Pick the joint the steppers drive (wraps over the 12 canonical joints).
+    JointPrev,
+    JointNext,
+    /// What the transform steppers drive: the entity/state, or one joint of the
+    /// active keyframe. Set from the ANIMAR panel.
+    EditEntity,
+    EditJoint,
+}
+
+/// Collapsible categories of the native editor. `None` (in `EditorState::panel`)
+/// means no panel is open, so the screen only carries the entity selection and
+/// the menu button.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditorPanel {
+    Transform,
+    Estado,
+    Voxels,
+    Animacion,
+    Archivo,
+}
+
+impl EditorPanel {
+    /// The five categories, in menu order.
+    pub const ALL: [EditorPanel; 5] = [
+        Self::Transform,
+        Self::Estado,
+        Self::Voxels,
+        Self::Animacion,
+        Self::Archivo,
+    ];
+
+    /// Button label. ASCII caps only: `glyph5x7` has no accented glyphs, so
+    /// "ANIMAR" (not "ANIMACIÓN") and no `Ñ` in new labels.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Transform => "TRANSFORM",
+            Self::Estado => "ESTADO",
+            Self::Voxels => "VOXELS",
+            Self::Animacion => "ANIMAR",
+            Self::Archivo => "ARCHIVO",
+        }
+    }
 }
 
 /// What an inventory / hotbar slot holds (icons for now; gameplay hooks later).
@@ -53,18 +185,53 @@ pub enum HudAction {
 pub enum HotbarItem {
     Empty,
     Sword,
+    Shield,
     Pickaxe,
     Axe,
+    Consumable,
+    Magic,
+}
+
+/// Columnas de la fila 3 del atlas (iconos del hotbar).
+///
+/// Fuente única de verdad: `HotbarItem::atlas_col` las consulta y
+/// `build_hud_atlas` las hornea. Si añades una columna, toca solo aquí y el
+/// test `every_hotbar_item_has_an_icon` lo detecta si te olvidas de hornearla.
+mod hotbar_col {
+    pub const SWORD: u32 = 0;
+    pub const SHIELD: u32 = 1;
+    pub const PICKAXE: u32 = 2;
+    pub const AXE: u32 = 3;
+    pub const CONSUMABLE: u32 = 4;
+    pub const MAGIC: u32 = 5;
 }
 
 impl HotbarItem {
     /// Atlas column on row 3 (hotbar icons).
     fn atlas_col(self) -> Option<u32> {
+        use hotbar_col::*;
         match self {
             Self::Empty => None,
-            Self::Sword => Some(0),
-            Self::Pickaxe => Some(1),
-            Self::Axe => Some(2),
+            Self::Sword => Some(SWORD),
+            Self::Shield => Some(SHIELD),
+            Self::Pickaxe => Some(PICKAXE),
+            Self::Axe => Some(AXE),
+            Self::Consumable => Some(CONSUMABLE),
+            Self::Magic => Some(MAGIC),
+        }
+    }
+
+    /// Nombre para depuración / log.
+    #[allow(dead_code)]
+    fn label(self) -> &'static str {
+        match self {
+            Self::Empty => "vacio",
+            Self::Sword => "espada",
+            Self::Shield => "escudo",
+            Self::Pickaxe => "pico",
+            Self::Axe => "hacha",
+            Self::Consumable => "consumible",
+            Self::Magic => "magia",
         }
     }
 }
@@ -75,6 +242,11 @@ pub struct Hotbar {
     pub slots: [HotbarItem; HOTBAR_SLOTS],
     /// Currently drawn / held item. Press the same key again to store it.
     pub selected: Option<usize>,
+    /// Frame counter when slot 1 was last modified with shift+clic.
+    /// Used for the "cool-down" of weapon+shield combination.
+    pub shift_cooldown: u64,
+    /// Número de combinaciones arma+escudo realizadas este "session".
+    pub combo_count: u32,
 }
 
 impl Default for Hotbar {
@@ -83,20 +255,36 @@ impl Default for Hotbar {
             slots: [
                 HotbarItem::Sword,
                 HotbarItem::Pickaxe,
-                HotbarItem::Axe,
-                HotbarItem::Empty,
+                HotbarItem::Consumable,
+                HotbarItem::Magic,
             ],
-            // Start with pickaxe in hand.
+            // Start with pickaxe in hand (slot 1 → herramienta).
             selected: Some(1),
+            shift_cooldown: 0,
+            combo_count: 0,
         }
     }
 }
 
 impl Hotbar {
     /// Select slot, or unequip if that slot is already equipped.
-    pub fn press_slot(&mut self, index: usize) {
+    /// Para el slot 1, si se presiona con shift, intenta combinar/alternar
+    /// el elemento secundario (escudo) en estilo Zelda TotK/BOTW.
+    pub fn press_slot(&mut self, index: usize, shift: bool) {
         if index >= HOTBAR_SLOTS {
             return;
+        }
+        // Slot 1 combinación arma+escudo (solo si shift está activo).
+        if index == 0 && shift {
+            // Cool-down simple: evitar múltiples combinaciones rápidas.
+            if self.frame_count() - self.shift_cooldown < 10 {
+                // Demasiado pronto; ignorar.
+            } else {
+                self.combine_weapon_shield();
+                self.shift_cooldown = self.frame_count();
+                self.combo_count = self.combo_count.saturating_add(1);
+                return;
+            }
         }
         if self.slots[index] == HotbarItem::Empty {
             return;
@@ -108,8 +296,24 @@ impl Hotbar {
         }
     }
 
+    fn frame_count(&self) -> u64 {
+        // Placeholder: en producción esto vendría del renderer.frame_index.
+        // Por ahora usamos 0 para que la lógica compile.
+        0
+    }
+
+    fn combine_weapon_shield(&mut self) {
+        // Lógica de combinación estilo Zelda: ciclar espada→escudo→espada→vacio...
+        match self.selected_item() {
+            HotbarItem::Sword => self.slots[0] = HotbarItem::Shield,
+            HotbarItem::Shield => self.slots[0] = HotbarItem::Empty,
+            HotbarItem::Empty => self.slots[0] = HotbarItem::Sword,
+            _ => {} // consumible/magia: no afecta el ciclo weapon/shield
+        }
+    }
+
     pub fn select(&mut self, index: usize) {
-        self.press_slot(index);
+        self.press_slot(index, false);
     }
 
     pub fn selected_item(&self) -> HotbarItem {
@@ -124,6 +328,16 @@ impl Hotbar {
 
     pub fn holding_sword(&self) -> bool {
         self.selected_item() == HotbarItem::Sword
+    }
+
+    /// Get the current weapon/shield state for slot 1.
+    /// El slot 0 cicla Sword→Shield→Empty, así que nunca hay ambos a la vez.
+    pub fn slot1_state(&self) -> &'static str {
+        match self.selected_item() {
+            HotbarItem::Sword => "espada",
+            HotbarItem::Shield => "escudo",
+            _ => "vacio",
+        }
     }
 
     /// Equipped tool identity for mining / hero mesh (None = empty hands).
@@ -203,19 +417,23 @@ pub fn build_hud_atlas() -> RgbaImage {
     blit_bottle(&mut img, 2, 2, false);
     blit_bottle(&mut img, 3, 2, true);
     blit_label(&mut img, 4, 2, b"INV", ink); // spans into col 5
+    blit_boots(&mut img, 6, 2); // DepthBoots (la fila de items está llena)
 
     // Row 3: hotbar — snapshot of the real held mesh (same orient/grip/scale).
+    // Las columnas salen de `hotbar_col` (fuente única de verdad).
+    use hotbar_col as HC;
     blit_held_tool_snapshot(
         &mut img,
-        0,
+        HC::SWORD,
         3,
         crate::entity_model::sword_model(),
         &crate::items::spawn_special1_sword().def.attach,
         crate::hero::ToolIconBake::default(),
     );
+    blit_shield(&mut img, HC::SHIELD, 3);
     blit_held_tool_snapshot(
         &mut img,
-        1,
+        HC::PICKAXE,
         3,
         crate::entity_model::pickaxe_model(),
         &crate::items::spawn_wooden_pickaxe().def.attach,
@@ -224,7 +442,9 @@ pub fn build_hud_atlas() -> RgbaImage {
             size_mul: 0.9,
         },
     );
-    blit_axe(&mut img, 2, 3);
+    blit_axe(&mut img, HC::AXE, 3);
+    blit_bottle(&mut img, HC::CONSUMABLE, 3, true);
+    blit_magic(&mut img, HC::MAGIC, 3);
 
     // Row 4: inventory material icons
     blit_inv_block(&mut img, 0, ITEM_ATLAS_ROW, [132, 96, 60], false); // dirt
@@ -486,6 +706,107 @@ fn blit_axe(img: &mut RgbaImage, col: u32, row: u32) {
             let c = if x + 1 == 13 + w { edge } else { blade };
             put(img, ox as i32 + x, y, c);
         }
+    }
+}
+
+/// Botas de profundidad: dos botas voxel con suela de goma.
+fn blit_boots(img: &mut RgbaImage, col: u32, row: u32) {
+    let (ox, oy) = tile_origin(col, row);
+    let leather = Rgba([126, 84, 48, 255]);
+    let dark = Rgba([84, 54, 30, 255]);
+    let sole = Rgba([40, 42, 48, 255]);
+    let hi = Rgba([156, 112, 68, 255]);
+    for (ox_off, wide) in [(6i32, 9i32), (17, 9)] {
+        // Suela
+        for y in 24..27 {
+            for x in ox_off..(ox_off + wide) {
+                put(img, ox as i32 + x, oy as i32 + y, sole);
+            }
+        }
+        // Cuerpo (con puntera más ancha abajo)
+        for y in 12..24 {
+            let extra = if y >= 20 { 1 } else { 0 };
+            for x in (ox_off + 1 - extra)..(ox_off + wide - 1 + extra) {
+                let c = if y < 15 {
+                    hi
+                } else if x <= ox_off + 1 || x >= ox_off + wide - 2 {
+                    dark
+                } else {
+                    leather
+                };
+                put(img, ox as i32 + x, oy as i32 + y, c);
+            }
+        }
+        // Boca
+        for x in ox_off + 1..(ox_off + wide - 1) {
+            put(img, ox as i32 + x, oy as i32 + 11, dark);
+        }
+    }
+}
+
+/// Escudo: silueta voxel tipo Zelda (kite/heater), sin asset de malla todavía.
+fn blit_shield(img: &mut RgbaImage, col: u32, row: u32) {
+    let (ox, oy) = tile_origin(col, row);
+    let wood = Rgba([120, 75, 40, 255]);
+    let face = Rgba([70, 96, 150, 255]);
+    let hi = Rgba([96, 128, 190, 255]);
+    let edge = Rgba([28, 32, 48, 255]);
+    // Silueta: se estrecha hacia abajo (kite).
+    for y in 4..27 {
+        let t = y - 4;
+        // Ancho: 20 en el centro, cónico en punta abajo.
+        let half = if t < 10 {
+            10 - t / 2
+        } else {
+            10 - (t - 10) * 2
+        }
+        .max(1);
+        let x0 = 16 - half;
+        for x in x0..(16 + half) {
+            let c = if x == x0 || x + 1 == 16 + half {
+                edge
+            } else if x >= 18 && x <= 20 && t < 12 {
+                hi
+            } else {
+                face
+            };
+            put(img, ox as i32 + x, oy as i32 + y, c);
+        }
+    }
+    // Empuñadura de madera en la parte superior.
+    for x in 11..21 {
+        put(img, ox as i32 + x, oy as i32 + 2, wood);
+        put(img, ox as i32 + x, oy as i32 + 3, wood);
+    }
+}
+
+/// Magia: gema flotante con destello (stub, sin asset todavía).
+fn blit_magic(img: &mut RgbaImage, col: u32, row: u32) {
+    let (ox, oy) = tile_origin(col, row);
+    let core = Rgba([236, 240, 255, 255]);
+    let glow = Rgba([150, 130, 240, 255]);
+    let deep = Rgba([88, 66, 180, 255]);
+    // Rombo centrado.
+    for y in 6..26i32 {
+        let dy = (y - 16).abs();
+        let half = 9 - dy;
+        if half <= 0 {
+            continue;
+        }
+        for x in (16 - half)..(16 + half) {
+            let c = if x <= 13 || x >= 19 {
+                deep
+            } else if x == 15 || x == 16 {
+                core
+            } else {
+                glow
+            };
+            put(img, ox as i32 + x, oy as i32 + y, c);
+        }
+    }
+    // Chispas alrededor.
+    for (x, y) in [(7, 9), (24, 11), (8, 23), (23, 22)] {
+        put(img, ox as i32 + x, oy as i32 + y, core);
     }
 }
 
@@ -810,6 +1131,28 @@ fn push_panel(mesh: &mut HudMesh, rect: HudRect, logical_w: f32, logical_h: f32,
     // Solid panel: sample transparent corner of atlas, multiply by color.
     let (uv0, uv1) = atlas_uv(7, 0, 1);
     push_quad(mesh, rect, logical_w, logical_h, uv0, uv1, rgba);
+}
+
+/// Global HUD scale: Android shrinks overlay furniture so buttons cover less
+/// world. Desktop is 1.0 so the PC HUD is pixel-identical to before.
+pub fn hud_scale() -> f32 {
+    if cfg!(target_os = "android") {
+        0.8
+    } else {
+        1.0
+    }
+}
+
+/// Solid quad with no hit region — used by the touch overlay, which routes its
+/// input through `TouchControls` rects instead of `HudMesh::hits`.
+pub fn push_solid_quad(
+    mesh: &mut HudMesh,
+    rect: HudRect,
+    logical_w: f32,
+    logical_h: f32,
+    rgba: [f32; 4],
+) {
+    push_panel(mesh, rect, logical_w, logical_h, rgba);
 }
 
 fn push_icon_btn(
@@ -1409,6 +1752,130 @@ pub fn build_hotbar_hud(
 }
 
 /// Bottom-left status: hearts (life) + empty/filled bottles (magic).
+/// Pantalla de carga: anillo de progreso + porcentaje, con fundido de salida.
+///
+/// `pct` 0..1 = progreso de carga. `fade` 1 = opaco, 0 = ya no se dibuja
+/// (el mundo queda revelado con el anillo cerrado).
+pub fn build_loading_hud(pct: f32, logical_w: f32, logical_h: f32, fade: f32) -> HudMesh {
+    let mut mesh = HudMesh::default();
+    let fade = fade.clamp(0.0, 1.0);
+    if fade <= 0.01 {
+        return mesh;
+    }
+    let pct = pct.clamp(0.0, 1.0);
+
+    const SEGMENTS: u32 = 24;
+    let filled = (pct * SEGMENTS as f32).round() as u32;
+    let seg_angle = std::f32::consts::TAU / SEGMENTS as f32;
+
+    // Velo a pantalla completa.
+    push_panel(
+        &mut mesh,
+        HudRect {
+            x: 0.0,
+            y: 0.0,
+            w: logical_w,
+            h: logical_h,
+        },
+        logical_w,
+        logical_h,
+        [0.02, 0.03, 0.05, 0.72 * fade],
+    );
+
+    // Anillo: 24 segmentos, se rellenan en sentido horario desde las 12.
+    let cx = logical_w * 0.5;
+    let cy = logical_h * 0.5;
+    let radius = (logical_w.min(logical_h) * 0.16).max(48.0);
+    let thickness = radius * 0.18;
+    let arc = (std::f32::consts::TAU / SEGMENTS as f32 * radius * 0.82).max(2.0);
+    for i in 0..SEGMENTS {
+        // Ángulo de las 12 en sentido horario (y hacia abajo ⇒ suma).
+        let a = -std::f32::consts::FRAC_PI_2 + seg_angle * i as f32;
+        let (s, c) = a.sin_cos();
+        // El rect local tiene h radial; se rota para que apunte al radio.
+        let quad = HudRect {
+            x: cx + c * radius - arc * 0.5,
+            y: cy + s * radius - thickness * 0.5,
+            w: arc,
+            h: thickness,
+        };
+        let on = i < filled;
+        let alpha = if on { 0.95 * fade } else { 0.22 * fade };
+        let color = if on {
+            [0.95, 0.82, 0.45, alpha]
+        } else {
+            [0.75, 0.78, 0.85, alpha]
+        };
+        push_quad_rotated(
+            &mut mesh,
+            quad,
+            logical_w,
+            logical_h,
+            [0.0, 0.0],
+            [1.0, 1.0],
+            color,
+            a + std::f32::consts::FRAC_PI_2,
+        );
+    }
+
+    // Porcentaje bajo el anillo.
+    let label = format!("{}%", (pct * 100.0).round() as i32);
+    let px = 4.0;
+    let tw = text_width(&label, px);
+    push_text(
+        &mut mesh,
+        cx - tw * 0.5,
+        cy + radius + 18.0,
+        logical_w,
+        logical_h,
+        &label,
+        px,
+        [0.92, 0.92, 0.95, 0.9 * fade],
+    );
+    mesh
+}
+
+/// Mira de primera persona: cruz centrada, sin hit regions.
+pub fn build_crosshair_hud(logical_w: f32, logical_h: f32) -> HudMesh {
+    let mut mesh = HudMesh::default();
+    let cx = logical_w * 0.5;
+    let cy = logical_h * 0.5;
+    let arm = 7.0;
+    let thick = 1.6;
+    let gap = 4.0;
+    let color = [1.0, 1.0, 1.0, 0.85];
+    let rects = [
+        HudRect {
+            x: cx - arm * 0.5,
+            y: cy - gap - thick,
+            w: arm,
+            h: thick,
+        },
+        HudRect {
+            x: cx - arm * 0.5,
+            y: cy + gap,
+            w: arm,
+            h: thick,
+        },
+        HudRect {
+            x: cx - gap - thick,
+            y: cy - arm * 0.5,
+            w: thick,
+            h: arm,
+        },
+        HudRect {
+            x: cx + gap,
+            y: cy - arm * 0.5,
+            w: thick,
+            h: arm,
+        },
+    ];
+    for r in rects {
+        push_panel(&mut mesh, r, logical_w, logical_h, color);
+    }
+    mesh
+}
+
 pub fn build_status_hud(
     hearts: u32,
     max_hearts: u32,
@@ -1537,7 +2004,8 @@ fn push_stack_icon(
         w: rect.w - 8.0,
         h: rect.h - 10.0,
     };
-    let (uv0, uv1) = atlas_uv(stack.kind.atlas_col(), ITEM_ATLAS_ROW, 1);
+    let (col, row) = stack.kind.atlas_tile();
+    let (uv0, uv1) = atlas_uv(col, row, 1);
     let tint = stack.kind.tint_rgb();
     let mul = if stack.kind.is_cube() {
         [1.0, 1.0, 1.0, 1.0]
@@ -1617,6 +2085,1016 @@ fn push_stack_count(
         );
         x += digit_w;
     }
+}
+
+/// Rows of the main menu, in display order. Kept next to the builder so the
+/// keyboard index and the hit regions can never drift apart.
+pub const MENU_ROWS: [(&str, HudAction); 3] = [
+    ("PARTIDA NUEVA", HudAction::MenuNewGame),
+    ("PARTIDA GUARDADA", HudAction::MenuLoadGame),
+    ("MODO EDITOR", HudAction::MenuEditor),
+];
+
+/// First-screen selector: new game / saved game / editor.
+///
+/// `selected` is the keyboard-highlighted row (wrapped by the caller). The
+/// backdrop swallows every click so the world never reacts behind the menu.
+pub fn build_main_menu_hud(
+    selected: usize,
+    has_save: bool,
+    logical_w: f32,
+    logical_h: f32,
+) -> HudMesh {
+    let mut mesh = HudMesh::default();
+    let screen = HudRect {
+        x: 0.0,
+        y: 0.0,
+        w: logical_w,
+        h: logical_h,
+    };
+    push_panel(
+        &mut mesh,
+        screen,
+        logical_w,
+        logical_h,
+        [0.03, 0.04, 0.07, 0.88],
+    );
+    mesh.hits.push(HudHitRegion {
+        action: HudAction::MenuBackdrop,
+        rect: screen,
+    });
+
+    let s = hud_scale();
+    let row_h = 46.0 * s;
+    let row_gap = 10.0 * s;
+    let row_w = 300.0 * s;
+    let block_h = MENU_ROWS.len() as f32 * row_h + (MENU_ROWS.len() as f32 - 1.0) * row_gap;
+    // Title sits above the rows; the whole block is vertically centered.
+    let title_h = 30.0 * s;
+    let top = (logical_h - (title_h + 26.0 * s + block_h)) * 0.5;
+
+    push_text(
+        &mut mesh,
+        (logical_w - text_width("MICROVERSE", 5.0 * s)) * 0.5,
+        top,
+        logical_w,
+        logical_h,
+        "MICROVERSE",
+        5.0 * s,
+        [0.98, 0.86, 0.42, 1.0],
+    );
+
+    let first_y = top + title_h + 26.0 * s;
+    for (i, (label, action)) in MENU_ROWS.iter().enumerate() {
+        let row = HudRect {
+            x: (logical_w - row_w) * 0.5,
+            y: first_y + i as f32 * (row_h + row_gap),
+            w: row_w,
+            h: row_h,
+        };
+        let is_sel = i == selected;
+        // "Partida guardada" stays readable but dimmed when there is no save.
+        let dim = *label == "PARTIDA GUARDADA" && !has_save;
+        let bg = if is_sel {
+            [0.16, 0.30, 0.46, 1.0]
+        } else {
+            [0.10, 0.12, 0.17, 0.92]
+        };
+        push_panel(&mut mesh, row, logical_w, logical_h, bg);
+        // Accent bar on the left of the highlighted row.
+        if is_sel {
+            push_panel(
+                &mut mesh,
+                HudRect {
+                    x: row.x,
+                    y: row.y,
+                    w: 5.0 * s,
+                    h: row.h,
+                },
+                logical_w,
+                logical_h,
+                [0.98, 0.86, 0.42, 1.0],
+            );
+        }
+        let text_px = 3.0 * s;
+        let tx = row.x + 20.0 * s;
+        let ty = row.y + (row_h - 7.0 * text_px) * 0.5;
+        let color = if dim {
+            [0.58, 0.60, 0.66, 1.0]
+        } else if is_sel {
+            [1.0, 1.0, 1.0, 1.0]
+        } else {
+            [0.84, 0.86, 0.92, 1.0]
+        };
+        push_text(&mut mesh, tx, ty, logical_w, logical_h, label, text_px, color);
+        mesh.hits.push(HudHitRegion {
+            action: *action,
+            rect: row,
+        });
+    }
+    mesh
+}
+
+/// Filas de la lista de entidades que caben en el panel del editor.
+pub const EDITOR_VISIBLE_ROWS: usize = 5;
+
+/// Botón de texto centrado: fondo + etiqueta + hit region.
+fn push_text_btn(
+    mesh: &mut HudMesh,
+    rect: HudRect,
+    logical_w: f32,
+    logical_h: f32,
+    label: &str,
+    px: f32,
+    bg: [f32; 4],
+    action: HudAction,
+) {
+    push_panel(mesh, rect, logical_w, logical_h, bg);
+    push_text(
+        mesh,
+        rect.x + (rect.w - text_width(label, px)) * 0.5,
+        rect.y + (rect.h - 7.0 * px) * 0.5,
+        logical_w,
+        logical_h,
+        label,
+        px,
+        [0.92, 0.94, 0.98, 1.0],
+    );
+    mesh.hits.push(HudHitRegion { action, rect });
+}
+
+/// The editor's view state, grouped so the panel builder does not grow one
+/// parameter per selection level (`docs/plan_fase6.md` §3.3). Four levels
+/// deep now: entity → state → keyframe → joint.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EditorView {
+    /// Selected entity (`usize::MAX` = none).
+    pub selected: usize,
+    /// First visible row of the entity list.
+    pub scroll: usize,
+    /// Active state of the selected entity.
+    pub state_sel: usize,
+    /// Active keyframe of the open clip.
+    pub kf_sel: usize,
+    /// Active joint, index into `animation::joint_names()`.
+    pub joint_sel: usize,
+    /// True when the transform steppers drive the joint instead of the entity.
+    pub editing_joint: bool,
+    /// Collapsible category open (`None` = menu closed).
+    pub panel: Option<EditorPanel>,
+}
+
+/// Native editor panel: entity list (left), selection readout (right) and the
+/// menu button (bottom-left). Everything else lives inside a collapsible
+/// category panel, drawn only when `view.panel` is `Some` — with `None` the
+/// screen carries just the selection and the menu.
+///
+/// `entities` is the live scene, `view` the cursors and open panel, and `clip`
+/// the animation clip open in the editor. Only the buttons are hit regions, so
+/// the world stays visible and tappable behind the panel.
+pub fn build_editor_hud(
+    scene_name: &str,
+    status: &str,
+    entities: &[crate::editor::EditorEntity],
+    view: EditorView,
+    // Animation clip open in the editor (`None` = none imported yet).
+    clip: Option<&crate::editor_clip::EditorClip>,
+    logical_w: f32,
+    logical_h: f32,
+) -> HudMesh {
+    let (selected, scroll, state_sel, kf_sel, joint_sel) = (
+        view.selected, view.scroll, view.state_sel, view.kf_sel, view.joint_sel,
+    );
+    let panel = view.panel;
+    let mut mesh = HudMesh::default();
+    let s = hud_scale();
+    // Ancho mínimo para la etiqueta más larga del panel ("tipo+" = 5 glifos
+    // = 60 px con `text_px` 2.0). Con botones de 40 px las etiquetas se
+    // solapaban.
+    let btn = 68.0 * s;
+    let gap = 6.0 * s;
+    let pad = 10.0 * s;
+    let text_px = 2.0 * s;
+    let dim_bg = [0.08, 0.09, 0.13, 0.86];
+    let btn_bg = [0.16, 0.19, 0.26, 0.95];
+    let accent = [0.20, 0.38, 0.55, 0.98];
+
+    // ── Top strip: scene name + last message ──────────────────────────────
+    let top = HudRect {
+        x: gap,
+        y: gap,
+        w: logical_w - gap * 2.0,
+        // Alto para que el título (px 2.2) y el mensaje (px 1.8) no se
+        // pisen: 4 + 15 + 3 + 12 + 2.
+        h: 38.0 * s,
+    };
+    push_panel(&mut mesh, top, logical_w, logical_h, dim_bg);
+    push_text(
+        &mut mesh,
+        top.x + pad,
+        top.y + 4.0 * s,
+        logical_w,
+        logical_h,
+        &format!("EDITOR · {scene_name}"),
+        2.2 * s,
+        [0.98, 0.86, 0.42, 1.0],
+    );
+    if !status.is_empty() {
+        push_text(
+            &mut mesh,
+            top.x + pad,
+            top.y + 23.0 * s,
+            logical_w,
+            logical_h,
+            status,
+            1.8 * s,
+            [0.78, 0.82, 0.88, 1.0],
+        );
+    }
+
+    // ── Left: entity list ─────────────────────────────────────────────────
+    let list_w = 150.0 * s;
+    let rows = EDITOR_VISIBLE_ROWS.min(entities.len().max(1));
+    let list = HudRect {
+        x: gap,
+        y: top.y + top.h + gap,
+        w: list_w,
+        h: pad * 2.0 + 16.0 * s + rows as f32 * (btn + gap),
+    };
+    push_panel(&mut mesh, list, logical_w, logical_h, dim_bg);
+    let mut oy = list.y + pad;
+    push_text(
+        &mut mesh,
+        list.x + pad,
+        oy,
+        logical_w,
+        logical_h,
+        &format!("ENTIDADES ({})", entities.len()),
+        text_px,
+        [0.70, 0.76, 0.84, 1.0],
+    );
+    oy += 16.0 * s;
+    for (i, entity) in entities
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(EDITOR_VISIBLE_ROWS)
+    {
+        let row = HudRect {
+            x: list.x + pad,
+            y: oy,
+            w: list.w - pad * 2.0,
+            h: btn,
+        };
+        let is_sel = i == selected;
+        let bg = if is_sel { accent } else { btn_bg };
+        push_panel(&mut mesh, row, logical_w, logical_h, bg);
+        // Type tag colour chip + "label (kind)".
+        let c = entity.kind_color();
+        push_panel(
+            &mut mesh,
+            HudRect {
+                x: row.x,
+                y: row.y,
+                w: 4.0 * s,
+                h: row.h,
+            },
+            logical_w,
+            logical_h,
+            [c[0], c[1], c[2], 1.0],
+        );
+        let label = format!("{} {}", i + 1, entity.label());
+        push_text(
+            &mut mesh,
+            row.x + 10.0 * s,
+            row.y + (row.h - 7.0 * text_px) * 0.5,
+            logical_w,
+            logical_h,
+            &label,
+            text_px,
+            [0.92, 0.94, 0.98, 1.0],
+        );
+        mesh.hits.push(HudHitRegion {
+            action: HudAction::Ed(EditorAction::SelNext),
+            rect: row,
+        });
+        oy += btn + gap;
+    }
+    // Scroll window (only when the list does not fit).
+    if entities.len() > EDITOR_VISIBLE_ROWS {
+        let sb = 22.0 * s;
+        for (i, (label, act)) in [("◀", EditorAction::ScrollPrev), ("▶", EditorAction::ScrollNext)]
+            .into_iter()
+            .enumerate()
+        {
+            push_text_btn(
+                &mut mesh,
+                HudRect {
+                    x: list.x + pad + i as f32 * (sb + gap),
+                    y: list.y + list.h - sb - pad,
+                    w: sb,
+                    h: sb,
+                },
+                logical_w,
+                logical_h,
+                label,
+                text_px,
+                btn_bg,
+                HudAction::Ed(act),
+            );
+        }
+    }
+
+    // ── Right: transform readout of the selection ─────────────────────────
+    if let Some(entity) = entities.get(selected) {
+        let state_idx = entity.clamp_state(state_sel);
+        // "POS 8.5 25.2 24.0" son 15 glifos: a px 1.8 son 162 px, de ahí el
+        // ancho (el panel anterior lo cortaba por la derecha).
+        let info_w = 250.0 * s;
+        let info = HudRect {
+            x: logical_w - info_w - gap,
+            y: top.y + top.h + gap,
+            w: info_w,
+            h: 104.0 * s,
+        };
+        push_panel(&mut mesh, info, logical_w, logical_h, dim_bg);
+        let c = entity.kind_color();
+        push_panel(
+            &mut mesh,
+            HudRect {
+                x: info.x,
+                y: info.y,
+                w: 4.0 * s,
+                h: info.h,
+            },
+            logical_w,
+            logical_h,
+            [c[0], c[1], c[2], 1.0],
+        );
+        let px = 1.6 * s;
+        let mut iy = info.y + 8.0 * s;
+        let line = |mesh: &mut HudMesh, txt: String, iy: &mut f32| {
+            push_text(
+                mesh,
+                info.x + 10.0 * s,
+                *iy,
+                logical_w,
+                logical_h,
+                &txt,
+                px,
+                [0.88, 0.90, 0.95, 1.0],
+            );
+            *iy += 12.0 * s;
+        };
+        line(
+            &mut mesh,
+            format!("{} · {}", entity.label(), entity.kind),
+            &mut iy,
+        );
+        line(
+            &mut mesh,
+            format!("model {}", entity.effective_model(state_idx)),
+            &mut iy,
+        );
+        line(
+            &mut mesh,
+            format!(
+                "pos {:.1} {:.1} {:.1}",
+                entity.position[0], entity.position[1], entity.position[2]
+            ),
+            &mut iy,
+        );
+        line(
+            &mut mesh,
+            format!(
+                "rot {:.0} {:.0} {:.0}",
+                entity.rotation[0], entity.rotation[1], entity.rotation[2]
+            ),
+            &mut iy,
+        );
+        line(
+            &mut mesh,
+            format!(
+                "esc {:.2} {:.2} {:.2}",
+                entity.scale[0], entity.scale[1], entity.scale[2]
+            ),
+            &mut iy,
+        );
+        line(
+            &mut mesh,
+            format!(
+                "zes {:.2} · caja {:.1}",
+                entity.skew[2], entity.size[0]
+            ),
+            &mut iy,
+        );
+        // Which object the step buttons drive right now: the active state when
+        // the entity owns states, the entity itself otherwise.
+        line(
+            &mut mesh,
+            if entity.has_states() {
+                format!("editando estado {}/{}", state_idx + 1, entity.states.len())
+            } else {
+                "editando entidad".to_string()
+            },
+            &mut iy,
+        );
+    }
+
+    // ── Bottom-left: the menu button (the only always-on control) ─────────
+    let row_h = 24.0 * s;
+    let open = panel.is_some();
+    let menu = HudRect {
+        x: gap,
+        y: logical_h - row_h - gap,
+        w: 100.0 * s,
+        h: row_h,
+    };
+    push_text_btn(
+        &mut mesh,
+        menu,
+        logical_w,
+        logical_h,
+        if open { "CERRAR" } else { "MENU" },
+        text_px,
+        if open { accent } else { btn_bg },
+        // Closed → open the most-used category. Open → close everything.
+        if open {
+            HudAction::Ed(EditorAction::ClosePanel)
+        } else {
+            HudAction::Ed(EditorAction::OpenPanel(EditorPanel::Transform))
+        },
+    );
+
+    // ── Category column + panel content (only while a panel is open) ──────
+    if let Some(current) = panel {
+        let cat_w = 110.0 * s;
+        // px 1.8 so the longest label ("TRANSFORM", 9 glyphs) fits in cat_w.
+        let cat_px = 1.8 * s;
+        let col_bottom = menu.y - gap;
+        for (i, cat) in EditorPanel::ALL.iter().enumerate() {
+            let rect = HudRect {
+                x: gap,
+                y: col_bottom - (EditorPanel::ALL.len() - i) as f32 * (row_h + gap),
+                w: cat_w,
+                h: row_h,
+            };
+            let bg = if *cat == current { accent } else { btn_bg };
+            push_text_btn(
+                &mut mesh,
+                rect,
+                logical_w,
+                logical_h,
+                cat.label(),
+                cat_px,
+                bg,
+                HudAction::Ed(EditorAction::OpenPanel(*cat)),
+            );
+        }
+
+        match current {
+            // Same 4×6 grid and same actions as before — only *when* it is
+            // drawn changed (it now needs the panel open).
+            EditorPanel::Transform => {
+                let group_w = btn * 6.0 + gap * 5.0;
+                let bar_h = btn * 4.0 + gap * 3.0 + pad * 2.0;
+                let bar = HudRect {
+                    x: (logical_w - group_w - pad * 2.0) * 0.5,
+                    y: logical_h - bar_h - gap,
+                    w: group_w + pad * 2.0,
+                    h: bar_h,
+                };
+                push_panel(&mut mesh, bar, logical_w, logical_h, dim_bg);
+                let axes = ["X", "Y", "Z"];
+                let mut by = bar.y + pad;
+                for row_i in 0..4 {
+                    // Axes are laid out as dec/inc pairs; row 3 (skew) is a
+                    // single pair followed by selection / type cycling.
+                    let row_actions: [EditorAction; 6] = match row_i {
+                        0 => [
+                            EditorAction::PosXDec,
+                            EditorAction::PosXInc,
+                            EditorAction::PosYDec,
+                            EditorAction::PosYInc,
+                            EditorAction::PosZDec,
+                            EditorAction::PosZInc,
+                        ],
+                        1 => [
+                            EditorAction::RotXDec,
+                            EditorAction::RotXInc,
+                            EditorAction::RotYDec,
+                            EditorAction::RotYInc,
+                            EditorAction::RotZDec,
+                            EditorAction::RotZInc,
+                        ],
+                        2 => [
+                            EditorAction::SclXDec,
+                            EditorAction::SclXInc,
+                            EditorAction::SclYDec,
+                            EditorAction::SclYInc,
+                            EditorAction::SclZDec,
+                            EditorAction::SclZInc,
+                        ],
+                        _ => [
+                            EditorAction::SkewDec,
+                            EditorAction::SkewInc,
+                            EditorAction::SelPrev,
+                            EditorAction::SelNext,
+                            EditorAction::KindPrev,
+                            EditorAction::KindNext,
+                        ],
+                    };
+                    let row_labels: [&str; 6] = match row_i {
+                        0..=2 => [
+                            "", "", "", "", "", "",
+                        ],
+                        _ => [
+                            "zes-", "zes+", "ant", "sig", "tipo-", "tipo+",
+                        ],
+                    };
+                    for (i, act) in row_actions.iter().enumerate() {
+                        // Axis rows label themselves "X-", "X+"… per column.
+                        let axis_row = row_i <= 2;
+                        let dynamic;
+                        let label: &str = if axis_row {
+                            dynamic = format!("{}{}", axes[i / 2], if i % 2 == 0 { "-" } else { "+" });
+                            &dynamic
+                        } else {
+                            row_labels[i]
+                        };
+                        push_text_btn(
+                            &mut mesh,
+                            HudRect {
+                                x: bar.x + pad + i as f32 * (btn + gap),
+                                y: by,
+                                w: btn,
+                                h: btn,
+                            },
+                            logical_w,
+                            logical_h,
+                            label,
+                            text_px,
+                            btn_bg,
+                            HudAction::Ed(*act),
+                        );
+                    }
+                    by += btn + gap;
+                }
+            }
+            EditorPanel::Archivo => {
+                let fw = 100.0 * s;
+                let w = fw * 4.0 + gap * 3.0 + pad * 2.0;
+                let h = pad * 2.0 + 16.0 * s + row_h * 3.0 + gap * 2.0;
+                let bar = HudRect {
+                    x: (logical_w - w) * 0.5,
+                    y: logical_h - h - gap,
+                    w,
+                    h,
+                };
+                push_panel(&mut mesh, bar, logical_w, logical_h, dim_bg);
+                push_text(
+                    &mut mesh,
+                    bar.x + pad,
+                    bar.y + pad,
+                    logical_w,
+                    logical_h,
+                    EditorPanel::Archivo.label(),
+                    text_px,
+                    [0.98, 0.86, 0.42, 1.0],
+                );
+                // Fila 1: clips (import/export) y salida. Fila 2: escena.
+                // Fila 3: historial (también en Ctrl+Z / Ctrl+Shift+Z).
+                let file_actions: [(&str, EditorAction); 10] = [
+                    ("IMPORTAR", EditorAction::ClipLoad),
+                    ("EXPORTAR", EditorAction::ClipSave),
+                    ("VOLVER", EditorAction::Back),
+                    ("+AÑADIR", EditorAction::Add),
+                    ("COPIAR", EditorAction::Duplicate),
+                    ("BORRAR", EditorAction::Delete),
+                    ("GUARDAR", EditorAction::Save),
+                    ("CARGAR", EditorAction::Load),
+                    ("DESHACER", EditorAction::Undo),
+                    ("REHACER", EditorAction::Redo),
+                ];
+                for (i, (label, act)) in file_actions.iter().enumerate() {
+                    let bg = match *act {
+                        EditorAction::Back => [0.30, 0.16, 0.18, 0.95],
+                        EditorAction::Save | EditorAction::ClipSave => [0.16, 0.34, 0.24, 0.95],
+                        EditorAction::ClipLoad => [0.24, 0.22, 0.36, 0.95],
+                        EditorAction::Undo => [0.30, 0.26, 0.14, 0.95],
+                        EditorAction::Redo => [0.26, 0.20, 0.30, 0.95],
+                        _ => btn_bg,
+                    };
+                    push_text_btn(
+                        &mut mesh,
+                        HudRect {
+                            x: bar.x + pad + (i % 4) as f32 * (fw + gap),
+                            y: bar.y + pad + 16.0 * s + (i / 4) as f32 * (row_h + gap),
+                            w: fw,
+                            h: row_h,
+                        },
+                        logical_w,
+                        logical_h,
+                        label,
+                        text_px,
+                        bg,
+                        HudAction::Ed(*act),
+                    );
+                }
+            }
+            // Per-state mesh/palette/transform (schema v2). The rows are the
+            // states of the selected entity; the readout is the active one.
+            EditorPanel::Estado => {
+                let entity = entities.get(selected);
+                let states = entity.map(|e| e.states.as_slice()).unwrap_or(&[]);
+                let idx = entity.map(|e| e.clamp_state(state_sel)).unwrap_or(0);
+                let shown = states.len().min(EDITOR_VISIBLE_ROWS);
+                let fw = 100.0 * s;
+                let readout = 3.0 * 12.0 * s;
+                let w = fw * 3.0 + gap * 2.0 + pad * 2.0;
+                let h = pad * 2.0 + 16.0 * s + readout
+                    + shown as f32 * (row_h + gap)
+                    + (row_h + gap) * 2.0;
+                let bar = HudRect {
+                    x: (logical_w - w) * 0.5,
+                    y: logical_h - h - gap,
+                    w,
+                    h,
+                };
+                push_panel(&mut mesh, bar, logical_w, logical_h, dim_bg);
+                let px = 1.6 * s;
+                push_text(
+                    &mut mesh,
+                    bar.x + pad,
+                    bar.y + pad,
+                    logical_w,
+                    logical_h,
+                    &format!("ESTADOS ({})", states.len()),
+                    text_px,
+                    [0.98, 0.86, 0.42, 1.0],
+                );
+                // Reserved readout block: name / mesh / palette of the active
+                // state (or the hint when the entity has none).
+                let mut ty = bar.y + pad + 16.0 * s;
+                if states.is_empty() {
+                    push_text(
+                        &mut mesh,
+                        bar.x + pad,
+                        ty,
+                        logical_w,
+                        logical_h,
+                        "SIN ESTADOS: USA +NUEVO",
+                        px,
+                        [0.78, 0.82, 0.88, 1.0],
+                    );
+                } else {
+                    let st = &states[idx];
+                    for row in [
+                        format!("{}/{} · {}", idx + 1, states.len(), st.label()),
+                        format!(
+                            "mesh {}",
+                            if st.model.is_empty() {
+                                "hereda entidad"
+                            } else {
+                                &st.model
+                            }
+                        ),
+                        format!(
+                            "paleta {}",
+                            if st.palette.is_empty() {
+                                "del mesh"
+                            } else {
+                                &st.palette
+                            }
+                        ),
+                    ] {
+                        push_text(
+                            &mut mesh,
+                            bar.x + pad,
+                            ty,
+                            logical_w,
+                            logical_h,
+                            &row,
+                            px,
+                            [0.88, 0.90, 0.95, 1.0],
+                        );
+                        ty += 12.0 * s;
+                    }
+                }
+                // State rows → jump straight to one.
+                let mut ry = bar.y + pad + 16.0 * s + readout;
+                for (i, st) in states.iter().enumerate().take(EDITOR_VISIBLE_ROWS) {
+                    let rect = HudRect {
+                        x: bar.x + pad,
+                        y: ry,
+                        w: w - pad * 2.0,
+                        h: row_h,
+                    };
+                    push_text_btn(
+                        &mut mesh,
+                        rect,
+                        logical_w,
+                        logical_h,
+                        st.label(),
+                        1.8 * s,
+                        if i == idx { accent } else { btn_bg },
+                        HudAction::Ed(EditorAction::StateSel(i)),
+                    );
+                    ry += row_h + gap;
+                }
+                let buttons: [(&str, EditorAction); 5] = [
+                    ("ANT", EditorAction::StatePrev),
+                    ("SIG", EditorAction::StateNext),
+                    ("+NUEVO", EditorAction::StateAdd),
+                    ("COPIAR", EditorAction::StateDup),
+                    ("BORRAR", EditorAction::StateDel),
+                ];
+                let by = bar.y + pad + 16.0 * s + readout + shown as f32 * (row_h + gap);
+                for (i, (label, act)) in buttons.iter().enumerate() {
+                    let bg = if *act == EditorAction::StateDel {
+                        [0.30, 0.16, 0.18, 0.95]
+                    } else {
+                        btn_bg
+                    };
+                    push_text_btn(
+                        &mut mesh,
+                        HudRect {
+                            x: bar.x + pad + (i % 3) as f32 * (fw + gap),
+                            y: by + (i / 3) as f32 * (row_h + gap),
+                            w: fw,
+                            h: row_h,
+                        },
+                        logical_w,
+                        logical_h,
+                        label,
+                        text_px,
+                        bg,
+                        HudAction::Ed(*act),
+                    );
+                }
+            }
+            // Timeline + los 4 niveles de selección (Fase 6). El widget es nuevo:
+            // un eje temporal horizontal, no la lista vertical de entidades.
+            EditorPanel::Animacion => {
+                let fw = 100.0 * s;
+                let px = 1.6 * s;
+                let w = fw * 4.0 + gap * 3.0 + pad * 2.0;
+                let strip_h = 26.0 * s;
+                let h = pad * 2.0 + 16.0 * s + 12.0 * s + strip_h + 14.0 * s
+                    + 12.0 * s * 2.0
+                    + row_h * 3.0
+                    + gap * 3.0;
+                let bar = HudRect {
+                    x: (logical_w - w) * 0.5,
+                    y: logical_h - h - gap,
+                    w,
+                    h,
+                };
+                push_panel(&mut mesh, bar, logical_w, logical_h, dim_bg);
+                push_text(
+                    &mut mesh,
+                    bar.x + pad,
+                    bar.y + pad,
+                    logical_w,
+                    logical_h,
+                    EditorPanel::Animacion.label(),
+                    text_px,
+                    [0.98, 0.86, 0.42, 1.0],
+                );
+                let row = |mesh: &mut HudMesh, txt: String, y: f32| {
+                    push_text(
+                        mesh,
+                        bar.x + pad,
+                        y,
+                        logical_w,
+                        logical_h,
+                        &txt,
+                        px,
+                        [0.88, 0.90, 0.95, 1.0],
+                    );
+                };
+                // Sin clip no hay timeline; el resto del panel no aplica.
+                let Some(c) = clip else {
+                    row(
+                        &mut mesh,
+                        "SIN CLIP: USA ARCHIVO > IMPORTAR".into(),
+                        bar.y + pad + 16.0 * s,
+                    );
+                    return mesh;
+                };
+                let frames = &c.file.frames;
+                let n = frames.len();
+                let dur = c.file.duration_s.max(1e-3);
+                let kf = kf_sel.min(n.saturating_sub(1));
+                row(&mut mesh, c.summary(), bar.y + pad + 16.0 * s);
+
+                // ── Timeline: regla + un diamante por keyframe ──────────────
+                let strip_y = bar.y + pad + 16.0 * s + 12.0 * s;
+                push_panel(
+                    &mut mesh,
+                    HudRect {
+                        x: bar.x + pad,
+                        y: strip_y + strip_h * 0.5,
+                        w: w - pad * 2.0,
+                        h: 1.0 * s,
+                    },
+                    logical_w,
+                    logical_h,
+                    [0.34, 0.38, 0.48, 0.9],
+                );
+                let slot = (w - pad * 2.0) / n.max(1) as f32;
+                for (i, f) in frames.iter().enumerate() {
+                    // Diamante dibujado en su posicion temporal (t / dur) …
+                    let fx = bar.x + pad + (f.t / dur).clamp(0.0, 1.0) * (w - pad * 2.0);
+                    let d = 8.0 * s;
+                    let diamond = HudRect {
+                        x: fx - d * 0.5,
+                        y: strip_y + strip_h * 0.5 - d * 0.5,
+                        w: d,
+                        h: d,
+                    };
+                    // … y su hit region es una ranura igualitaria, que es lo
+                    // que hace falta para acertar con el dedo.
+                    let hit = HudRect {
+                        x: bar.x + pad + i as f32 * slot,
+                        y: strip_y,
+                        w: slot,
+                        h: strip_h,
+                    };
+                    if i == kf {
+                        push_panel(&mut mesh, diamond, logical_w, logical_h, accent);
+                    } else {
+                        push_panel(
+                            &mut mesh,
+                            HudRect {
+                                x: diamond.x,
+                                y: diamond.y,
+                                w: diamond.w,
+                                h: 1.0 * s,
+                            },
+                            logical_w,
+                            logical_h,
+                            [0.70, 0.76, 0.86, 0.95],
+                        );
+                        push_panel(
+                            &mut mesh,
+                            HudRect {
+                                x: diamond.x,
+                                y: diamond.y + diamond.h - 1.0 * s,
+                                w: diamond.w,
+                                h: 1.0 * s,
+                            },
+                            logical_w,
+                            logical_h,
+                            [0.70, 0.76, 0.86, 0.95],
+                        );
+                    }
+                    mesh.hits.push(HudHitRegion {
+                        action: HudAction::Ed(EditorAction::KeyframeSel(i)),
+                        rect: hit,
+                    });
+                }
+
+                let y2 = strip_y + strip_h + 4.0 * s;
+                row(
+                    &mut mesh,
+                    format!("clave {}/{} · t {:.2}s", kf + 1, n, frames[kf].t),
+                    y2,
+                );
+                let jname = crate::animation::joint_names()
+                    .get(joint_sel)
+                    .copied()
+                    .unwrap_or("-");
+                let axis = crate::animation::joint_axis(jname)
+                    .map(|a| a.to_ascii_uppercase())
+                    .unwrap_or('?');
+                row(
+                    &mut mesh,
+                    format!(
+                        "artic {}/12 · {jname} · eje {axis}",
+                        joint_sel + 1
+                    ),
+                    y2 + 12.0 * s,
+                );
+
+                // ── Botones: cursores, target y el subconjunto de steppers ──
+                let by = y2 + 12.0 * s * 2.0 + 4.0 * s;
+                let btn_at = |mesh: &mut HudMesh, i: usize, row_i: usize, label: &str, act: EditorAction, bg: [f32; 4]| {
+                    push_text_btn(
+                        mesh,
+                        HudRect {
+                            x: bar.x + pad + (i % 4) as f32 * (fw + gap),
+                            y: by + row_i as f32 * (row_h + gap),
+                            w: fw,
+                            h: row_h,
+                        },
+                        logical_w,
+                        logical_h,
+                        label,
+                        text_px,
+                        bg,
+                        HudAction::Ed(act),
+                    )
+                };
+                btn_at(&mut mesh, 0, 0, "CLAVE<", EditorAction::KeyframePrev, btn_bg);
+                btn_at(&mut mesh, 1, 0, "CLAVE>", EditorAction::KeyframeNext, btn_bg);
+                btn_at(
+                    &mut mesh,
+                    2,
+                    0,
+                    "TIEMPO-",
+                    EditorAction::KeyframeTimeDec,
+                    btn_bg,
+                );
+                btn_at(
+                    &mut mesh,
+                    3,
+                    0,
+                    "TIEMPO+",
+                    EditorAction::KeyframeTimeInc,
+                    btn_bg,
+                );
+                btn_at(&mut mesh, 0, 1, "ARTIC<", EditorAction::JointPrev, btn_bg);
+                btn_at(&mut mesh, 1, 1, "ARTIC>", EditorAction::JointNext, btn_bg);
+                // Qué editan los steppers: entidad/estado o articulación.
+                btn_at(
+                    &mut mesh,
+                    2,
+                    1,
+                    "OBJETO",
+                    EditorAction::EditEntity,
+                    if view.editing_joint { btn_bg } else { accent },
+                );
+                btn_at(
+                    &mut mesh,
+                    3,
+                    1,
+                    "ARTIC",
+                    EditorAction::EditJoint,
+                    if view.editing_joint { accent } else { btn_bg },
+                );
+                // Solo los dos steppers del eje de la articulación: los otros
+                // canales (pos, escala, tamaño, cizalla) no tienen destino aquí.
+                // Los botones mandan la acción del eje REAL, no una fija.
+                let (dec, inc) = match crate::animation::joint_axis(jname) {
+                    Some('x') => (EditorAction::RotXDec, EditorAction::RotXInc),
+                    Some('y') => (EditorAction::RotYDec, EditorAction::RotYInc),
+                    Some('z') => (EditorAction::RotZDec, EditorAction::RotZInc),
+                    _ => (EditorAction::RotXDec, EditorAction::RotXInc),
+                };
+                btn_at(&mut mesh, 0, 2, &format!("{axis}-"), dec, btn_bg);
+                btn_at(&mut mesh, 1, 2, &format!("{axis}+"), inc, btn_bg);
+                if !view.editing_joint {
+                    // Los steppers también existen en el panel OBJETO: aquí solo
+                    // se avisa de que están apagados.
+                    row(&mut mesh, "steppers: OBJETO".into(), by + row_h * 3.0);
+                } else {
+                    row(&mut mesh, "steppers: ARTIC".into(), by + row_h * 3.0);
+                }
+            }
+            // Categories whose controls land in a later phase: the panel is
+            // reachable, it just states what is not built yet.
+            pending => {
+                let (title, sub) = match pending {
+                    EditorPanel::Voxels => ("VOXELS INDIVIDUALES", "PENDIENTE"),
+                    EditorPanel::Transform
+                    | EditorPanel::Estado
+                    | EditorPanel::Animacion
+                    | EditorPanel::Archivo => unreachable!(),
+                };
+                let w = 340.0 * s;
+                let h = 64.0 * s;
+                let bar = HudRect {
+                    x: (logical_w - w) * 0.5,
+                    y: logical_h - h - gap,
+                    w,
+                    h,
+                };
+                push_panel(&mut mesh, bar, logical_w, logical_h, dim_bg);
+                push_text(
+                    &mut mesh,
+                    bar.x + pad,
+                    bar.y + 12.0 * s,
+                    logical_w,
+                    logical_h,
+                    title,
+                    text_px,
+                    [0.98, 0.86, 0.42, 1.0],
+                );
+                push_text(
+                    &mut mesh,
+                    bar.x + pad,
+                    bar.y + 32.0 * s,
+                    logical_w,
+                    logical_h,
+                    sub,
+                    1.6 * s,
+                    [0.78, 0.82, 0.88, 1.0],
+                );
+            }
+        }
+    }
+    mesh
 }
 
 /// Minecraft-style inventory: dim + beige panel + 9×3 slots + tool hotbar mirror.
@@ -1807,6 +3285,97 @@ mod tests {
         assert!(img.pixels().any(|p| p.0[3] > 0));
     }
 
+    /// Regresión: `atlas_col` y `build_hud_atlas` se desincronizaron al añadir
+    /// variantes al enum, y el pico acabó mostrando el icono del hacha. Este
+    /// test recorre TODOS los `HotbarItem` y exige que el tile al que apuntan
+    /// tenga píxeles opacos de verdad.
+    #[test]
+    fn every_hotbar_item_has_an_icon() {
+        let img = build_hud_atlas();
+        let all = [
+            HotbarItem::Sword,
+            HotbarItem::Shield,
+            HotbarItem::Pickaxe,
+            HotbarItem::Axe,
+            HotbarItem::Consumable,
+            HotbarItem::Magic,
+        ];
+        for item in all {
+            let col = item
+                .atlas_col()
+                .unwrap_or_else(|| panic!("{} deberia tener icono", item.label()));
+            let (ox, oy) = tile_origin(col, 3);
+            let mut opaque = 0u32;
+            for y in 0..HUD_TILE {
+                for x in 0..HUD_TILE {
+                    if img.get_pixel(ox + x, oy + y).0[3] > 8 {
+                        opaque += 1;
+                    }
+                }
+            }
+            assert!(
+                opaque > 20,
+                "el tile del {} (col {col}) esta vacio: {opaque} px opacos",
+                item.label()
+            );
+        }
+    }
+
+    /// El hacha y el pico son tiles distintos: comparten fila pero no columna.
+    #[test]
+    fn pickaxe_and_axe_icons_differ() {
+        let img = build_hud_atlas();
+        let sample = |col: u32| -> Vec<u8> {
+            let (ox, oy) = tile_origin(col, 3);
+            let mut v = Vec::new();
+            for y in 0..HUD_TILE {
+                for x in 0..HUD_TILE {
+                    v.push(img.get_pixel(ox + x, oy + y).0[3]);
+                }
+            }
+            v
+        };
+        assert_ne!(
+            sample(hotbar_col::PICKAXE),
+            sample(hotbar_col::AXE),
+            "pico y hacha comparten tile"
+        );
+    }
+
+    /// Regresión: `DepthBoots` pedía la columna 10 con solo 10 columnas, y
+    /// ClampToEdge leía la "O" de la brújula. Ahora el tile se valida en rango.
+    #[test]
+    fn every_inventory_item_tile_is_in_range_and_baked() {
+        use crate::inventory::InvItem;
+        let img = build_hud_atlas();
+        let all = [
+            InvItem::DirtFrag,
+            InvItem::StoneFrag,
+            InvItem::CoalMicro,
+            InvItem::CoalCube,
+            InvItem::SapphireMicro,
+            InvItem::SapphireCube,
+            InvItem::RubyMicro,
+            InvItem::RubyCube,
+            InvItem::EmeraldMicro,
+            InvItem::EmeraldCube,
+            InvItem::DepthBoots,
+        ];
+        for item in all {
+            let (col, row) = item.atlas_tile();
+            assert!(
+                col < ATLAS_COLS && row < ATLAS_ROWS,
+                "{item:?} apunta fuera del atlas: ({col},{row})"
+            );
+            let (ox, oy) = tile_origin(col, row);
+            let opaque = (0..HUD_TILE)
+                .flat_map(|y| (0..HUD_TILE).map(move |x| (x, y)))
+                .filter(|&(x, y)| img.get_pixel(ox + x, oy + y).0[3] > 8)
+                .count();
+            assert!(opaque > 20, "el tile de {item:?} esta vacio: {opaque} px");
+        }
+    }
+
     #[test]
     fn hud_builds_when_armed() {
         let mut t = StairTool::default();
@@ -1843,16 +3412,16 @@ mod tests {
     fn hotbar_press_toggles_equip() {
         let mut hb = Hotbar::default();
         assert_eq!(hb.selected, Some(1));
-        hb.press_slot(1);
+        hb.press_slot(1, false);
         assert_eq!(hb.selected, None);
         assert!(!hb.holding_pickaxe());
-        hb.press_slot(1);
+        hb.press_slot(1, false);
         assert!(hb.holding_pickaxe());
-        hb.press_slot(0);
+        hb.press_slot(0, false);
         assert_eq!(hb.selected_item(), HotbarItem::Sword);
         assert!(hb.holding_sword());
         assert!(!hb.holding_pickaxe());
-        hb.press_slot(0);
+        hb.press_slot(0, false);
         assert!(!hb.holding_sword());
     }
 
@@ -1893,5 +3462,295 @@ mod tests {
             ang_n.cos() < -0.7,
             "N should sit near left when facing east, ang={ang_n}"
         );
+    }
+
+    /// El editor colapsable: con el menú cerrado solo hay selección de entidad
+    /// + botón de menú. La parrilla de transform y las acciones de archivo
+    /// viven dentro de su panel, no siempre en pantalla.
+    #[test]
+    fn editor_hud_hides_controls_until_a_panel_opens() {
+        let entities = [crate::editor::EditorEntity::new("prop", [0.0, 24.0, 0.0])];
+        let has = |mesh: &HudMesh, act: EditorAction| {
+            mesh.hits.iter().any(|h| h.action == HudAction::Ed(act))
+        };
+        let build = |panel| {
+            build_editor_hud(
+                "escena",
+                "",
+                &entities,
+                EditorView {
+                    selected: 0,
+                    panel,
+                    ..Default::default()
+                },
+                None,
+                1280.0,
+                720.0,
+            )
+        };
+        let closed = build(None);
+        // El menú abre la categoría por defecto; la lista de entidades sigue viva.
+        assert!(has(&closed, EditorAction::OpenPanel(EditorPanel::Transform)));
+        assert!(has(&closed, EditorAction::SelNext));
+        // Y nada de la parrilla ni de los archivos.
+        for hidden in [
+            EditorAction::PosXInc,
+            EditorAction::RotYDec,
+            EditorAction::SclZInc,
+            EditorAction::SkewInc,
+            EditorAction::SizeDec,
+            EditorAction::KindNext,
+            EditorAction::Add,
+            EditorAction::Save,
+            EditorAction::Load,
+            EditorAction::Back,
+            EditorAction::StateAdd,
+        ] {
+            assert!(!has(&closed, hidden), "{hidden:?} no debe verse sin panel");
+        }
+
+        // Transform abierto → la parrilla vuelve, los archivos siguen ocultos.
+        let transform = build(Some(EditorPanel::Transform));
+        assert!(has(&transform, EditorAction::PosXInc));
+        assert!(has(&transform, EditorAction::SkewInc));
+        assert!(!has(&transform, EditorAction::Save));
+        // Con un panel abierto, las cinco categorías son alcanzables.
+        for cat in EditorPanel::ALL {
+            assert!(has(&transform, EditorAction::OpenPanel(cat)), "{cat:?}");
+        }
+
+        // Archivo abierto → acciones de archivo, sin la parrilla.
+        let file = build(Some(EditorPanel::Archivo));
+        for shown in [
+            EditorAction::Add,
+            EditorAction::Duplicate,
+            EditorAction::Delete,
+            EditorAction::Save,
+            EditorAction::Load,
+            EditorAction::Back,
+        ] {
+            assert!(has(&file, shown), "{shown:?} debe verse en ARCHIVO");
+        }
+        assert!(!has(&file, EditorAction::PosXInc));
+        assert!(has(&file, EditorAction::ClosePanel));
+
+        // Estado abierto → el gestor de estados, y nada de transform/archivo.
+        let estados = build(Some(EditorPanel::Estado));
+        for shown in [
+            EditorAction::StatePrev,
+            EditorAction::StateNext,
+            EditorAction::StateAdd,
+            EditorAction::StateDup,
+            EditorAction::StateDel,
+        ] {
+            assert!(has(&estados, shown), "{shown:?} debe verse en ESTADO");
+        }
+        assert!(!has(&estados, EditorAction::PosXInc));
+        assert!(!has(&estados, EditorAction::Save));
+        // La entidad no tiene estados: no hay filas, solo el +NUEVO.
+        assert!(!has(&estados, EditorAction::StateSel(0)));
+
+        // Las categorías pendientes abren panel pero no emiten comandos.
+        for cat in [EditorPanel::Voxels, EditorPanel::Animacion] {
+            let mesh = build(Some(cat));
+            assert!(has(&mesh, EditorAction::OpenPanel(EditorPanel::Archivo)));
+            assert!(!has(&mesh, EditorAction::PosXInc));
+            assert!(!has(&mesh, EditorAction::Save));
+        }
+    }
+
+    /// Con dos estados, el panel ESTADO ofrece una fila por estado (la activa
+    /// resaltada) y el readout sale del subconjunto que se le pasa.
+    #[test]
+    fn editor_hud_lists_every_state_of_the_selected_entity() {
+        let mut e = crate::editor::EditorEntity::new("item", [0.0, 24.0, 0.0]);
+        e.model = "special1_sword".into();
+        e.states = vec![
+            crate::editor::EditorEntityState {
+                name: "normal".into(),
+                ..Default::default()
+            },
+            crate::editor::EditorEntityState {
+                name: "gastada".into(),
+                model: "assets/items/espada_worn.json".into(),
+                palette: "mono".into(),
+                position: [0.0, -0.5, 0.0],
+                ..Default::default()
+            },
+        ];
+        let entities = [e];
+        let has = |mesh: &HudMesh, act: EditorAction| {
+            mesh.hits.iter().any(|h| h.action == HudAction::Ed(act))
+        };
+        let mesh = build_editor_hud(
+            "estados",
+            "",
+            &entities,
+            EditorView {
+                selected: 0,
+                state_sel: 1,
+                panel: Some(EditorPanel::Estado),
+                ..Default::default()
+            },
+            None,
+            1280.0,
+            720.0,
+        );
+        // Una fila por estado (solo 2 filas, no 5).
+        assert!(has(&mesh, EditorAction::StateSel(0)));
+        assert!(has(&mesh, EditorAction::StateSel(1)));
+        assert!(!has(&mesh, EditorAction::StateSel(2)));
+    }
+
+    /// El panel ANIMAR (Fase 6 C) muestra el clip abierto y sus acciones de
+    /// import/export viven en ARCHIVO, no en ANIMAR.
+    #[test]
+    fn editor_hud_shows_the_open_clip_and_its_file_actions() {
+        let entities = [crate::editor::EditorEntity::new("prop", [0.0, 24.0, 0.0])];
+        let has = |mesh: &HudMesh, act: EditorAction| {
+            mesh.hits.iter().any(|h| h.action == HudAction::Ed(act))
+        };
+        let build = |panel, clip| {
+            build_editor_hud(
+                "escena",
+                "",
+                &entities,
+                EditorView {
+                    selected: 0,
+                    panel,
+                    ..Default::default()
+                },
+                clip,
+                1280.0,
+                720.0,
+            )
+        };
+        let clip_json = r#"{
+            "id": "borrador_ia", "model": "assets/entities/hero.json",
+            "duration_s": 0.4, "loop": true,
+            "frames": [{ "t": 0.0, "pose": {} }, { "t": 0.4, "pose": {} }]
+        }"#;
+        let clip = crate::editor_clip::EditorClip::from_json(clip_json, None).expect("clip");
+
+        // ARCHIVO: las 6 acciones de escena + import/export de clip.
+        let file = build(Some(EditorPanel::Archivo), None);
+        for act in [
+            EditorAction::ClipLoad,
+            EditorAction::ClipSave,
+            EditorAction::Add,
+            EditorAction::Save,
+            EditorAction::Load,
+            EditorAction::Back,
+        ] {
+            assert!(has(&file, act), "{act:?} debe verse en ARCHIVO");
+        }
+
+        // ANIMAR sin clip ni con clip: mismos controles, distinto readout.
+        // OJO: `HudMesh` no guarda el texto (son quads de píxeles de glifo), así
+        // que aquí solo se assertan hit regions; el texto del readout se cubre
+        // en `editor_clip::tests::a_clip_imports_and_summarises`.
+        let none = build(Some(EditorPanel::Animacion), None);
+        assert!(!has(&none, EditorAction::ClipLoad), "importar es de ARCHIVO");
+        assert!(!has(&none, EditorAction::StateAdd));
+        let with = build(Some(EditorPanel::Animacion), Some(&clip));
+        assert!(!has(&with, EditorAction::PosXInc));
+        // Con clip el panel dibuja más geometría (resumen + timeline).
+        assert!(
+            with.vertices.len() > none.vertices.len(),
+            "el readout del clip debería dibujar más: {} vs {}",
+            with.vertices.len(),
+            none.vertices.len()
+        );
+    }
+
+    /// El timeline es un widget NUEVO (eje temporal horizontal), no la lista
+    /// vertical de entidades: un hit por keyframe, con ranuras iguales, y los
+    /// cursores de keyframe y articulación siempre alcanzables.
+    #[test]
+    fn editor_timeline_gives_every_keyframe_its_own_hit() {
+        let entities = [crate::editor::EditorEntity::new("prop", [0.0, 24.0, 0.0])];
+        let clip_json = r#"{
+            "id": "ia", "model": "assets/entities/hero.json",
+            "duration_s": 0.4, "loop": false,
+            "frames": [
+                { "t": 0.0, "pose": {} }, { "t": 0.2, "pose": {} }, { "t": 0.4, "pose": {} }
+            ]
+        }"#;
+        let clip = crate::editor_clip::EditorClip::from_json(clip_json, None).expect("clip");
+        let n = clip.file.frames.len();
+        let mesh = build_editor_hud(
+            "anim",
+            "",
+            &entities,
+            EditorView {
+                selected: 0,
+                panel: Some(EditorPanel::Animacion),
+                kf_sel: 1,
+                joint_sel: 3,
+                editing_joint: true,
+                ..Default::default()
+            },
+            Some(&clip),
+            1280.0,
+            720.0,
+        );
+        let has = |a: EditorAction| mesh.hits.iter().any(|h| h.action == HudAction::Ed(a));
+        // Un hit por keyframe, y solo esos tres.
+        for i in 0..n {
+            assert!(has(EditorAction::KeyframeSel(i)), "falta el hit del clave {i}");
+        }
+        assert!(!has(EditorAction::KeyframeSel(n)));
+        // Los cursores de los niveles 3 y 4.
+        for a in [
+            EditorAction::KeyframePrev,
+            EditorAction::KeyframeNext,
+            EditorAction::KeyframeTimeDec,
+            EditorAction::KeyframeTimeInc,
+            EditorAction::JointPrev,
+            EditorAction::JointNext,
+            EditorAction::EditEntity,
+            EditorAction::EditJoint,
+        ] {
+            assert!(has(a), "{a:?} debe ser alcanzable en ANIMAR");
+        }
+        // El subconjunto de steppers: el eje de `l_arm_x` (joint_sel 3) es X.
+        assert!(has(EditorAction::RotXDec) && has(EditorAction::RotXInc));
+        // Y no aparecen los canales que no tienen destino en una articulación.
+        for dead in [
+            EditorAction::PosXInc,
+            EditorAction::SclXInc,
+            EditorAction::SizeInc,
+            EditorAction::SkewInc,
+        ] {
+            assert!(!has(dead), "{dead:?} no debe salir en ANIMAR");
+        }
+        // Con `editing_joint` apagado los steppers siguen siendo hit (mismo
+        // panel), pero el target lo decide el boton, no la vista.
+        assert!(has(EditorAction::EditEntity) && has(EditorAction::EditJoint));
+    }
+
+    /// Sin clip, el panel ANIMAR lo dice y no inventa keyframes.
+    #[test]
+    fn editor_timeline_without_a_clip_has_no_keyframe_hits() {
+        let entities = [crate::editor::EditorEntity::new("prop", [0.0, 24.0, 0.0])];
+        let mesh = build_editor_hud(
+            "anim",
+            "",
+            &entities,
+            EditorView {
+                selected: 0,
+                panel: Some(EditorPanel::Animacion),
+                ..Default::default()
+            },
+            None,
+            1280.0,
+            720.0,
+        );
+        let has = |a: EditorAction| mesh.hits.iter().any(|h| h.action == HudAction::Ed(a));
+        assert!(!has(EditorAction::KeyframeSel(0)));
+        assert!(!has(EditorAction::KeyframeNext));
+        // Pero el panel sigue siendo alcanzable y la escena se sigue viendo.
+        assert!(has(EditorAction::SelNext));
+        assert!(has(EditorAction::ClosePanel));
     }
 }

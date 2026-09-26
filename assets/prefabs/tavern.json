@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "id": "tavern",
+  "name": "Taberna",
+  "size": [9, 6, 7],
+  "anchor": [4, 0, 3],
+  "entrance": { "position": [4, 1, 0], "facing": "south" },
+  "lot": { "width": 11, "depth": 9 },
+  "palette": {
+    ".": "air",
+    "S": "village_stone",
+    "C": "cobblestone",
+    "W": "wood_planks",
+    "G": "glass",
+    "R": "wood_roof",
+    "D": "door"
+  },
+  "layers": [
+    [
+      "SSSSSSSSS",
+      "SSSSSSSSS",
+      "SSSSSSSSS",
+      "SSSSSSSSS",
+      "SSSSSSSSS",
+      "SSSSSSSSS",
+      "SSSSSSSSS"
+    ],
+    [
+      "WWWDWWWWW",
+      "W.......W",
+      "W.......W",
+      "W.......W",
+      "W.......W",
+      "W.......W",
+      "WWWWWWWWW"
+    ],
+    [
+      "WWWDWWWWW",
+      "G.......G",
+      "W.......W",
+      "W.......W",
+      "W.......W",
+      "G.......G",
+      "WWWWWWWWW"
+    ],
+    [
+      "WWWWWWWWW",
+      "W.......W",
+      "W.......W",
+      "W.......W",
+      "W.......W",
+      "W.......W",
+      "WWWWWWWWW"
+    ],
+    [
+      "RRRRRRRRR",
+      "RRRRRRRCR",
+      "RRRRRRRRR",
+      "RRRRRRRRR",
+      "RRRRRRRRR",
+      "RRRRRRRRR",
+      "RRRRRRRRR"
+    ],
+    [
+      ".........",
+      ".......C.",
+      ".........",
+      ".........",
+      ".........",
+      ".........",
+      "........."
+    ]
+  ]
+}

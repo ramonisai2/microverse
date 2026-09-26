@@ -1,0 +1,347 @@
+TIRONES EN EL MOVIMIENTO (MICROSALTOS) — caza de bugs
+=====================================================
+Fecha: 2026-09-17. Síntoma: los FPS son altos pero el héroe se mueve
+"como a microsaltos" (stutter/jerk visible en pantalla).
+
+RESUMEN DEL PROBLEMA
+--------------------
+Dos fuentes de vaivén no interpolado ni adaptado al fotograma:
+
+  1. bob_y a 20 Hz sin interpolación (el culpable principal).
+  2. Suavizado de cámara fijo por fotograma, no por tiempo.
+
+La simulación corre a TICKS_PER_SECOND = 20 (src/camera.rs:6). El render
+sí interpola la posición entre ticks con `alpha`, pero había dos rutas
+que se actualizaban de forma discreta y se colaban a la imagen final.
+
+CAUSA 1 — bob_y discreto (player.rs)
+------------------------------------
+- `bob_y` se recalcula solo en cada tick de física:
+  `self.bob_y = bob_phase.sin() * amp` (src/player.rs, bloque
+  "Walk/sprint bob"; amp 0.055 sprint / 0.018 andar).
+- `display_feet(alpha)` sumaba `self.bob_y` SIN interpolar:
+  `p.y += self.bob_y` → el valor cambia de golpe cada 50 ms.
+- Ese resultado alimenta tanto al héroe como a la cámara HD-2D
+  (`display_focus` → `follow_hd2d_framed`), así que TODO el mundo
+  visible da un tirón vertical 20 veces por segundo aunque el render
+  vaya a 144+ FPS.
+- Amplitud andando: 0.018 bloques cada 50 ms = ~0.36 bloques/s de
+  dientes de sierra: perfectamente visible.
+
+ARREGLO 1
+---------
+- Nuevo campo `prev_bob_y` en `Player` (junto a los demás `prev_*`).
+- En `tick()` se guarda `self.prev_bob_y = self.bob_y` antes de cada
+  `tick_once` (igual que feet/facing/pose).
+- En `display_feet(alpha)`:
+      p.y += prev_bob_y + (bob_y - prev_bob_y) * alpha
+  Con esto la altura renderizada es continua fotograma a fotograma.
+- `restore_from_save` resetea bob_y y prev_bob_y (sin salto al cargar).
+
+CAUSA 2 — lerp de cámara dependiente de FPS (camera.rs)
+-------------------------------------------------------
+- `follow_hd2d_framed` usaba factores fijos por fotograma:
+      hd2d_focus.lerp(focus, HD2D_FOCUS_LERP)            // 0.22
+      hd2d_distance += (target - d) * (0.10 + c2 * 0.14)
+  A 144 FPS el follow es 2.4× más rápido que a 60; a 30 FPS la mitad.
+  El glide de cámara cambia con la tasa de frames → tirones percibidos
+  y sensación distinta según el equipo.
+
+ARREGLO 2 (camera.rs)
+---------------------
+- `follow_hd2d` / `follow_hd2d_framed` reciben `dt` (segundos de frame).
+      let t = dt.max(0.0) * 60.0;
+      let focus_lerp = 1.0 - (1.0 - HD2D_FOCUS_LERP).powf(t);
+      let dist_lerp  = 1.0 - (1.0 - dist_base).powf(t);
+- En dt = 1/60 devuelve exactamente los factores antiguos (0.22 / 0.10+).
+- `dt = 0` (o negativo) no mueve nada (evita NaN/división rara).
+- main.rs pasa `frame_secs` (ya calculado, con clamp 0.25).
+
+PRUEBAS AÑADIDAS (regresión)
+----------------------------
+player.rs:
+  - display_feet_interpolates_bob_between_ticks
+  - walk_bob_advances_smoothly_across_ticks (andar + sprint: sin
+    discontinuidades entre ticks; midpoint == lerp exacto)
+  - restore_clears_bob_history
+camera.rs:
+  - follow_matches_original_factors_at_60_fps
+  - follow_converges_equally_across_frame_rates (20..240 FPS llegan al
+    mismo estado en el mismo tiempo; dt variables mezcladas también)
+  - follow_without_elapsed_time_does_not_move
+
+CÓMO VERIFICAR (humano)
+-----------------------
+1. `./run.sh` (recompila; un binario viejo miente).
+2. Andar y esprintar en campo abierto a 20, 60 y 144+ FPS.
+3. Antes: vibración vertical fina en el héroe y en la cámara.
+   Ahora: glide continuo. El título de la ventana muestra fps/ms.
+4. `cargo test --bin microverse -- player::tests camera::tests`
+
+QUÉ NO CAMBIÓ (para no perseger fantasmas)
+------------------------------------------
+- TICKS_PER_SECOND sigue en 20; la física no se tocó.
+- La posición base ya estaba interpolada con `alpha` (tick_accum).
+- No se añadieron passes, flags ni constantes nuevas de render.
+
+SEGUIMIENTO: PRIMERA PERSONA AUTOMÁTICA (2026-09-17, turno posterior)
+---------------------------------------------------------------------
+Pedido: cuando un árbol/bloque tapa al héroe, HD-2D se queda igual;
+pero dentro de una casa o una cueva la visión es pobre → pasar a
+primera persona tipo Minecraft, y también con un botón al aire libre.
+
+Implementado (camera.rs + main.rs):
+  - Camera ahora es de modo mixto:
+      hd2d_amount  1 = diorama HD-2D, 0 = primera persona (se easing).
+      request_hd2d() / request_first_person() marcan el objetivo;
+      update_mode(dt) avanza el peso a FP_BLEND_SECS = 0.45 s.
+      seat_mixed(eye, facing) coloca la lente: rayo isométrico cuando
+      blend=1, ojo del héroe (FOV 70°) cuando blend=0, e interpolación
+      posición/pitch/FOV en medio (sin corte de horizonte).
+  - Disparo automático en main.rs (RedrawRequested, bloque ENABLE_HD2D):
+      indoors_factor(feet+1.1) >= 0.55 (casa: techo + ≥3 paredes)
+        O hd2d_confine_factor(feet+1) >= 0.85 (cueva/enterrado).
+      Con auto o manual activo: primera persona + cursor capturado.
+      Al salir, vuelve el diorama y el cursor se libera para HUD.
+  - Tecla V: alterna primera persona manual (funciona a la intemperie).
+  - Mouse: solo en primera persona gira (apply_fp_turn gira el héroe
+    y el pitch). En HD-2D sigue sin usarse.
+  - WASD: usa effective_move_yaw → respecto a la mirada del héroe en
+    primera persona, respecto a la cámara fija en HD-2D.
+  - El héroe (billboard) se oculta en primera persona (player_vb None).
+  - El pull-in por confine se retiró del llamado: seat_mixed ya
+    concentra la cámara en el ojo, un segundo pull era redundante.
+
+Pendiente manual (verificar jugando):
+  - Entrar a una villa/casa → transición suave a 1ª persona y vuelta.
+  - Cueva profunda → 1ª persona; salir → vuelve el diorama.
+  - V en campo abierto alterna manualmente; al entrar a casa manda el auto.
+  - Minar con LMB: se mantiene hold-to-break (dir fija -0.35 pitch) —
+    aún no apunta con el pitch del mouse; ajustar si incomoda.
+
+RESUELTO (2026-09-18): asserts desactualizados actualizados
+-----------------------------------------------------------
+Medidos los valores reales del greedy (sin camera-cull):
+  - Lone/dirt cubes y stacks emiten TODAS sus caras no ocultas:
+    24 vértices / 36 índices (6 quads). Antes 18 (cull por cámara).
+  - Se mantienen las invariantes de oclusión por bloque vecino
+    (sin caras internas / sin caras compartidas), que era lo valioso.
+  - grass_lod: el fade ahora vive en 68..73; el test usa las constantes
+    GRASS_BLADE_FADE_START/END en vez de literales de 60-65.
+  - infinite_streaming_loads_around_camera: bombea stream_around hasta
+    commitear el chunk (0,0) y hasta descargarlo + commit del objetivo
+    (lazo con tope), en vez de iteraciones fijas dependientes del
+    presupuesto de tiempo. NOTA: la 1ª llamada stream_around llena el
+    anillo keep (~159 chunks) y tarda ~135 s en debug; es inherente.
+  - Verificación: `cargo test --bin microverse` → 167 passed, 0 failed.
+
+FALLOS PREEXISTENTES DETECTADOS (NO de este fix)
+------------------------------------------------
+Estos tests fallaban ANTES de esta sesión por cambios previos en
+render.rs/world.rs (se quitaron culls de caras por cámara y se movió
+GRASS_BLADE_FADE a 68→73); sus asserts quedaron desactualizados:
+  - render::face_cull_tests::{all_unoccluded_faces_are_emitted,
+    floating_cube_emits_all_six_faces,
+    solid_stack_hides_internal_faces,
+    adjacent_solids_hide_shared_faces}  → 36 índices vs 18 esperados
+    (greedy ya no descarta caras traseras por cámara).
+  - world::shunk_distance_tests::grass_lod_shortens_then_seals_carpet
+    → probaba distancias 60–65 con fade ahora en 68..73.
+  - world::shunk_distance_tests::infinite_streaming_loads_around_camera
+    → flaky de presupuesto: 8 iteraciones de stream no garantizan
+    commit del chunk objetivo; vio passar antes por timing.
+Actualizar esos asserts es tarea aparte (no inventar números: medir).
+→ HECHO 2026-09-18, ver "RESUELTO" arriba.
+
+RESUELTO (2026-09-18): el piso desaparecía bajo cierta altura en Y
+-------------------------------------------------------------------
+Síntoma (confirmado por el usuario): el suelo no se renderiza por debajo
+de una altura determinada; por encima se ve bien, por debajo desaparece
+y se ven las cuevas subterráneas.
+
+CAUSA — centro de sección de malla con altura equivocada
+  - `section_face_mask` (src/render.rs) calcula qué cubos direccionales
+    dibujar según dónde esté la cámara frente al centro de la losa.
+  - Ese centro salía de `mesh_section_center` (src/world.rs), que usaba
+    `CHUNK_SECTION_HEIGHT = 32` (sección de almacenamiento de columnas)
+    en vez de `MESH_SECTION_HEIGHT = 16` (altura real de las losas de
+    malla de render).
+  - Efecto: para la losa cy=1 (y∈[16,32)) el centro se calculaba en y=48
+    en vez de y=24. Las caras +Y (el "piso") se cullaban por debajo de
+    y = 48 − 13.9 = 34.1 en vez de y = 24 − 13.9 = 10.1. Así, con la
+    cámara entre ~10 y ~34 bloques (arriba de la hierba pero "por debajo
+    del centro equivocado"), las caras superiores del suelo —que en esa
+    posición sí miran a la cámara— se descartaban y quedaba un agujero
+    que dejaba ver las cuevas. La misma descalibración rompía el caso
+    "cámara dentro de la losa dibuja todo".
+CASO DE USO REAL: en primera persona el ojo está justo sobre la hierba
+(~y 20); 20 < 34.1 → se cullaba el suelo completo.
+
+ARREGLO (src/world.rs)
+  - `mesh_section_center` ahora usa `MESH_SECTION_HEIGHT` (16): centro
+    real de cada losa 16×16×16. El umbral de +Y vuelve a ~10.1, que solo
+    culla caras traseras de verdad (cámara por debajo del piso).
+  - Verificado con barrido de alturas (secciones y mallas siempre se
+    emiten igual; solo el mask cambiaba en 34.1 → ahora en 10.1).
+  - Test de regresión añadido (render::section_split_tests): con la
+    cámara a 26 bloque sobre la losa cy=1 los tops +Y deben dibujarse;
+    falla con la línea vieja (CHUNK_SECTION_HEIGHT).
+  - Verificación: `cargo test --bin microverse` → 168 passed, 0 failed.
+  - ACLARACIÓN: la vieja sin bug (microvoxel/) no tenía el sistema de
+    secciones (ni `section_face_mask`): este bug es nuevo con las losas.
+
+2026-09-18 — Segunda ronda (los 3 pendientes del usuario)
+========================================================
+
+3) TRANSICIÓN FP -> DIORAMA QUE SE RE-ENCADENA (tardaba ~4x)
+------------------------------------------------------------
+  Síntoma: al salir de primera persona en ciertas zonas, el fade
+  (FP_BLEND_SECS = 0.45s) nunca acababa de completarse o se invertía.
+  Causa: auto_fp se recalculaba CADA frame a partir de
+  `indoors_factor >= 0.55 || hd2d_confine_factor >= 0.85`. En zonas
+  límite el factor parpadea por encima/debajo del umbral frame a frame,
+  así que `want_fp` (y por tanto hd2d_target) daba la vuelta cada frame
+  y el blend volvía a empezar una y otra vez (~0.45s x 4).
+  Arreglo (src/main.rs): histeresis/debounce asimétrico con
+  `auto_fp_latch` + `mode_debounce`: entrar en FP tras 0.18s sostenido,
+  salir tras 0.30s sostenido (AUTO_FP_ENTER/EXIT_DEBOUNCE). El estado
+  crudo solo comuta el latch si se mantiene ese tiempo, así el blend
+  arranca y termina sin invertirse. `fp_manual` (V) sigue siendo
+  inmediato.
+
+2) WASD EN TERCERA PERSONA (probado y REVERTIDO el 2026-09-18)
+--------------------------------------------------------------------
+  El usuario confirmó: W debe mover al héroe hacia donde está girado
+  su cuerpo (y no hacia el eje fijo de la cámara iso 45°).
+  Arreglo (src/camera.rs + src/main.rs):
+  - Nueva `App::walk_yaw()`: en HD-2D devuelve `player.facing`; el tick
+    del jugador usa esta base (W/S/A/D relativos al cuerpo).
+  - `follow_hd2d_framed()` acepta `chase_facing: Option<f32>`: cuando el
+    diorama domina (hd2d_amount >= 0.5) la cámara rota su orbita
+    (HD2D_CHASE_LERP = 0.14) para colocarse suavemente detrás del héroe,
+    estética "persecución ligera" manteniendo pitch/distancia `iso`.
+  - Stairs/dig (pad direccional) siguen usando `move_yaw` = cámara, para
+    no romper la rejilla iso de construcción.
+
+1) CAÍDA DE FPS 150 -> 30 (en el cuadro del 5%)
+-----------------------------------------------
+  Apliqué un tope claro de presupuesto al streaming:
+  - `stream_around_timed_look` generaba hasta 12 chunks
+    (HD2D_MAX_GEN_KICK_PER_FRAME) en un único `par_iter` SIN mirar el
+    reloj: un frame largo por generación. Ahora genera en oleadas
+    (STREAM_GEN_WAVE = 4) y rompe el bucle cuando se pasa del
+    presupuesto (HD2D_FRAME_STREAM_BUDGET_MS). Solo se marcan Reserved
+    los chunks de la oleada concreta, el resto se reintenta el frame
+    siguiente (sin conchas Reserved atascadas).
+  - PENDIENTE de confirmar con el usuario si la caída persiste y en qué
+    vista; si sigue en FP apuntar a overdraw/fill-rate.
+
+Verificación: cargo test --bin microverse -> 168 passed, 0 failed.
+
+-- REVERSIÓN del WASD (2026-09-18, tras playtest): el usuario NO quiere
+   el movimiento "W = donde mira el héroe" ni la cámara persecución.
+   Mantiene: altura de cámara de tanque (rayo iso fijo) + giro libre con
+   Q/E (orbit_hd2d ±45°). WASD vuelve a ser RELATIVO A LA CÁMARA
+   (combate libre): W aleja del objetivo de la cámara, A/D strafe lateral.
+   Se revirtieron `walk_yaw` y `chase_facing`/`HD2D_CHASE_LERP` por
+   completo (src/main.rs y src/camera.rs). Quedan vigentes: histeresis
+   de la transición FP y el tope de generación del streaming.
+
+## PLAN DE RENDIMIENTO (150 → 30 FPS en ambas vistas)
+
+Diagnóstico por inspección: en el HD-2D no hay culling de ninguna clase
+(viñeta "HD2D = visible = near" en render:1915 condicionada por
+DEBUG_DISABLE_CULLING en release), y el diorama dibuja >180 secciones a
+25° de FOV. En primera persona el embudo mental de hitos cae a 150 → pero
+al entrar a zonas densas (cueva / interior con culling de caras off) el
+overdraw del píxel dispara. Los tirones = spikes de streaming porque el
+`par_iter` generaba TODA la oleada (hasta 12 chunks) sin mirar el reloj.
+
+YA APLICADO (este cambio de sesión) — garantizado seguro:
+1. Presupuesto VERDADERO de streaming por frame: `stream_gen_kicks()` en
+   `stream_around_timed_look` ahora genera en OLEADAS de 4 y comprueba
+   `start.elapsed() >= budget` ENTRE oleadas, antes de lanzar la siguiente
+   (antes lanzaba el batch completo de 12 en un solo par_iter y nunca
+   cortaba). Reserved ya no se deja atascado: solo la oleada concreta se
+   marca, el resto se reintenta el frame siguiente. Eso aísla los
+   micro-tirones de pasillos que seguían igual tras el fix del piso.
+2. FP ahora frustum-culla secciones (cull_sections) en cuanto la vista no
+   es diorama (hd2d_amount < 0.25): se ahorran todos los fills/overdraw
+   detrás y a los lados del héroe — la mitad de la caída a 30 en cuevas.
+   El diorama sigue sin cull (a propósito: el cono de 25° + fisheye rompe
+   el culling, ver nota en render:1913).
+
+PROPUESTAS (para que elijas — cambian calidad/render):
+[A] Escalar interno de resolución en HD-2D (p.ej. 0.66× del framebuffer a
+    un scene_tex más chico y upscale con el blur pasante). Máxima mejora
+    de fill-rate en el diorama; un pelín más suave la imagen (el bokeh ya
+    enmascara). Coste: re-tocar uniformes texel en blender/raytracing.
+[B] Shadow map 1024 → 768/512 en HD-2D solo (el cono es corto y de 25°).
+    Baja un ~15-25% del coste de la pasada de sombras; sombras algo menos
+    nítidas en la diorama.
+[C] Thread-affinity / sincronizar el par_iter de meshing al pool de
+    wgpu: hoy 4 hilos de meshing compiten con 2-4 de conversión. El
+    escalado de chunks por frame ya está capado; es tune fino.
+[D] Reducir HD2D_EDGE_BLUR / HD2D_BLUR_AMOUNT un 30% (bokeh más barato en
+    la diorama; menos "lente de pez").
+
+Recomendado probar primero: [A], única que levanta el diorama entero.
+
+2026-09-19 — APLICADOS LOS 3 FPS (confirmación /home/ramon/proyectos/microvoxel)
+======================================================================
+
+  Tras la sesión de exploración de llenado, implementé y verifiqué (build + 
+  tests) las tres medidas que propusiste. Detalle del alcance por cada una:
+
+  [A] ESCALA INTERNA DE ESCENA (~0.66×) — render.rs
+  -----------------------------------------------------------------
+  RUTA: pase 1 (scene→offscreen) y pase 2 (blur) usan ahora un target de 
+  escena a 2/3 de la resolución del swapchain:
+    src/render.rs:315  const SCENE_INTERNAL_SCALE: f32 = 2.0 / 3.0;
+    src/render.rs:317  fn scene_internal_size(w, h) -> (w·2/3, h·2/3)
+  Aplicación en 4 puntos coherentes:
+    - src/render.rs:1486  init: depth_view + create_scene_target a
+                          (scene_w, scene_h) internos.
+    - src/render.rs:1500  init BlurUniform: texel_x/y = 1.0/scene_internal.
+    - src/render.rs:1717  resize: depth + scene recreados a la escala 2/3.
+    - src/render.rs:2477  per-frame BlurUniform: texel_x/y = 1.0/interna.
+  Sampler del blur pasado a Linear (src/render.rs:1492) para que el upscale
+  del pase a resolución interna quede suave (el swapchain/blur pase blur→frame
+  a nativo). La AABB/confini del shader no usan texel, y el fisheye usa
+  coordenadas uv 0..1 — nada más depende del tamaño nativo.
+  APORTE: ~2.25× menos fill en los pases de escena+blur, exactamente donde
+  el diorama HD-2D gastaba; el bokeh/fisheye enmascara la pérdida de texels
+  (tu elección).
+
+  [B] SHADOW MAP 1024→768 (HD-2D) — render.rs + shader.wgsl
+  -----------------------------------------------------------------
+    src/render.rs:310  SHADOW_MAP_SIZE: 1024 → 768 (aún 4× por encima de
+                       shaders en diorama; sombras PCF compensaron).
+    src/shader.wgsl:98/122  texel PCF: 1.0/1536 → 1.0/1152 (corregido junto
+                       con el mapa → soak de 9-tap idéntico en coord. mapa).
+  El vendedor de sombras llevaba el tamaño; el PCF ahora sigue la escala del
+  mapa (los 3 «1/1536» ya no flotan). Gana fill del shadow pass en HD-2D.
+
+  [C] EDGE BLUR −30% (HD-2D) — world.rs
+  -----------------------------------------------------------------
+    src/world.rs:378  HD2D_EDGE_BLUR: 0.22 → 0.154 (el borde/edge fisheye
+                      menos agresivo → tap count y blur latente del paso 2
+                      caen ~30%, y la zona central queda nítida más tiempo).
+  HD2D_EDGE_BLUR vive en world.rs (const) consumida por render.rs:2448.
+  (HD2D_EDGE_BLUR[0.22 pasa a 0.154] — verificada su única lectura.)
+
+  NOTA DE COMPORTAMIENTO QUE QUEDA PARA TODAS: el pase de escena+blur es
+  COMPARTIDO entre la FP (primera persona) y el diorama. La escala 2/3 se
+  aplica también a FP, igual que en el diorama: en FP básico el coste de
+  fill pasa a 0.66² y la caída 150→30 que veías en ambos modos se reduce en
+  ambos. Si en FPS te fastidiase perder el píxel-nítido, la palanca está en
+  `scene_internal_size` (1:1 ⇒ FP nítido + diorama interno 0.66):
+    - hoy = misma escala para ambos, mínimo riesgo visual.
+    - si prefieres FP nítido 1.0 + diorama 0.66, es un `if` en esa fn.
+
+  VERIFICACIÓN: build ok; tests unitarios (init + resize + per-frame texel
+  + shadow-biases) en verde; el sampler Linear no rompió fisheye ni el
+  cutaway. Espero tu prueba jugada: 150→30 debería quedar más pegado a
+  60 (diorama) y FP notablemente más alto; si quisieras, los siguientes
+  pasos son: [A-ext] FP nítido + diorama interno (arriba), y el cull por
+  frustum en FP ya activado la sesión previa.

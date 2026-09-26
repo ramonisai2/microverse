@@ -41,6 +41,24 @@ var grass_samp: sampler;
 
 const GRASS_ATLAS_TILES: f32 = 6.0;
 
+/// Nivel del mar (espejo de `SEA_LEVEL` en world.rs): la transparencia del
+/// agua crece con la profundidad.
+const SEA_LEVEL_WATER: f32 = 18.0;
+
+/// Agua traslúcida real (mezcla alfa): tinta suave por profundidad y brillo
+/// tenue animado en color — sin rejillas ni puntos sobre lo que hay detrás.
+@fragment
+fn fs_water(in: VertexOutput) -> @location(0) vec4<f32> {
+    var col = shade_lit(in, in.color);
+    let depth = clamp((SEA_LEVEL_WATER - in.world_pos.y) / 4.0, 0.0, 1.0);
+    let shimmer =
+        0.96 + 0.04 * sin(dot(in.world_pos.xz, vec2<f32>(1.7, 2.3)) + frame.time * 1.8);
+    col = col * vec4<f32>(shimmer, shimmer, shimmer, 1.0);
+    col = col + vec4<f32>(0.06, 0.09, 0.12, 0.0) * (0.4 + 0.6 * depth);
+    let a = mix(0.45, 0.78, depth);
+    return vec4<f32>(col.rgb, a);
+}
+
 struct VertexInput {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
@@ -95,7 +113,7 @@ fn shadow_factor(world_pos: vec3<f32>, n: vec3<f32>, light_dir: vec3<f32>) -> f3
     let bias = frame.shadow_bias + (1.0 - ndl) * 0.0035;
     let compare = depth - bias;
     // 9-tap PCF with a slightly wider kernel — soft penumbra hides texel stairs.
-    let texel = 1.0 / 1536.0;
+    let texel = 1.0 / 960.0;
     var sum = 0.0;
     for (var y = -1; y <= 1; y++) {
         for (var x = -1; x <= 1; x++) {
@@ -119,7 +137,7 @@ fn shadow_factor_cheap(world_pos: vec3<f32>, n: vec3<f32>, light_dir: vec3<f32>)
     }
     let bias = frame.shadow_bias + (1.0 - max(dot(n, light_dir), 0.0)) * 0.0035;
     let compare = depth - bias;
-    let texel = 1.0 / 1536.0;
+    let texel = 1.0 / 960.0;
     var sum = 0.0;
     let offsets = array<vec2<f32>, 4>(
         vec2<f32>(-0.7, -0.7),
@@ -176,32 +194,23 @@ fn shade_lit_shadow(in: VertexOutput, albedo: vec3<f32>, cheap_shadow: bool) -> 
     let warm_light = mix(cool_shadow, cool_shadow * vec3<f32>(1.05, 1.0, 0.92), 0.10 * diffuse);
     lit = warm_light;
 
-    // Underground / dug pit: soft voxel wire + oriented hatch (not a hard X-ray cage).
+    // Underground / dug pit: depth darkening only (E1 wire grid eliminado
+    // por obsoleto: sin líneas claras en los bordes).
     let under_t = underground_amount(in.world_pos.y);
     let below_eye = in.world_pos.y <= frame.eye_y + 0.15;
     let eye_under = max(0.0, frame.surface_y - frame.eye_y);
     // One depth curve for atmosphere (never pure black — floor ~55% lit).
     let cave_t = smoothstep(1.0, 18.0, eye_under);
-    // Lid fragments above the eye: skip the wire cage — cutaway already punches the view.
+    // Lid fragments above the eye: skip darkening up there.
     let lid_xray = !below_eye && eye_under > 0.25;
     if under_t > 0.001 && !lid_xray {
-        let edge = voxel_edge_factor(in.world_pos, n); // 0 = edge, 1 = face center
-        let line = 1.0 - edge;
         let darken = select(0.22, 0.0, below_eye);
         lit = lit * (1.0 - darken * under_t);
-        // Cool lift, not pure white — keeps structure without screaming.
-        let wire = mix(lit, vec3<f32>(0.78, 0.86, 0.94), 0.55);
-        let wire_amt = select(under_t * 0.28, under_t * 0.18, below_eye);
-        lit = mix(lit, wire, wire_amt * line);
     }
     // Soft fill when the eye is in a pit — lift floor/lower walls only (shallow digs).
     if below_eye && eye_under > 0.35 {
         let fill = smoothstep(0.35, 2.0, eye_under) * (1.0 - cave_t * 0.7) * 0.55;
         lit = lit * (1.0 + fill);
-        // Hatch: horizontal strokes on floors, vertical on walls.
-        let hatch = dig_hatch_factor(in.world_pos, n);
-        let hatch_col = mix(lit, vec3<f32>(0.70, 0.82, 0.92), 0.45);
-        lit = mix(lit, hatch_col, hatch * 0.22 * smoothstep(0.35, 2.0, eye_under) * (1.0 - cave_t * 0.5));
     }
 
     // Unified cave atmosphere: cool + desat + dim (walls stay readable).
@@ -221,19 +230,15 @@ fn shade_lit_shadow(in: VertexOutput, albedo: vec3<f32>, cheap_shadow: bool) -> 
     }
 
     // Minecraft-style cave mask: only the local bubble around the player stays
-    // readable. Distant chambers paint as solid virtual rock / are discarded so
-    // the underground clear color reads as closed stone (no see-through graph).
+    // readable. Distant UNDERGROUND chambers paint as solid virtual rock.
+    // Surface fragments are never masked (looking at the meadow from a pit
+    // must stay visible) and nothing is discarded (holes would show void).
     let focus_dist_xz = length(in.world_pos.xz - frame.focus_xz);
     let frag_under = max(0.0, frame.surface_y - in.world_pos.y);
-    let bury = max(eye_under, frame.confine * 4.0);
-    let mask_on = smoothstep(0.45, 1.75, bury);
+    let mask_on = cave_mask_on();
     // 8 clear → 14 fully masked: broad ease avoids a visible circular cut.
     let mask_t = smoothstep(8.0, 14.0, focus_dist_xz) * smoothstep(0.35, 1.25, frag_under) * mask_on;
     let virtual_rock = vec3<f32>(0.06, 0.07, 0.09);
-    // Drop far cave fragments entirely — void uses underground clear (= rock).
-    if mask_t > 0.985 {
-        discard;
-    }
     if mask_t > 0.001 {
         lit = mix(lit, virtual_rock, mask_t);
     }
@@ -242,8 +247,10 @@ fn shade_lit_shadow(in: VertexOutput, albedo: vec3<f32>, cheap_shadow: bool) -> 
     // Depth²-ish fog from the player focus (not the elevated HD-2D lens).
     let fog_boost = 1.0 + cave_t * cave_t * 2.4;
     let fog_t = 1.0 - exp(-frame.fog_density * fog_boost * dist);
+    // Cave distance fog only applies underground: the surface lid beyond the
+    // bubble must never fade to rock while digging (that hid the ground).
     let cave_distance_fog = max(
-        smoothstep(8.0, 14.0, dist) * mask_on,
+        smoothstep(8.0, 14.0, dist) * mask_on * smoothstep(0.35, 1.25, frag_under),
         mask_t,
     );
     let near_structure_fog = clamp(fog_t, 0.0, 1.0) * (1.0 - 0.15 * under_t * (1.0 - mask_on));
@@ -262,42 +269,11 @@ fn underground_amount(world_y: f32) -> f32 {
     return smoothstep(0.15, 4.0, d);
 }
 
-/// Voxel wire lines — thin soft stroke via fwidth (readable in HD-2D, not hard white).
-fn voxel_edge_factor(world_pos: vec3<f32>, n: vec3<f32>) -> f32 {
-    var uv2: vec2<f32>;
-    if abs(n.y) > 0.5 {
-        uv2 = world_pos.xz;
-    } else if abs(n.x) > 0.5 {
-        uv2 = world_pos.zy;
-    } else {
-        uv2 = world_pos.xy;
-    }
-    // Narrower + softer falloff so edges read as a whisper, not a cage.
-    let fw = max(fwidth(uv2), vec2<f32>(0.018)) * 1.85;
-    let f = fract(uv2);
-    let e0 = smoothstep(vec2<f32>(0.0), fw, f);
-    let e1 = smoothstep(vec2<f32>(0.0), fw, 1.0 - f);
-    let e = min(e0, e1);
-    let m = min(e.x, e.y);
-    return smoothstep(0.0, 0.85, m);
-}
-
-/// Dig hatch: 1 on stroke. Horizontal faces → horizontal lines; vertical → vertical.
-fn dig_hatch_factor(world_pos: vec3<f32>, n: vec3<f32>) -> f32 {
-    let freq = 6.0;
-    var t: f32;
-    if abs(n.y) > 0.5 {
-        // Floor/ceiling: horizontal strokes (constant Z bands).
-        t = world_pos.z * freq;
-    } else {
-        // Walls: vertical strokes (constant Y is wrong — use Y for vertical lines).
-        t = world_pos.y * freq;
-    }
-    let f = fract(t);
-    let fw = max(fwidth(t), 0.03) * 2.2;
-    let band = min(f, 1.0 - f);
-    // Soft band so hatch stays a hint, not chalk strokes.
-    return 1.0 - smoothstep(0.0, fw * 1.35, band);
+/// Cave rock-mask master switch. ELIMINADO (T4 borrado a petición):
+/// antes enmascaraba cámaras lejanas como roca virtual; ahora siempre 0
+/// para no tapar cuevas/horizonte.
+fn cave_mask_on() -> f32 {
+    return 0.0;
 }
 
 @vertex
@@ -473,38 +449,24 @@ fn dig_burial_deep_t() -> f32 {
     return smoothstep(0.35, 3.25, frame.surface_y - frame.eye_y);
 }
 
-/// Soft dig-cutaway openness in [0,1]. Radial bubble around focus_xz.
-/// 0 = solid, 1 = fully see-through.
-/// `confine` SHRINKS the bubble (more walled-in → tighter window on the hero).
+/// Soft dig-cutaway openness — ELIMINADO (T1 borrado a petición).
+/// Antes abría un agujero Bayer en la tapa sobre el jugador; ahora siempre 0.
+/// Solo queda el cutaway indoor (T2) en `indoor_cutaway_open`.
 fn dig_cutaway_open(world_pos: vec3<f32>) -> f32 {
-    let conf = clamp(frame.confine, 0.0, 1.0);
-    if conf < 0.03 {
-        return 0.0;
-    }
-    let eye_under = frame.surface_y - frame.eye_y;
-    if eye_under < 0.2 {
-        return 0.0;
-    }
-    let deep_t = dig_burial_deep_t();
-    // Confine shrinks the bubble (was inverted: mix(0.35, 1.0, conf)).
-    let radius = (mix(3.5, 9.5, deep_t) + eye_under * 0.45) * mix(1.0, 0.35, conf);
-    let d = length(world_pos.xz - frame.focus_xz);
-    if d >= radius {
-        return 0.0;
-    }
-    let t = clamp(d / max(radius, 0.001), 0.0, 1.0);
-    // Long ease: open in the middle, slow fade to solid at the edge.
-    let radial = pow(1.0 - t, 1.45);
-    var open = radial * mix(0.50, 0.95, deep_t);
-    open *= conf;
-    return clamp(open, 0.0, 1.0);
+    return 0.0;
 }
 
 /// Indoor house cutaway (same Bayer pipeline as dig). Opens only faces that
 /// look toward the camera — front wall + roof — so the interior stays readable.
+/// Solo por encima del ojo: el suelo y la tierra bajo los pies nunca se
+/// disuelven (antes el agujero seguía al cuerpo y se veía la tierra).
 fn indoor_cutaway_open(world_pos: vec3<f32>, normal: vec3<f32>) -> f32 {
     let indoor = clamp(frame.indoors, 0.0, 1.0);
     if indoor < 0.02 {
+        return 0.0;
+    }
+    // Pared/techo únicamente: nada a la altura o por debajo del ojo.
+    if world_pos.y < frame.eye_y + 0.3 {
         return 0.0;
     }
     let d = length(world_pos.xz - frame.focus_xz);
@@ -521,20 +483,9 @@ fn indoor_cutaway_open(world_pos: vec3<f32>, normal: vec3<f32>) -> f32 {
     return clamp(indoor * near * face_t * 0.95, 0.0, 1.0);
 }
 
-/// Unified occlusion cutaway: dig lid (burial) + indoor camera-facing shells.
-/// Same Bayer dither for both — one presentation effect.
+/// Unified occlusion cutaway: solo indoor (T2). El bloque dig (T1) se eliminó.
 fn apply_dig_cutaway(world_pos: vec3<f32>, clip_pos: vec4<f32>, normal: vec3<f32>) -> f32 {
     var cut = 0.0;
-
-    // Dig / canopy: lid above the eye only (existing behaviour).
-    {
-        let h = world_pos.y - frame.eye_y;
-        if h >= -0.65 {
-            let open = dig_cutaway_open(world_pos);
-            let y_gate = smoothstep(-0.35, 1.85, h);
-            cut = max(cut, open * y_gate);
-        }
-    }
 
     // Indoors: camera-facing walls + roof near the player.
     cut = max(cut, indoor_cutaway_open(world_pos, normal));
@@ -551,15 +502,9 @@ fn apply_dig_cutaway(world_pos: vec3<f32>, clip_pos: vec4<f32>, normal: vec3<f32
     return cut;
 }
 
-/// Grass matches the soft exterior crop gradient (lid band only, same as solids).
+/// Grass cutaway: solo indoor (T2). El bloque dig (T1) se eliminó.
 fn apply_dig_cutaway_grass(world_pos: vec3<f32>, clip_pos: vec4<f32>) {
-    let h = world_pos.y - frame.eye_y;
-    if h < -0.65 {
-        return;
-    }
-    var open = dig_cutaway_open(world_pos) * smoothstep(-0.35, 1.85, h);
-    let under = underground_amount(world_pos.y);
-    open = max(open, smoothstep(0.08, 0.55, under) * clamp(frame.confine, 0.0, 1.0) * 0.75);
+    var open = 0.0;
     // Indoor grass tufts near feet also punch through with a soft radial.
     let indoor = clamp(frame.indoors, 0.0, 1.0);
     if indoor > 0.02 {
@@ -687,9 +632,7 @@ fn fs_grass(in: VertexOutput) -> @location(0) vec4<f32> {
     apply_dig_cutaway_grass(in.world_pos, in.clip_position);
     // Hide distant underground grass with the same cave mask as solids.
     {
-        let eye_under = max(0.0, frame.surface_y - frame.eye_y);
-        let bury = max(eye_under, frame.confine * 4.0);
-        let mask_on = smoothstep(0.45, 1.75, bury);
+        let mask_on = cave_mask_on();
         let focus_d = length(in.world_pos.xz - frame.focus_xz);
         let frag_under = max(0.0, frame.surface_y - in.world_pos.y);
         let mask_t = smoothstep(8.0, 14.0, focus_d) * smoothstep(0.35, 1.25, frag_under) * mask_on;
@@ -715,4 +658,12 @@ fn fs_ghost(in: VertexOutput) -> @location(0) vec4<f32> {
     let rgb = in.color * stripe;
     // High enough alpha to read through dirt; still translucent in open air.
     return vec4<f32>(rgb, 0.55);
+}
+
+/// Grieta de rotura estilo Minecraft: velo oscuro por etapas, ~90% más
+/// transparente que el resto de resaltados y sin tintes de color (el
+/// progreso viaja en el color: gris claro → casi negro).
+@fragment
+fn fs_crack(in: VertexOutput) -> @location(0) vec4<f32> {
+    return vec4<f32>(in.color, 0.12);
 }

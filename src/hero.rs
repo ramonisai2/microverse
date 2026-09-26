@@ -523,27 +523,22 @@ pub fn bake_held_tool_icon(
     };
 
     let mut zbuf = vec![f32::NEG_INFINITY; n_px];
-    let put = |pixels: &mut [u8],
-               zbuf: &mut [f32],
-               x: i32,
-               y: i32,
-               z: f32,
-               rgb: [f32; 3],
-               shade: f32| {
-        if x < 0 || y < 0 || x >= size as i32 || y >= size as i32 {
-            return;
-        }
-        let i = (y as u32 * size + x as u32) as usize;
-        if z <= zbuf[i] {
-            return;
-        }
-        zbuf[i] = z;
-        let o = i * 4;
-        pixels[o] = (rgb[0] * shade * 255.0).clamp(0.0, 255.0) as u8;
-        pixels[o + 1] = (rgb[1] * shade * 255.0).clamp(0.0, 255.0) as u8;
-        pixels[o + 2] = (rgb[2] * shade * 255.0).clamp(0.0, 255.0) as u8;
-        pixels[o + 3] = 255;
-    };
+    let put =
+        |pixels: &mut [u8], zbuf: &mut [f32], x: i32, y: i32, z: f32, rgb: [f32; 3], shade: f32| {
+            if x < 0 || y < 0 || x >= size as i32 || y >= size as i32 {
+                return;
+            }
+            let i = (y as u32 * size + x as u32) as usize;
+            if z <= zbuf[i] {
+                return;
+            }
+            zbuf[i] = z;
+            let o = i * 4;
+            pixels[o] = (rgb[0] * shade * 255.0).clamp(0.0, 255.0) as u8;
+            pixels[o + 1] = (rgb[1] * shade * 255.0).clamp(0.0, 255.0) as u8;
+            pixels[o + 2] = (rgb[2] * shade * 255.0).clamp(0.0, 255.0) as u8;
+            pixels[o + 3] = 255;
+        };
 
     let rast_tri = |pixels: &mut [u8],
                     zbuf: &mut [f32],
@@ -767,11 +762,8 @@ pub fn for_each_hero_face(
                     // (e.g. torso/arm) — keep it exposed so a moving limb
                     // reveals its cut cross-section instead of leaving a hole.
                 }
-                let n_design = transform_normal(
-                    *part,
-                    pose,
-                    Vec3::new(nx as f32, ny as f32, nz as f32),
-                );
+                let n_design =
+                    transform_normal(*part, pose, Vec3::new(nx as f32, ny as f32, nz as f32));
                 let n_world = (right * n_design.x + up * n_design.y + forward * (-n_design.z))
                     .normalize_or_zero();
                 let na = n_world.to_array();
@@ -881,10 +873,7 @@ mod tests {
                 let p2 = Vec3::from_array(face[2].0);
                 let n = Vec3::from_array(face[0].1);
                 let cross = (p1 - p0).cross(p2 - p0);
-                assert!(
-                    cross.dot(n) > 0.0,
-                    "posed face winding not CCW outward"
-                );
+                assert!(cross.dot(n) > 0.0, "posed face winding not CCW outward");
                 face.clear();
             }
         });

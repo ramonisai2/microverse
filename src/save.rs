@@ -12,6 +12,22 @@ use std::path::{Path, PathBuf};
 pub const SAVE_REL: &str = "saves/microverse.json";
 pub const AUTOSAVE_SECS: f32 = 45.0;
 
+/// Directorio externo (Android: almacenamiento interno de la app).
+/// Si está fijado, el guardado vive ahí en vez de junto al cwd.
+static EXTERNAL_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Fija el directorio de guardado (llamar desde `android_main`).
+pub fn set_external_dir(dir: PathBuf) {
+    let _ = EXTERNAL_DIR.set(dir);
+}
+
+/// Directorio externo fijado, si lo hay. Lo usa el editor para guardar sus
+/// escenas en el mismo sitio que la partida (en Android, dentro del
+/// almacenamiento de la app).
+pub fn external_dir() -> Option<PathBuf> {
+    EXTERNAL_DIR.get().cloned()
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct SaveFile {
     version: u32,
@@ -36,8 +52,11 @@ struct PlayerSave {
 struct HotbarSave {
     slots: [HotbarItem; HOTBAR_SLOTS],
     selected: Option<usize>,
+    #[serde(default)]
+    combo_count: u32,
+    #[serde(default)]
+    shift_cooldown: u64,
 }
-
 #[derive(Clone, Serialize, Deserialize)]
 struct SlotSave {
     slot: usize,
@@ -67,6 +86,10 @@ pub struct LoadedSave {
 }
 
 fn search_paths() -> Vec<PathBuf> {
+    // Android primero (si está fijado).
+    if let Some(dir) = EXTERNAL_DIR.get() {
+        return vec![dir.join("microverse.json")];
+    }
     let mut paths = Vec::new();
     paths.push(PathBuf::from(SAVE_REL));
     if let Ok(cwd) = std::env::current_dir() {
@@ -82,6 +105,10 @@ fn search_paths() -> Vec<PathBuf> {
 }
 
 fn preferred_path() -> PathBuf {
+    // Android primero (si está fijado).
+    if let Some(dir) = EXTERNAL_DIR.get() {
+        return dir.join("microverse.json");
+    }
     if let Ok(cwd) = std::env::current_dir() {
         return cwd.join(SAVE_REL);
     }
@@ -149,6 +176,8 @@ pub fn write_snapshot(
         hotbar: HotbarSave {
             slots: hotbar.slots,
             selected: hotbar.selected,
+            combo_count: hotbar.combo_count,
+            shift_cooldown: hotbar.shift_cooldown,
         },
         inventory: inv_slots,
         cursor,
@@ -188,10 +217,12 @@ fn parse_save(text: &str, path: &Path) -> Result<LoadedSave, String> {
         hearts: file.player.hearts,
         bottles: file.player.bottles,
         pickaxe_durability: file.pickaxe_durability,
-        hotbar: Hotbar {
-            slots: file.hotbar.slots,
-            selected,
-        },
+hotbar: Hotbar {
+                slots: file.hotbar.slots,
+                selected,
+                combo_count: file.hotbar.combo_count,
+                shift_cooldown: file.hotbar.shift_cooldown,
+            },
         inventory: inventory_from_slots(&file.inventory, file.cursor.as_ref()),
         edits: file
             .edits
@@ -199,6 +230,13 @@ fn parse_save(text: &str, path: &Path) -> Result<LoadedSave, String> {
             .map(|e| (IVec3::new(e.x, e.y, e.z), e.material))
             .collect(),
     })
+}
+
+/// ¿Hay alguna partida guardada? Solo mira si el archivo existe (no lo
+/// parsea): el menú atenúa la fila "partida guardada" sin gastarse un
+/// `try_load` en cada frame.
+pub fn exists() -> bool {
+    search_paths().iter().any(|p| p.is_file())
 }
 
 pub fn try_load() -> Option<LoadedSave> {
@@ -246,6 +284,8 @@ mod tests {
                     HotbarItem::Empty,
                 ],
                 selected: Some(1),
+                combo_count: 0,
+                shift_cooldown: 0,
             },
             inventory: vec![SlotSave {
                 slot: 0,

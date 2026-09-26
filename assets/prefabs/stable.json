@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "id": "stable",
+  "name": "Establo",
+  "size": [7, 4, 5],
+  "anchor": [3, 0, 2],
+  "entrance": { "position": [3, 1, 0], "facing": "south" },
+  "lot": { "width": 9, "depth": 7 },
+  "palette": {
+    ".": "air",
+    "S": "village_stone",
+    "W": "wood_planks",
+    "R": "wood_roof",
+    "N": "sand"
+  },
+  "layers": [
+    [
+      "SSSSSSS",
+      "SSSSSSS",
+      "SSSSSSS",
+      "SSSSSSS",
+      "SSSSSSS"
+    ],
+    [
+      ".......",
+      "W.....W",
+      "W.....W",
+      "W..NN.W",
+      "WWWWWWW"
+    ],
+    [
+      "WWWWWWW",
+      "W.....W",
+      "W.....W",
+      "W.....W",
+      "WWWWWWW"
+    ],
+    [
+      "RRRRRRR",
+      "RRRRRRR",
+      "RRRRRRR",
+      "RRRRRRR",
+      "RRRRRRR"
+    ]
+  ]
+}

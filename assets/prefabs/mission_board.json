@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "id": "mission_board",
+  "name": "Tablón de encargos",
+  "size": [3, 3, 3],
+  "anchor": [1, 0, 1],
+  "entrance": { "position": [1, 1, 0], "facing": "south" },
+  "lot": { "width": 5, "depth": 5 },
+  "palette": {
+    ".": "air",
+    "W": "wood_planks",
+    "N": "sand"
+  },
+  "layers": [
+    [
+      "W.W",
+      "...",
+      "..."
+    ],
+    [
+      "WWW",
+      "NNN",
+      "..."
+    ],
+    [
+      "WWW",
+      "NNN",
+      "..."
+    ]
+  ]
+}

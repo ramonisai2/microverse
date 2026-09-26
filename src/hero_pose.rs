@@ -313,6 +313,107 @@ impl HeroPose {
         }
     }
 
+    /// Sprint leap (Shift+jump): hurdle pose — lead knee tucked high, trail
+    /// leg extended back, arms swept back. `amount` 0→1 in air while sprinting.
+    pub fn from_sprint_jump(vel_y: f32, amount: f32) -> Self {
+        let a = amount.clamp(0.0, 1.0);
+        let ascending = (vel_y / 8.0).clamp(-1.0, 1.0);
+        let tuck = (1.0 + ascending.max(0.0) * 0.25) * a;
+        Self {
+            head_y: 8f32.to_radians() * a,
+            l_arm_z: -6f32.to_radians() * a,
+            r_arm_z: 6f32.to_radians() * a,
+            l_arm_x: 48f32.to_radians() * a,
+            r_arm_x: 42f32.to_radians() * a,
+            l_elbow_x: 30f32.to_radians() * a,
+            r_elbow_x: 34f32.to_radians() * a,
+            l_leg_x: -72f32.to_radians() * tuck,
+            r_leg_x: 38f32.to_radians() * a,
+            l_knee_x: -95f32.to_radians() * tuck,
+            r_knee_x: -12f32.to_radians() * a,
+            l_foot_x: 22f32.to_radians() * a,
+            r_foot_x: 26f32.to_radians() * a,
+        }
+    }
+
+    /// Sword low thrust (Shift+click): lunge with the blade punched forward
+    /// low, off arm back for balance. `t01` 0→1 through the stab.
+    pub fn from_sword_thrust(t01: f32, amount: f32, timid: bool) -> Self {
+        let a = amount.clamp(0.0, 1.0) * if timid { 0.55 } else { 1.0 };
+        let t = t01.clamp(0.0, 1.0);
+        // Fast extend, brief hold, recover.
+        let ext = (t * std::f32::consts::PI).sin().max(0.0);
+        Self {
+            head_y: 6f32.to_radians() * a * ext,
+            l_arm_z: 10f32.to_radians() * a,
+            r_arm_z: -8f32.to_radians() * a,
+            l_arm_x: (20f32.to_radians() + ext * 25f32.to_radians()) * a,
+            r_arm_x: (-30f32.to_radians() - ext * 45f32.to_radians()) * a,
+            l_elbow_x: 30f32.to_radians() * a,
+            r_elbow_x: (28f32.to_radians() - ext * 20f32.to_radians()) * a,
+            l_leg_x: (-28f32.to_radians() * ext) * a,
+            r_leg_x: (24f32.to_radians() * ext) * a,
+            l_knee_x: (-42f32.to_radians() * ext) * a,
+            r_knee_x: (-8f32.to_radians() * ext) * a,
+            l_foot_x: 8f32.to_radians() * a * ext,
+            r_foot_x: 4f32.to_radians() * a,
+        }
+    }
+
+    /// Sword block (Shift+right-click hold): blade across the chest, off arm
+    /// braced forward, slight crouch. Static stance scaled by `amount`.
+    pub fn from_block(amount: f32) -> Self {
+        let a = amount.clamp(0.0, 1.0);
+        Self {
+            head_y: -6f32.to_radians() * a,
+            l_arm_z: 14f32.to_radians() * a,
+            r_arm_z: -20f32.to_radians() * a,
+            l_arm_x: -35f32.to_radians() * a,
+            r_arm_x: -55f32.to_radians() * a,
+            l_elbow_x: 45f32.to_radians() * a,
+            r_elbow_x: 70f32.to_radians() * a,
+            l_leg_x: -18f32.to_radians() * a,
+            r_leg_x: 12f32.to_radians() * a,
+            l_knee_x: -25f32.to_radians() * a,
+            r_knee_x: -20f32.to_radians() * a,
+            l_foot_x: 6f32.to_radians() * a,
+            r_foot_x: 6f32.to_radians() * a,
+        }
+    }
+
+    /// Swim (crawl): alternate overhead reaches with flutter kick, head up.
+    /// `phase` is the stroke clock; `amount` 0→1 floating.
+    pub fn from_swim(phase: f32, amount: f32) -> Self {
+        let a = amount.clamp(0.0, 1.0);
+        let s = phase.sin();
+        let c = phase.cos();
+        // Brazadas opuestas amplias (delante-arriba → atrás).
+        let l_reach = (-100f32.to_radians() - s * 70f32.to_radians()) * a;
+        let r_reach = (-100f32.to_radians() + s * 70f32.to_radians()) * a;
+        let l_elbow = (30f32.to_radians() + c.max(0.0) * 25f32.to_radians()) * a;
+        let r_elbow = (30f32.to_radians() + (-c).max(0.0) * 25f32.to_radians()) * a;
+        // Patada corta alterna.
+        let l_kick = s * 20f32.to_radians() * a;
+        let r_kick = -s * 20f32.to_radians() * a;
+        let l_knee = (-18f32.to_radians() - (-s).max(0.0) * 14f32.to_radians()) * a;
+        let r_knee = (-18f32.to_radians() - s.max(0.0) * 14f32.to_radians()) * a;
+        Self {
+            head_y: s * 8f32.to_radians() * a,
+            l_arm_z: 12f32.to_radians() * a,
+            r_arm_z: -12f32.to_radians() * a,
+            l_arm_x: l_reach,
+            r_arm_x: r_reach,
+            l_elbow_x: l_elbow,
+            r_elbow_x: r_elbow,
+            l_leg_x: l_kick,
+            r_leg_x: r_kick,
+            l_knee_x: l_knee,
+            r_knee_x: r_knee,
+            l_foot_x: 14f32.to_radians() * a,
+            r_foot_x: 14f32.to_radians() * a,
+        }
+    }
+
     /// Linear blend of joint angles (`t` in 0..=1).
     pub fn lerp(self, other: Self, t: f32) -> Self {
         let t = t.clamp(0.0, 1.0);
@@ -602,29 +703,13 @@ pub fn transform_normal(part: BodyPart, pose: &HeroPose, n: Vec3) -> Vec3 {
         BodyPart::Head => rot_y(n, pose.head_y),
         BodyPart::LArm => rot_z(rot_x(n, pose.l_arm_x), pose.l_arm_z),
         BodyPart::RArm => rot_z(rot_x(n, pose.r_arm_x), pose.r_arm_z),
-        BodyPart::LForearm => {
-            rot_z(
-                rot_x(rot_x(n, pose.l_elbow_x), pose.l_arm_x),
-                pose.l_arm_z,
-            )
-        }
-        BodyPart::RForearm => {
-            rot_z(
-                rot_x(rot_x(n, pose.r_elbow_x), pose.r_arm_x),
-                pose.r_arm_z,
-            )
-        }
+        BodyPart::LForearm => rot_z(rot_x(rot_x(n, pose.l_elbow_x), pose.l_arm_x), pose.l_arm_z),
+        BodyPart::RForearm => rot_z(rot_x(rot_x(n, pose.r_elbow_x), pose.r_arm_x), pose.r_arm_z),
         BodyPart::LLeg => rot_x(n, pose.l_leg_x),
         BodyPart::RLeg => rot_x(n, pose.r_leg_x),
         BodyPart::LShin => rot_x(rot_x(n, pose.l_knee_x), pose.l_leg_x),
         BodyPart::RShin => rot_x(rot_x(n, pose.r_knee_x), pose.r_leg_x),
-        BodyPart::LFoot => rot_x(
-            rot_x(rot_x(n, pose.l_foot_x), pose.l_knee_x),
-            pose.l_leg_x,
-        ),
-        BodyPart::RFoot => rot_x(
-            rot_x(rot_x(n, pose.r_foot_x), pose.r_knee_x),
-            pose.r_leg_x,
-        ),
+        BodyPart::LFoot => rot_x(rot_x(rot_x(n, pose.l_foot_x), pose.l_knee_x), pose.l_leg_x),
+        BodyPart::RFoot => rot_x(rot_x(rot_x(n, pose.r_foot_x), pose.r_knee_x), pose.r_leg_x),
     }
 }

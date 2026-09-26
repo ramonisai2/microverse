@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "id": "barter_stall",
+  "name": "Trueque",
+  "size": [3, 3, 3],
+  "anchor": [1, 0, 1],
+  "entrance": { "position": [1, 1, 2], "facing": "south" },
+  "lot": { "width": 5, "depth": 5 },
+  "palette": {
+    ".": "air",
+    "W": "wood_planks",
+    "G": "glass",
+    "E": "emerald"
+  },
+  "layers": [
+    [
+      "W.W",
+      "...",
+      "W.W"
+    ],
+    [
+      "W.W",
+      "GEG",
+      "W.W"
+    ],
+    [
+      "WWW",
+      "WWW",
+      "WWW"
+    ]
+  ]
+}

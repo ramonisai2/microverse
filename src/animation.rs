@@ -51,7 +51,7 @@ pub const CLIP_NAMES: [&str; 9] = [
     "fist_right",
 ];
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClipFile {
     #[serde(default = "default_version")]
     pub version: String,
@@ -68,7 +68,7 @@ pub struct ClipFile {
     pub frames: Vec<FrameFile>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FrameFile {
     /// Tiempo del fotograma en segundos.
     pub t: f32,
@@ -156,6 +156,30 @@ impl AnimationClip {
     }
 }
 
+/// The 12 canonical joint names, in [`pose_from_map`] order. The editor's
+/// timeline cycles through them to pick which joint the steppers drive.
+///
+/// Kept in sync with [`canonical_joint`] by a test, not by construction, so the
+/// private alias table stays the single place that defines what a name means.
+pub fn joint_names() -> [&'static str; 12] {
+    [
+        "head_y", "l_arm_z", "r_arm_z", "l_arm_x", "r_arm_x", "l_elbow_x", "r_elbow_x", "l_leg_x",
+        "r_leg_x", "l_knee_x", "r_knee_x", "l_foot_x",
+    ]
+}
+
+/// Axis a joint rotates around: the last letter of its canonical name
+/// (`l_arm_x` → `x`, `head_y` → `y`). `None` for anything unknown, which is how
+/// the editor knows a joint has no target for a `Rot` stepper.
+pub fn joint_axis(name: &str) -> Option<char> {
+    match name.as_bytes().last()? {
+        b'x' => Some('x'),
+        b'y' => Some('y'),
+        b'z' => Some('z'),
+        _ => None,
+    }
+}
+
 /// Nombre canónico de una articulación (acepta alias del editor biped).
 fn canonical_joint(name: &str) -> Option<&'static str> {
     Some(match name {
@@ -226,7 +250,11 @@ fn pose_to_map(p: &HeroPose) -> BTreeMap<String, f32> {
 // Registro: carga assets/animations/<id>.json una vez, con fallback procedural.
 // ---------------------------------------------------------------------------
 
-fn clip_search_paths(rel: &str) -> Vec<PathBuf> {
+/// Candidate roots for a clip/animation asset: cwd, the exe directory and the
+/// manifest dir, so a build in any of those places finds `assets/animations/`.
+/// Public because the editor's clip importer lists the same folder to offer
+/// `*.json` files for import.
+pub fn clip_search_paths(rel: &str) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Ok(cwd) = std::env::current_dir() {
         paths.push(cwd.join(rel));
@@ -243,10 +271,27 @@ fn clip_search_paths(rel: &str) -> Vec<PathBuf> {
     paths
 }
 
+/// Clips embebidos (APK Android: sin sistema de archivos de assets).
+fn embedded_clip_json(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "walk" => include_str!("../assets/animations/walk.json"),
+        "sprint" => include_str!("../assets/animations/sprint.json"),
+        "dig" => include_str!("../assets/animations/dig.json"),
+        "pick_overhead" => include_str!("../assets/animations/pick_overhead.json"),
+        "sword_slash_1" => include_str!("../assets/animations/sword_slash_1.json"),
+        "sword_slash_2" => include_str!("../assets/animations/sword_slash_2.json"),
+        "sword_slash_3" => include_str!("../assets/animations/sword_slash_3.json"),
+        "fist_left" => include_str!("../assets/animations/fist_left.json"),
+        "fist_right" => include_str!("../assets/animations/fist_right.json"),
+        _ => return None,
+    })
+}
+
 fn load_registry() -> HashMap<String, AnimationClip> {
     let mut map = HashMap::new();
     for name in CLIP_NAMES {
         let rel = format!("assets/animations/{name}.json");
+        let mut done = false;
         for p in clip_search_paths(&rel) {
             let Ok(text) = std::fs::read_to_string(&p) else {
                 continue;
@@ -258,7 +303,20 @@ fn load_registry() -> HashMap<String, AnimationClip> {
                 }
                 Err(e) => log::warn!("animation: bad JSON {}: {e}", p.display()),
             }
+            done = true;
             break;
+        }
+        // Fallback embebido (Android / APK sin assets en disco).
+        if !done {
+            if let Some(text) = embedded_clip_json(name) {
+                match AnimationClip::from_json_str(text) {
+                    Ok(clip) => {
+                        log::info!("animation: embedded {name}");
+                        map.insert(name.to_string(), clip);
+                    }
+                    Err(e) => log::warn!("animation: bad embedded {name}: {e}"),
+                }
+            }
         }
     }
     map
@@ -322,6 +380,17 @@ pub fn sword_slash_pose(variant: u8, t01: f32, amount: f32, timid: bool) -> Hero
             scaled(c.sample(t01.clamp(0.0, 1.0) * c.duration_s), k)
         }
         None => HeroPose::from_sword_slash(variant, t01, amount, timid),
+    }
+}
+
+/// `t01` ∈ 0..1 dentro de la estocada; `timid` = al aire (motion reducido).
+pub fn sword_thrust_pose(t01: f32, amount: f32, timid: bool) -> HeroPose {
+    match clip("sword_thrust") {
+        Some(c) => {
+            let k = amount * if timid { 0.55 } else { 1.0 };
+            scaled(c.sample(t01.clamp(0.0, 1.0) * c.duration_s), k)
+        }
+        None => HeroPose::from_sword_thrust(t01, amount, timid),
     }
 }
 
@@ -474,6 +543,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `joint_names()` (público, lo usa el timeline del editor) tiene que
+    /// seguir siendo exactamente el conjunto que `canonical_joint` acepta, y
+    /// cada nombre debe_canonicizarse a sí mismo.
+    #[test]
+    fn joint_names_are_exactly_the_canonical_set() {
+        let names = joint_names();
+        assert_eq!(names.len(), 12);
+        for n in names {
+            assert_eq!(canonical_joint(n), Some(n), "{n} no se canoniza a sí mismo");
+            // Y toda articulación tiene un eje, que es lo que decide si un
+            // stepper Rot tiene destino.
+            let axis = joint_axis(n).unwrap_or_else(|| panic!("{n} sin eje"));
+            assert!(matches!(axis, 'x' | 'y' | 'z'));
+            assert_eq!(axis, n.as_bytes()[n.len() - 1] as char);
+        }
+        assert_eq!(joint_axis(""), None);
+        assert_eq!(joint_axis("nope"), None);
+        assert_eq!(joint_axis("head_w"), None);
     }
 
     #[test]

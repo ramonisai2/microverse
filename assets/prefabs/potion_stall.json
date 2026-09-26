@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "id": "potion_stall",
+  "name": "Tenderete de pociones",
+  "size": [3, 3, 3],
+  "anchor": [1, 0, 1],
+  "entrance": { "position": [1, 1, 2], "facing": "south" },
+  "lot": { "width": 5, "depth": 5 },
+  "palette": {
+    ".": "air",
+    "W": "wood_planks",
+    "G": "glass",
+    "L": "leaves",
+    "N": "sand"
+  },
+  "layers": [
+    [
+      "W.W",
+      "...",
+      "W.W"
+    ],
+    [
+      "W.W",
+      "GLG",
+      "W.W"
+    ],
+    [
+      "WWW",
+      "WNW",
+      "WWW"
+    ]
+  ]
+}

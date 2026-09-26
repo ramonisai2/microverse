@@ -1,4 +1,5 @@
 //! Minecraft-style player storage: 9×3 slots + UI cursor stack.
+use crate::hud::ITEM_ATLAS_ROW;
 use crate::world::{
     EmbedKind, FragmentKind, OreDrop, BLOCK_FRAGMENTS_PER_BREAK, MAX_BLOCK_FRAGMENTS,
     ORE_MICROS_PER_CUBE,
@@ -22,6 +23,8 @@ pub enum InvItem {
     SapphireCube,
     RubyCube,
     EmeraldCube,
+    /// Botas de fondo: en el inventario permiten caminar por el lecho.
+    DepthBoots,
 }
 
 impl InvItem {
@@ -37,6 +40,7 @@ impl InvItem {
             Self::SapphireCube => "cubo zafiro",
             Self::RubyCube => "cubo rubí",
             Self::EmeraldCube => "cubo esmeralda",
+            Self::DepthBoots => "botas pesadas",
         }
     }
 
@@ -48,14 +52,20 @@ impl InvItem {
     }
 
     /// Atlas column on the item row (row 4).
-    pub fn atlas_col(self) -> u32 {
+    /// Tile del atlas como (columna, fila). Devolver la fila también evita el
+    /// error de "columna fuera de rango", que con ClampToEdge samplaba el tile
+    /// vecino en vez de fallar.
+    pub fn atlas_tile(self) -> (u32, u32) {
         match self {
-            Self::DirtFrag => 0,
-            Self::StoneFrag => 1,
-            Self::CoalMicro | Self::CoalCube => 2,
-            Self::SapphireMicro | Self::SapphireCube => 3,
-            Self::RubyMicro | Self::RubyCube => 4,
-            Self::EmeraldMicro | Self::EmeraldCube => 5,
+            Self::DirtFrag => (0, ITEM_ATLAS_ROW),
+            Self::StoneFrag => (1, ITEM_ATLAS_ROW),
+            Self::CoalMicro | Self::CoalCube => (2, ITEM_ATLAS_ROW),
+            Self::SapphireMicro | Self::SapphireCube => (3, ITEM_ATLAS_ROW),
+            Self::RubyMicro | Self::RubyCube => (4, ITEM_ATLAS_ROW),
+            Self::EmeraldMicro | Self::EmeraldCube => (5, ITEM_ATLAS_ROW),
+            // La fila de items está llena (0-5) y 6-9 son las letras de la
+            // brújula, así que las botas van a un hueco libre de la fila 2.
+            Self::DepthBoots => (6, 2),
         }
     }
 
@@ -109,6 +119,7 @@ impl InvItem {
             Self::SapphireMicro | Self::SapphireCube => [0.22, 0.42, 0.92],
             Self::RubyMicro | Self::RubyCube => [0.88, 0.18, 0.22],
             Self::EmeraldMicro | Self::EmeraldCube => [0.18, 0.78, 0.38],
+            Self::DepthBoots => [0.45, 0.62, 0.78],
         }
     }
 }
@@ -472,7 +483,8 @@ impl PlayerInventory {
             self.count_of(InvItem::DirtFrag),
             self.count_of(InvItem::CoalMicro),
             self.count_of(InvItem::CoalCube),
-            self.count_of(InvItem::SapphireMicro) + self.count_of(InvItem::RubyMicro)
+            self.count_of(InvItem::SapphireMicro)
+                + self.count_of(InvItem::RubyMicro)
                 + self.count_of(InvItem::EmeraldMicro),
             self.count_of(InvItem::SapphireCube)
                 + self.count_of(InvItem::RubyCube)

@@ -343,13 +343,8 @@ impl StairTool {
                 let Some(anchor) = self.anchor else {
                     return false;
                 };
-                self.cells = compute_stair_cells(
-                    anchor,
-                    self.facing,
-                    self.incline,
-                    self.steps,
-                    self.width,
-                );
+                self.cells =
+                    compute_stair_cells(anchor, self.facing, self.incline, self.steps, self.width);
                 if self.cells.is_empty() {
                     return false;
                 }
@@ -392,14 +387,11 @@ impl StairTool {
         let d = self.facing.dir();
         let delta = target - anchor;
         let along = delta.x * d.x + delta.z * d.z;
-        self.steps = along.abs().max(STAIR_MIN_STEPS).clamp(STAIR_MIN_STEPS, STAIR_MAX_STEPS);
-        self.cells = compute_stair_cells(
-            anchor,
-            self.facing,
-            self.incline,
-            self.steps,
-            self.width,
-        );
+        self.steps = along
+            .abs()
+            .max(STAIR_MIN_STEPS)
+            .clamp(STAIR_MIN_STEPS, STAIR_MAX_STEPS);
+        self.cells = compute_stair_cells(anchor, self.facing, self.incline, self.steps, self.width);
     }
 
     fn rebuild_cells(&mut self) {
@@ -409,13 +401,7 @@ impl StairTool {
         let Some(anchor) = self.anchor else {
             return;
         };
-        self.cells = compute_stair_cells(
-            anchor,
-            self.facing,
-            self.incline,
-            self.steps,
-            self.width,
-        );
+        self.cells = compute_stair_cells(anchor, self.facing, self.incline, self.steps, self.width);
     }
 
     pub fn ghost_cells(&self) -> &[IVec3] {
@@ -572,7 +558,13 @@ mod tests {
     fn max_steps_is_ten() {
         assert_eq!(STAIR_MAX_STEPS, 24);
         let a = IVec3::new(0, 20, 0);
-        let cells = compute_stair_cells(a, TunnelFacing::East, TunnelIncline::Flat, 99, STAIR_WIDTH_MIN);
+        let cells = compute_stair_cells(
+            a,
+            TunnelFacing::East,
+            TunnelIncline::Flat,
+            99,
+            STAIR_WIDTH_MIN,
+        );
         let max_x = cells.iter().map(|c| c.x).max().unwrap();
         assert_eq!(max_x, a.x + STAIR_MAX_STEPS);
     }
@@ -580,13 +572,22 @@ mod tests {
     #[test]
     fn downward_stair_is_stepped_not_a_shaft() {
         let a = IVec3::new(0, 20, 0);
-        let cells = compute_stair_cells(a, TunnelFacing::East, TunnelIncline::Down, 8, STAIR_WIDTH_MIN);
+        let cells = compute_stair_cells(
+            a,
+            TunnelFacing::East,
+            TunnelIncline::Down,
+            8,
+            STAIR_WIDTH_MIN,
+        );
         assert!(cells.len() >= 8);
         // Never dig under the feet column.
         assert!(cells.iter().all(|c| c.x != 0));
         // Must span several X — a shaft would stack every cell on one column.
         let xs: std::collections::BTreeSet<_> = cells.iter().map(|c| c.x).collect();
-        assert!(xs.len() >= 8, "stair must advance horizontally, got xs={xs:?}");
+        assert!(
+            xs.len() >= 8,
+            "stair must advance horizontally, got xs={xs:?}"
+        );
         // Default 1-wide path along facing (East → +X at z=0).
         assert!(cells.iter().any(|c| c.z == 0));
         assert!(cells.iter().all(|c| c.z == 0), "default width is 1");
@@ -638,19 +639,23 @@ mod tests {
     fn down_matches_up_with_inverted_rise() {
         let a = IVec3::new(0, 20, 0);
         let up = compute_stair_cells(a, TunnelFacing::East, TunnelIncline::Up, 6, STAIR_WIDTH_MIN);
-        let down = compute_stair_cells(a, TunnelFacing::East, TunnelIncline::Down, 6, STAIR_WIDTH_MIN);
+        let down = compute_stair_cells(
+            a,
+            TunnelFacing::East,
+            TunnelIncline::Down,
+            6,
+            STAIR_WIDTH_MIN,
+        );
         assert_eq!(up.len(), down.len());
         for i in 1..=6 {
             let up_ys: std::collections::BTreeSet<_> =
                 up.iter().filter(|c| c.x == i).map(|c| c.y).collect();
             let down_ys: std::collections::BTreeSet<_> =
                 down.iter().filter(|c| c.x == i).map(|c| c.y).collect();
-            let expected_up: std::collections::BTreeSet<_> = (1..=STAIR_HEADROOM)
-                .map(|h| a.y + i + h)
-                .collect();
-            let expected_down: std::collections::BTreeSet<_> = (1..=STAIR_HEADROOM)
-                .map(|h| a.y - i + h)
-                .collect();
+            let expected_up: std::collections::BTreeSet<_> =
+                (1..=STAIR_HEADROOM).map(|h| a.y + i + h).collect();
+            let expected_down: std::collections::BTreeSet<_> =
+                (1..=STAIR_HEADROOM).map(|h| a.y - i + h).collect();
             assert_eq!(up_ys, expected_up, "Up step {i}");
             assert_eq!(down_ys, expected_down, "Down step {i}");
         }
@@ -659,7 +664,13 @@ mod tests {
     #[test]
     fn upward_stair_keeps_tread() {
         let a = IVec3::new(0, 5, 0);
-        let cells = compute_stair_cells(a, TunnelFacing::South, TunnelIncline::Up, 8, STAIR_WIDTH_MIN);
+        let cells = compute_stair_cells(
+            a,
+            TunnelFacing::South,
+            TunnelIncline::Up,
+            8,
+            STAIR_WIDTH_MIN,
+        );
         assert!(cells.iter().any(|c| c.z > a.z));
         // First step: tread at y=6 stays; clears 7..=9.
         assert!(!cells.contains(&IVec3::new(0, 6, 1)));
@@ -679,7 +690,13 @@ mod tests {
     #[test]
     fn flat_corridor_does_not_eat_floor() {
         let a = IVec3::new(0, 10, 0);
-        let cells = compute_stair_cells(a, TunnelFacing::East, TunnelIncline::Flat, 4, STAIR_WIDTH_MIN);
+        let cells = compute_stair_cells(
+            a,
+            TunnelFacing::East,
+            TunnelIncline::Flat,
+            4,
+            STAIR_WIDTH_MIN,
+        );
         assert!(cells.iter().all(|c| c.y >= 11));
         assert!(cells.contains(&IVec3::new(1, 11, 0)));
         assert!(cells.contains(&IVec3::new(1, 12, 0)));
@@ -690,9 +707,21 @@ mod tests {
     #[test]
     fn cardinals_point_correct_axes() {
         let a = IVec3::new(10, 10, 10);
-        let n = compute_stair_cells(a, TunnelFacing::North, TunnelIncline::Flat, 4, STAIR_WIDTH_MIN);
+        let n = compute_stair_cells(
+            a,
+            TunnelFacing::North,
+            TunnelIncline::Flat,
+            4,
+            STAIR_WIDTH_MIN,
+        );
         assert!(n.iter().any(|c| c.z < a.z));
-        let w = compute_stair_cells(a, TunnelFacing::West, TunnelIncline::Flat, 4, STAIR_WIDTH_MIN);
+        let w = compute_stair_cells(
+            a,
+            TunnelFacing::West,
+            TunnelIncline::Flat,
+            4,
+            STAIR_WIDTH_MIN,
+        );
         assert!(w.iter().any(|c| c.x < a.x));
     }
 
@@ -705,25 +734,15 @@ mod tests {
             TunnelFacing::East,
             TunnelFacing::West,
         ];
-        let inclines = [
-            TunnelIncline::Down,
-            TunnelIncline::Up,
-            TunnelIncline::Flat,
-        ];
+        let inclines = [TunnelIncline::Down, TunnelIncline::Up, TunnelIncline::Flat];
         for &facing in &facings {
             for &incline in &inclines {
                 let cells = compute_stair_cells(a, facing, incline, 6, STAIR_WIDTH_MIN);
                 assert!(!cells.is_empty(), "{facing:?}/{incline:?}");
                 // Advances along facing — never a single-column shaft.
-                let alongs: std::collections::BTreeSet<_> = cells
-                    .iter()
-                    .map(|c| along_coord(facing, *c, a))
-                    .collect();
-                assert_eq!(
-                    alongs.len(),
-                    6,
-                    "{facing:?}/{incline:?} along={alongs:?}"
-                );
+                let alongs: std::collections::BTreeSet<_> =
+                    cells.iter().map(|c| along_coord(facing, *c, a)).collect();
+                assert_eq!(alongs.len(), 6, "{facing:?}/{incline:?} along={alongs:?}");
                 assert!(alongs.iter().all(|&t| t >= 1));
                 // Each step column: HEADROOM tall (× WIDTH ⇒ HEADROOM*WIDTH cells).
                 let per_step = (STAIR_HEADROOM * STAIR_WIDTH_MIN) as usize;

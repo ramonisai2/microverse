@@ -1,4 +1,5 @@
-//! Underground chambers + connecting passages (~10% of solid under-surface volume).
+//! Underground chambers + connecting passages (~4% of solid under-surface volume).
+//! Sparse enough to feel like real caves, not swiss cheese.
 //! Chests are reserved markers only (no open / loot UI yet).
 
 use crate::world::{
@@ -10,7 +11,7 @@ use glam::IVec3;
 pub const CAVE_SEED: u32 = 0xCA7E_5EED;
 /// Target fraction of under-surface solid volume to carve (chambers + passages).
 #[allow(dead_code)]
-pub const CAVE_VOLUME_TARGET: f32 = 0.10;
+pub const CAVE_VOLUME_TARGET: f32 = 0.04;
 /// Spacing between chamber grid nodes (blocks).
 pub const CHAMBER_CELL: i32 = 8;
 /// Fraction of chambers that get a reserved chest on the floor.
@@ -18,7 +19,8 @@ pub const CHEST_CHANCE: f32 = 0.20;
 /// Passage corridor width (blocks).
 pub const PASSAGE_WIDTH: i32 = 2;
 /// Chance a grid node hosts a chamber (drives total carve ≈ [`CAVE_VOLUME_TARGET`]).
-const CHAMBER_SPAWN_PCT: u32 = 82;
+/// Kept sparse on purpose: a chamber every ~3rd node reads as natural caves.
+const CHAMBER_SPAWN_PCT: u32 = 35;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Chamber {
@@ -38,11 +40,7 @@ pub struct Chamber {
 
 /// Stable chamber at grid node `(ix, iz)`, or `None` if this cell is skipped / too shallow.
 pub fn chamber_node(ix: i32, iz: i32) -> Option<Chamber> {
-    let h = mix_seed(
-        CAVE_SEED ^ WORLD_SEED,
-        ix as u32,
-        iz as u32,
-    );
+    let h = mix_seed(CAVE_SEED ^ WORLD_SEED, ix as u32, iz as u32);
     // Spawn rate tuned with CHAMBER_CELL for ~10% under-surface carve volume.
     if (h % 100) >= CHAMBER_SPAWN_PCT {
         return None;
@@ -152,8 +150,8 @@ fn passage_cells(a: &Chamber, b: &Chamber) -> Vec<(i32, i32, f32)> {
             i as f32 / (n - 1.0)
         };
         // Width-2: offset along the secondary axis of the current leg.
-        let along_x = i + 1 < spine.len() && spine[i + 1].0 != px
-            || (i > 0 && spine[i - 1].0 != px);
+        let along_x =
+            i + 1 < spine.len() && spine[i + 1].0 != px || (i > 0 && spine[i - 1].0 != px);
         if along_x || spine.len() == 1 {
             out.push((px, pz, t));
             out.push((px, pz + 1, t));
@@ -251,10 +249,7 @@ pub fn candidate_solid_count(world: &World, cx: i32, cz: i32) -> usize {
                 if world.get_voxel(IVec3::new(x, y, z)).is_some_and(|v| {
                     matches!(
                         v.material,
-                        Material::Dirt
-                            | Material::Stone
-                            | Material::BlackStone
-                            | Material::Bedrock
+                        Material::Dirt | Material::Stone | Material::BlackStone | Material::Bedrock
                     ) && v.is_fully_solid()
                 }) {
                     n += 1;
@@ -387,8 +382,8 @@ mod tests {
         let carved = before.saturating_sub(still_solid);
         let frac = carved as f32 / before as f32;
         assert!(
-            (0.07..=0.13).contains(&frac),
-            "carve fraction {frac:.3} (carved={carved}, before={before}, air≈{air}) outside 7–13%"
+            (0.015..=0.06).contains(&frac),
+            "carve fraction {frac:.3} (carved={carved}, before={before}, air≈{air}) outside 1.5–6%"
         );
     }
 

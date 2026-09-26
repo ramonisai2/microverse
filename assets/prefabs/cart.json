@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "id": "cart",
+  "name": "Carreta",
+  "size": [3, 2, 5],
+  "anchor": [1, 0, 2],
+  "entrance": { "position": [1, 1, 4], "facing": "south" },
+  "lot": { "width": 5, "depth": 7 },
+  "palette": {
+    ".": "air",
+    "W": "wood_planks",
+    "B": "black_stone",
+    "N": "sand"
+  },
+  "layers": [
+    [
+      "...",
+      "...",
+      "B.B",
+      "...",
+      "..."
+    ],
+    [
+      "WWW",
+      "WNW",
+      "WWW",
+      "WNW",
+      "WWW"
+    ]
+  ]
+}

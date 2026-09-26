@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "id": "sawmill",
+  "name": "Aserradero",
+  "size": [7, 5, 7],
+  "anchor": [3, 0, 3],
+  "entrance": { "position": [3, 1, 0], "facing": "south" },
+  "lot": { "width": 9, "depth": 9 },
+  "palette": {
+    ".": "air",
+    "S": "village_stone",
+    "W": "wood_planks",
+    "L": "log",
+    "R": "wood_roof",
+    "D": "door"
+  },
+  "layers": [
+    [
+      "SSSSSSS",
+      "SSSSSSS",
+      "SSSSSSS",
+      "SSSSSSS",
+      "SSSSSSS",
+      "SSSSSSS",
+      "SSSSSSS"
+    ],
+    [
+      "WWDWWWW",
+      ".......",
+      ".......",
+      "LLLL...",
+      "WWWWWWW",
+      ".......",
+      "......."
+    ],
+    [
+      "W.....W",
+      ".......",
+      ".......",
+      ".......",
+      "WWWWWWW",
+      ".......",
+      "......."
+    ],
+    [
+      "WWWWWWW",
+      ".......",
+      ".......",
+      ".......",
+      "WWWWWWW",
+      ".......",
+      "......."
+    ],
+    [
+      "RRRRRRR",
+      "RRRRRRR",
+      "RRRRRRR",
+      "RRRRRRR",
+      "RRRRRRR",
+      "RRRRRRR",
+      "RRRRRRR"
+    ]
+  ]
+}

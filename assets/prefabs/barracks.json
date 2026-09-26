@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "id": "barracks",
+  "name": "Cuartel",
+  "size": [7, 5, 7],
+  "anchor": [3, 0, 3],
+  "entrance": { "position": [3, 1, 0], "facing": "south" },
+  "lot": { "width": 9, "depth": 9 },
+  "palette": {
+    ".": "air",
+    "C": "cobblestone",
+    "W": "wood_planks",
+    "G": "glass",
+    "D": "door",
+    "T": "torch"
+  },
+  "layers": [
+    [
+      "CCCCCCC",
+      "CCCCCCC",
+      "CCCCCCC",
+      "CCCCCCC",
+      "CCCCCCC",
+      "CCCCCCC",
+      "CCCCCCC"
+    ],
+    [
+      "CCCDCCC",
+      "C.....C",
+      "C.....C",
+      "C..C..C",
+      "C.....C",
+      "C.....C",
+      "CCCCCCC"
+    ],
+    [
+      "CCCDCCC",
+      "G.....G",
+      "C.....C",
+      "C..C..C",
+      "C.....C",
+      "G.....G",
+      "CCCCCCC"
+    ],
+    [
+      "CCCCCCC",
+      "C.....C",
+      "C..T..C",
+      "C.....C",
+      "C.....C",
+      "C.....C",
+      "CCCCCCC"
+    ],
+    [
+      "WWWWWWW",
+      "WWWWWWW",
+      "WWWWWWW",
+      "WWWWWWW",
+      "WWWWWWW",
+      "WWWWWWW",
+      "WWWWWWW"
+    ]
+  ]
+}

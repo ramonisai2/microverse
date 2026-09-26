@@ -1,20 +1,19 @@
 {
   "schema_version": 1,
-  "id": "wizard_tower",
-  "name": "Torre de mago",
-  "size": [5, 8, 5],
+  "id": "lighthouse",
+  "name": "Faro",
+  "size": [5, 10, 5],
   "anchor": [2, 0, 2],
   "entrance": { "position": [2, 1, 0], "facing": "south" },
   "lot": { "width": 7, "depth": 7 },
   "palette": {
     ".": "air",
-    "S": "village_stone",
     "C": "cobblestone",
+    "S": "village_stone",
     "W": "wood_planks",
     "G": "glass",
-    "R": "wood_roof",
     "D": "door",
-    "A": "mana_crystal"
+    "T": "torch"
   },
   "layers": [
     [
@@ -27,51 +26,65 @@
     [
       "CCDCC",
       "C...C",
-      "C.A.C",
+      "C...C",
       "C...C",
       "CCCCC"
     ],
     [
-      "CCDCC",
+      "CCCCC",
       "C...C",
+      "C...C",
+      "C...C",
+      "CCCCC"
+    ],
+    [
+      "CCCCC",
+      "C...C",
+      "C...C",
+      "C...C",
+      "CCCCC"
+    ],
+    [
+      "SSSSS",
+      "S...S",
+      "S...S",
+      "S...S",
+      "SSSSS"
+    ],
+    [
+      "SSSSS",
+      "S...S",
+      "S...S",
+      "S...S",
+      "SSSSS"
+    ],
+    [
+      "SSSSS",
+      "S...S",
+      "S...S",
+      "S...S",
+      "SSSSS"
+    ],
+    [
+      "CGGGC",
       "G...G",
-      "C...C",
-      "CCGCC"
+      "G...G",
+      "G...G",
+      "CGGGC"
     ],
     [
-      "CCCCC",
-      "C...C",
-      "C...C",
-      "C...C",
-      "CCCCC"
+      "WWWWW",
+      "WWWWW",
+      "WWWWW",
+      "WWWWW",
+      "WWWWW"
     ],
     [
-      "CCCCC",
-      "C...C",
-      "G.A.G",
-      "C...C",
-      "CCCCC"
-    ],
-    [
-      "CCCCC",
-      "C...C",
-      "C...C",
-      "C...C",
-      "CCCCC"
-    ],
-    [
-      "WRRRW",
-      "RRRRR",
-      "RRARR",
-      "RRRRR",
-      "WRRRW"
-    ],
-    [
-      "..R..",
-      ".RRR.",
-      "RRARR",
-      ".RRR.",
-      "..R.."
+      ".....",
+      ".....",
+      "..T..",
+      ".....",
+      "....."
     ]
   ]
 }

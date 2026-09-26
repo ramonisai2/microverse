@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "id": "market_stall",
+  "name": "Puesto de mercado",
+  "size": [3, 3, 3],
+  "anchor": [1, 0, 1],
+  "entrance": { "position": [1, 1, 2], "facing": "south" },
+  "lot": { "width": 5, "depth": 5 },
+  "palette": {
+    ".": "air",
+    "W": "wood_planks",
+    "N": "sand",
+    "A": "apple"
+  },
+  "layers": [
+    [
+      "W.W",
+      "...",
+      "W.W"
+    ],
+    [
+      "W.W",
+      "WAW",
+      "W.W"
+    ],
+    [
+      "WNW",
+      "WNW",
+      "WNW"
+    ]
+  ]
+}

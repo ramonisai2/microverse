@@ -1,12 +1,11 @@
 //! Shared voxel entity models (editor JSON → in-game mesh).
-use crate::hero_pose::{
-    body_part_from_name, BodyPart, HeroPivots, ELBOW_SPLIT_Y, KNEE_SPLIT_Y,
-};
+use crate::hero_pose::{body_part_from_name, BodyPart, HeroPivots, ELBOW_SPLIT_Y, KNEE_SPLIT_Y};
 use glam::Vec3;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 pub const PALETTE_LEN: usize = 32;
 
@@ -215,9 +214,9 @@ impl EntityModel {
         if baked.is_empty() {
             return None;
         }
-        let foot_y = file.foot_y.unwrap_or_else(|| {
-            baked.iter().map(|v| v.y).min().unwrap_or(default_foot_y())
-        });
+        let foot_y = file
+            .foot_y
+            .unwrap_or_else(|| baked.iter().map(|v| v.y).min().unwrap_or(default_foot_y()));
         let mut model = Self::from_file(EntityFile {
             id: file.id,
             grid: file.grid.unwrap_or(EntityGrid {
@@ -257,11 +256,22 @@ impl EntityModel {
         body_height / span
     }
 
-    /// Emit exposed faces at `feet`, yaw `facing` (+X = 0).
-    /// Prefer [`crate::hero::for_each_hero_face`] for posed limbs.
-    #[allow(dead_code)]
+    /// Emit exposed faces at `feet`, yaw `facing` (+X = 0), resolving each
+    /// cell's colour index through `palette`.
+    ///
+    /// `palette` is a substitution table, not a re-bake: the cells keep the
+    /// indices stored in the file, and index `i` is drawn with `palette[i]`.
+    /// Pass `&model.palette` for the mesh's own palette; the editor passes the
+    /// active state's override (see [`preview_palette`]) so a state can be
+    /// re-coloured without touching the mesh file.
+    ///
+    /// This is the unrigged twin of [`crate::hero::for_each_hero_face`] (same
+    /// emit signature, same `ensure_outward_quad` winding): no `HeroPose`, no
+    /// pivots, no joint culling. Used by the editor preview to draw an
+    /// arbitrary `EntityModel` in the world.
     pub fn for_each_face(
         &self,
+        palette: &[[f32; 3]; PALETTE_LEN],
         feet: Vec3,
         facing: f32,
         body_height: f32,
@@ -278,14 +288,14 @@ impl EntityModel {
         };
 
         for (&(x, y, z), &ci) in &self.cells {
-            let color = self.palette[ci as usize];
+            let color = palette[ci as usize];
             for &(nx, ny, nz, corners) in &crate::hero::FACE_CORNERS {
                 if self.occupied(x + nx, y + ny, z + nz) {
                     continue;
                 }
                 let n_local = Vec3::new(nx as f32, ny as f32, nz as f32);
-                let n_world =
-                    (right * n_local.x + up * n_local.y + forward * (-n_local.z)).normalize_or_zero();
+                let n_world = (right * n_local.x + up * n_local.y + forward * (-n_local.z))
+                    .normalize_or_zero();
                 let na = n_world.to_array();
                 let eps = scale * 0.02;
                 let mut world_corners = [[0.0f32; 3]; 4];
@@ -558,6 +568,81 @@ fn load_entity_from_disk(rel: &str) -> Option<EntityModel> {
     None
 }
 
+fn preview_cache() -> &'static Mutex<HashMap<String, &'static EntityModel>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, &'static EntityModel>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn preview_palette_cache() -> &'static Mutex<HashMap<String, &'static [[f32; 3]; PALETTE_LEN]>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, &'static [[f32; 3]; PALETTE_LEN]>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Resolved palette table for an editor state, leaked so the preview can carry
+/// it as a `&'static` alongside the model.
+///
+/// Cached because `palette_by_name` parses a JSON array on every call and the
+/// preview asks once per frame. Empty name → `None`, which means "keep the
+/// mesh's own palette" (the `hereda` case the ESTADO panel shows).
+///
+/// Unknown names fall back to `classic`, exactly like the game does for a
+/// model's own `palette` field — a typo is not an error here, it is stored
+/// under its own key and resolves to the fallback.
+pub fn preview_palette(name: &str) -> Option<&'static [[f32; 3]; PALETTE_LEN]> {
+    if name.is_empty() {
+        return None;
+    }
+    let mut guard = preview_palette_cache().lock().ok()?;
+    if let Some(&palette) = guard.get(name) {
+        return Some(palette);
+    }
+    let leaked: &'static [[f32; 3]; PALETTE_LEN] = Box::leak(Box::new(palette_by_name(name)));
+    guard.insert(name.to_string(), leaked);
+    Some(leaked)
+}
+
+/// Generic model loader for the editor preview: any file the game can already
+/// read, addressed by the path the scene stores in `EditorEntity::model`.
+///
+/// A bare name is also looked up in the two folders the built-in loaders use
+/// (`assets/entities/`, `assets/items/`), because the editor's own default
+/// entity carries `model: "hero"`, not a full path.
+///
+/// Cached per path and handed out as `&'static`: `hero.json` is 185 KB and
+/// `from_json_str` rebuilds a 1000-cell `FxHashMap`, so parsing it every frame
+/// would be ruinous. One leak per distinct path — same lifetime as the
+/// [`OnceLock`] loaders above.
+///
+/// DEUDA TÉCNICA (anotada a propósito, no un descuido): la cache está indexada
+/// por la cadena **pedida**, no por la ruta que resolvió. Así que
+/// `preview_model("hero")` y `preview_model("assets/entities/hero.json")` son
+/// dos claves y cargan dos copias del mismo modelo. No duele mientras las
+/// escenas usen una sola grafía por modelo; si algún día hay muchas entidades
+/// escribiendo el mismo mesh de las dos formas, se arregla pasando la ruta
+/// resuelta desde `load_entity_from_disk` (hoy no la devuelve) y cacheando por
+/// esa. Los tres cargadores de arriba también habría que tocar.
+pub fn preview_model(rel: &str) -> Option<&'static EntityModel> {
+    if rel.is_empty() {
+        return None;
+    }
+    let mut guard = preview_cache().lock().ok()?;
+    if let Some(&model) = guard.get(rel) {
+        return Some(model);
+    }
+    let mut candidates = vec![rel.to_string()];
+    if !rel.contains('/') && !rel.ends_with(".json") {
+        candidates.push(format!("assets/entities/{rel}.json"));
+        candidates.push(format!("assets/items/{rel}.json"));
+    }
+    let model = candidates
+        .iter()
+        .find_map(|c| load_entity_from_disk(c))?;
+    let leaked: &'static EntityModel = Box::leak(Box::new(model));
+    guard.insert(rel.to_string(), leaked);
+    Some(leaked)
+}
+
 /// Wooden pickaxe mesh (`assets/entities/picodemadera.json`).
 pub fn pickaxe_model() -> Option<&'static EntityModel> {
     static PICK: OnceLock<Option<EntityModel>> = OnceLock::new();
@@ -687,5 +772,155 @@ mod tests {
         assert!((m.pivots.torso.y - 16.0).abs() < 0.01);
         assert!((m.pivots.l_arm.x + 6.5).abs() < 0.01);
         assert!((m.pivots.l_arm.y - 18.0).abs() < 0.01);
+    }
+
+    /// El cargador genérico del editor: ruta completa, nombre corto (que es lo
+    /// que guarda la entidad por defecto) y cache por ruta.
+    #[test]
+    fn preview_model_resolves_paths_and_short_names() {
+        let full = preview_model("assets/entities/hero.json").expect("hero por ruta");
+        assert!(!full.cells.is_empty(), "hero.json tiene celdas");
+        // Misma clave dos veces → la segunda sale de la caché (misma referencia).
+        assert_eq!(
+            full as *const EntityModel,
+            preview_model("assets/entities/hero.json").unwrap() as *const EntityModel
+        );
+        // `EditorEntity::default()` guarda `model: "hero"`: el nombre corto tiene
+        // que resolver al mismo modelo. OJO: es otra clave de caché, así que
+        // carga su propia copia (ver `preview_model`).
+        let short = preview_model("hero").expect("hero por nombre corto");
+        assert_eq!(full.id, short.id);
+        assert_eq!(full.cells.len(), short.cells.len());
+        // Un item real del directorio de items.
+        assert!(preview_model("assets/items/special1_sword.json").is_some());
+        // Y lo que no existe no inventa nada.
+        assert!(preview_model("no/existe/este.json").is_none());
+        assert!(preview_model("").is_none());
+    }
+
+    /// `for_each_face` es la ruta de la preview: sin rig, culling de caras
+    /// expuestas contra las celdas vecinas, color de paleta y escala por
+    /// `body_height`.
+    #[test]
+    fn for_each_face_emits_the_six_outer_faces_of_a_cell() {
+        let m = EntityModel::from_file(EntityFile {
+            id: "t".into(),
+            grid: EntityGrid { x: 4, y: 4, z: 4 },
+            foot_y: 0,
+            palette: "classic".into(),
+            voxels: vec![EntityVoxel {
+                x: 0,
+                y: 0,
+                z: 0,
+                c: 0,
+            }],
+        });
+        let mut faces: Vec<([f32; 3], [f32; 3])> = Vec::new();
+        m.for_each_face(&m.palette, Vec3::ZERO, 0.0, 1.0, |p, n, c| {
+            assert_eq!(c, m.palette[0], "el color sale de la paleta");
+            faces.push((p, n));
+        });
+        // 6 caras × 4 vértices, y una normal por cada eje y sentido.
+        assert_eq!(faces.len(), 24);
+        let mut normals: Vec<[f32; 3]> = faces.iter().map(|(_, n)| *n).collect();
+        normals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        normals.dedup();
+        assert_eq!(normals.len(), 6, "{normals:?}");
+        for axis in 0..3 {
+            for sign in [-1.0f32, 1.0] {
+                let mut want = [0.0; 3];
+                want[axis] = sign;
+                assert!(
+                    normals.contains(&want),
+                    "falta la normal {want:?} en {normals:?}"
+                );
+            }
+        }
+        // voxel_scale = body_height / (top_y - foot_y + 1) = 1/1, así que la
+        // celda sale como un cubo de 1 bloque. Ojo con el origen: el mapeo de
+        // diseño es `world = right*lx + up*ly + forward*(-lz)`, con lo que la
+        // celda (0,0,0) cae en [-1,0]×[0,1]×[0,1] con yaw 0. Lo que importa es
+        // la extensión, no dónde está.
+        let min = faces.iter().fold(Vec3::splat(f32::MAX), |acc, (p, _)| {
+            acc.min(Vec3::from_array(*p))
+        });
+        let max = faces.iter().fold(Vec3::splat(f32::MIN), |acc, (p, _)| {
+            acc.max(Vec3::from_array(*p))
+        });
+        let extent = max - min;
+        // El epsilon anti-z-fighting (`scale * 0.02`) engorda el AABB 0.02 por
+        // lado, así que la extensión sale 1.04 y no 1.0 exactos.
+        for (i, e) in [extent.x, extent.y, extent.z].into_iter().enumerate() {
+            assert!(
+                (e - 1.0).abs() < 0.05,
+                "eje {i}: esperadas 1 bloque, medido {e} (min {min:?}, max {max:?})"
+            );
+        }
+    }
+
+    /// Una celda pegada a otra oculta la cara compartida: es el mismo culling
+    /// que usa el héroe, y es lo que hace que un modelo sea sólido por dentro.
+    #[test]
+    fn for_each_face_hides_faces_between_neighbours() {
+        let m = EntityModel::from_file(EntityFile {
+            id: "t".into(),
+            grid: EntityGrid { x: 4, y: 4, z: 4 },
+            foot_y: 0,
+            palette: "classic".into(),
+            voxels: vec![
+                EntityVoxel { x: 0, y: 0, z: 0, c: 0 },
+                EntityVoxel { x: 1, y: 0, z: 0, c: 0 },
+            ],
+        });
+        let mut count = 0;
+        m.for_each_face(&m.palette, Vec3::ZERO, 0.0, 1.0, |_, _, _| {
+            count += 1
+        });
+        // 2 celdas pegadas: 10 caras en vez de 12 (la de contacto no sale).
+        assert_eq!(count, 10 * 4);
+    }
+
+    /// La paleta que se pasa es una tabla de sustitución: el índice que guarda
+    /// la celda no se toca, solo el RGB que sale por ese índice. Es lo que
+    /// permite que un estado cambie de color sin rehornear el mesh.
+    #[test]
+    fn for_each_face_takes_a_palette_substitution() {
+        let m = EntityModel::from_file(EntityFile {
+            id: "t".into(),
+            grid: EntityGrid { x: 4, y: 4, z: 4 },
+            foot_y: 0,
+            palette: "classic".into(),
+            voxels: vec![EntityVoxel {
+                x: 0,
+                y: 0,
+                z: 0,
+                c: 5,
+            }],
+        });
+        let own = m.palette[5];
+        let mono = palette_by_name("mono");
+        assert_ne!(own, mono[5], "si fueran iguales el test no probaría nada");
+
+        let collect = |pal: &[[f32; 3]; PALETTE_LEN]| -> Vec<[f32; 3]> {
+            let mut colors = Vec::new();
+            m.for_each_face(pal, Vec3::ZERO, 0.0, 1.0, |_, _, c| colors.push(c));
+            colors
+        };
+        // Con la suya: el RGB del índice 5 de la paleta del mesh.
+        assert!(collect(&m.palette).iter().all(|c| *c == own));
+        // Con otra: el RGB del índice 5 de esa otra, mismo índice.
+        assert!(collect(&mono).iter().all(|c| *c == mono[5]));
+        // Y la geometría no se mueve por cambiar la paleta.
+        assert_eq!(collect(&m.palette).len(), collect(&mono).len());
+
+        // La cache de paletas: mismo puntero, y el mismo fallback que el juego.
+        let a = preview_palette("mono").expect("mono");
+        assert_eq!(a as *const _, preview_palette("mono").unwrap() as *const _);
+        assert_eq!(*a, palette_by_name("mono"));
+        assert!(preview_palette("").is_none(), "vacío = hereda el mesh");
+        assert_eq!(
+            *preview_palette("no-existe").expect("fallback"),
+            palette_by_name("classic")
+        );
     }
 }

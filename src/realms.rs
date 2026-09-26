@@ -25,8 +25,14 @@ const REALM_SPAWN_PCT: u32 = 88;
 /// Inflate disk radius slightly so Voronoi+budget lands near ~65–75% coverage.
 const RADIUS_AREA_MUL: f32 = 1.28;
 /// Capital↔village separation (shunks) — wider than before so towns breathe.
-const VILLAGE_DIST_MIN: i32 = 7;
-const VILLAGE_DIST_MAX: i32 = 14;
+const VILLAGE_DIST_MIN: i32 = 9;
+const VILLAGE_DIST_MAX: i32 = 16;
+/// Minimum village↔village gap (Chebyshev shunks) so bigger footprints
+/// (walls + outskirts ≈ 7 shunks across) never overlap each other.
+const VILLAGE_SEPARATION_MIN: i32 = 8;
+/// Minimum village↔capital gap (Chebyshev shunks) so the 18-block capital
+/// walls and 30-block village walls + outskirts never overlap (needs ≥5).
+const VILLAGE_CAPITAL_CLEAR_MIN: i32 = 5;
 
 /// Stable identity of a realm (seed-grid coordinates).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -55,7 +61,10 @@ pub struct RealmInfo {
 
 #[inline]
 pub fn shunk_coord(block_x: i32, block_z: i32) -> (i32, i32) {
-    (block_x.div_euclid(SHUNK_SIZE), block_z.div_euclid(SHUNK_SIZE))
+    (
+        block_x.div_euclid(SHUNK_SIZE),
+        block_z.div_euclid(SHUNK_SIZE),
+    )
 }
 
 #[inline]
@@ -164,8 +173,8 @@ fn realm_info_compute(id: RealmId) -> Option<RealmInfo> {
     for i in 0..n {
         let h = mix_seed(h0 ^ 0x7111_A6E0, i as u32, area as u32);
         let ang = (h % 360) as f32 * (std::f32::consts::PI / 180.0);
-        let dist = VILLAGE_DIST_MIN
-            + ((h >> 9) % (VILLAGE_DIST_MAX - VILLAGE_DIST_MIN + 1) as u32) as i32;
+        let dist =
+            VILLAGE_DIST_MIN + ((h >> 9) % (VILLAGE_DIST_MAX - VILLAGE_DIST_MIN + 1) as u32) as i32;
         let mut vx = cx + (ang.cos() * dist as f32).round() as i32;
         let mut vz = cz + (ang.sin() * dist as f32).round() as i32;
         // Nudge into claimed territory if the ring landed in wild / foreign.
@@ -187,7 +196,18 @@ fn realm_info_compute(id: RealmId) -> Option<RealmInfo> {
                 if (px, pz) == capital {
                     continue;
                 }
-                if villages.iter().any(|&p| p == (px, pz)) {
+                // Keep clear of the capital's walls (18 blocks) too.
+                if (px - cx).abs().max((pz - cz).abs()) < VILLAGE_CAPITAL_CLEAR_MIN {
+                    continue;
+                }
+                if villages.iter().any(|&p: &(i32, i32)| p == (px, pz)) {
+                    continue;
+                }
+                // Spread villages around the ring: reject candidates too
+                // close to an already placed village.
+                if villages.iter().any(|&p: &(i32, i32)| {
+                    (p.0 - px).abs().max((p.1 - pz).abs()) < VILLAGE_SEPARATION_MIN
+                }) {
                     continue;
                 }
                 if realm_at_shunk(px, pz) == RealmCell::Claimed(id) {
@@ -202,19 +222,54 @@ fn realm_info_compute(id: RealmId) -> Option<RealmInfo> {
             }
         }
         if !placed {
-            // Fallback: offset from capital still inside radius.
-            vx = cx + if i % 2 == 0 { VILLAGE_DIST_MIN } else { -VILLAGE_DIST_MIN };
-            vz = cz + if (i / 2) % 2 == 0 {
-                VILLAGE_DIST_MIN
-            } else {
-                -VILLAGE_DIST_MIN
-            };
-            if realm_at_shunk(vx, vz) != RealmCell::Claimed(id) {
-                vx = cx;
-                vz = cz + VILLAGE_DIST_MIN;
+            // Fallback: axis offsets from capital (rotated per village so two
+            // fallbacks don't collide). First claimed + clear spot wins; the
+            // last resort keeps the old behavior.
+            const OFFSETS: [(i32, i32); 4] = [
+                (VILLAGE_DIST_MIN, 0),
+                (0, VILLAGE_DIST_MIN),
+                (-VILLAGE_DIST_MIN, 0),
+                (0, -VILLAGE_DIST_MIN),
+            ];
+            let mut found = None;
+            for k in 0..4 {
+                let (ox, oz) = OFFSETS[((i + k) % 4) as usize];
+                let px = cx + ox;
+                let pz = cz + oz;
+                if (px, pz) == capital
+                    || villages.iter().any(|&p: &(i32, i32)| p == (px, pz))
+                {
+                    continue;
+                }
+                if (px - cx).abs().max((pz - cz).abs()) < VILLAGE_CAPITAL_CLEAR_MIN {
+                    continue;
+                }
+                if villages.iter().any(|&p: &(i32, i32)| {
+                    (p.0 - px).abs().max((p.1 - pz).abs()) < VILLAGE_SEPARATION_MIN
+                }) {
+                    continue;
+                }
+                if realm_at_shunk(px, pz) == RealmCell::Claimed(id) {
+                    found = Some((px, pz));
+                    break;
+                }
             }
+            let (fx, fz) = found.unwrap_or((cx, cz + VILLAGE_DIST_MIN));
+            vx = fx;
+            vz = fz;
         }
-        if (vx, vz) != capital && !villages.iter().any(|&p| p == (vx, vz)) {
+        // First village is always welcome (the ≥1 guarantee); the rest must
+        // keep the minimum gap so footprints never overlap. Every village
+        // must also clear the capital's walls.
+        let clear = (vx - cx).abs().max((vz - cz).abs()) >= VILLAGE_CAPITAL_CLEAR_MIN
+            && (villages.is_empty()
+                || !villages.iter().any(|&p| {
+                    (p.0 - vx).abs().max((p.1 - vz).abs()) < VILLAGE_SEPARATION_MIN
+                }));
+        if (vx, vz) != capital
+            && !villages.iter().any(|&p| p == (vx, vz))
+            && clear
+        {
             villages.push((vx, vz));
         }
     }
@@ -245,9 +300,7 @@ pub fn realm_name(id: RealmId) -> String {
         "BR", "VAL", "MOR", "THA", "EL", "KOR", "AR", "DUN", "GAL", "ZER", "MIR", "OL",
     ];
     const CORE: [&str; 8] = ["A", "E", "I", "O", "AN", "OR", "EN", "UM"];
-    const TAIL: [&str; 8] = [
-        "DOR", "GARD", "HEIM", "IA", "OS", "WYN", "THAL", "MAR",
-    ];
+    const TAIL: [&str; 8] = ["DOR", "GARD", "HEIM", "IA", "OS", "WYN", "THAL", "MAR"];
     let h = seed_hash(id.ix, id.iz);
     let a = ONSET[(h as usize) % ONSET.len()];
     let b = CORE[((h >> 8) as usize) % CORE.len()];
@@ -278,10 +331,7 @@ mod tests {
                     continue;
                 };
                 found += 1;
-                assert!(
-                    !info.villages.is_empty(),
-                    "realm {info:?} missing village"
-                );
+                assert!(!info.villages.is_empty(), "realm {info:?} missing village");
                 assert!(
                     (REALM_AREA_MIN..=REALM_AREA_MAX).contains(&info.area_budget),
                     "area budget {}",
@@ -294,7 +344,10 @@ mod tests {
                 );
             }
         }
-        assert!(found >= 8, "expected several realm seeds in sample, got {found}");
+        assert!(
+            found >= 8,
+            "expected several realm seeds in sample, got {found}"
+        );
     }
 
     #[test]
@@ -348,6 +401,33 @@ mod tests {
                 big_avg + 0.01 >= small_avg,
                 "big realms should not have fewer villages on average ({big_avg} vs {small_avg})"
             );
+        }
+    }
+
+    #[test]
+    fn villages_keep_minimum_gap() {
+        for iz in -6..6 {
+            for ix in -6..6 {
+                let Some(info) = realm_info(RealmId { ix, iz }) else {
+                    continue;
+                };
+                for a in 0..info.villages.len() {
+                    let village = info.villages[a];
+                    // Villages stay clear of the capital's walls too.
+                    let dc = (village.0 - info.capital.0)
+                        .abs()
+                        .max((village.1 - info.capital.1).abs());
+                    assert!(dc >= 3, "village {village:?} on capital {info:?}");
+                    for b in a + 1..info.villages.len() {
+                        let other = info.villages[b];
+                        let d = (village.0 - other.0).abs().max((village.1 - other.1).abs());
+                        assert!(
+                            d >= VILLAGE_SEPARATION_MIN,
+                            "villages {village:?} and {other:?} too close in {info:?}"
+                        );
+                    }
+                }
+            }
         }
     }
 

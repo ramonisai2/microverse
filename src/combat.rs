@@ -10,6 +10,10 @@ pub fn melee_damage_for_item(item: HotbarItem) -> u32 {
         HotbarItem::Axe => 1,
         // Hotbar sword slot currently holds the special blade.
         HotbarItem::Sword => 20,
+        // Secondary hand / non-weapon slots swing like bare hands.
+        HotbarItem::Shield => 1,
+        HotbarItem::Consumable => 1,
+        HotbarItem::Magic => 1,
     }
 }
 

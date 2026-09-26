@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "id": "watchtower",
+  "name": "Atalaya",
+  "size": [5, 7, 5],
+  "anchor": [2, 0, 2],
+  "entrance": { "position": [2, 1, 2], "facing": "south" },
+  "lot": { "width": 7, "depth": 7 },
+  "palette": {
+    ".": "air",
+    "C": "cobblestone",
+    "W": "wood_planks",
+    "T": "torch"
+  },
+  "layers": [
+    [
+      "C...C",
+      ".....",
+      ".....",
+      ".....",
+      "C...C"
+    ],
+    [
+      "C...C",
+      ".....",
+      ".....",
+      ".....",
+      "C...C"
+    ],
+    [
+      "C...C",
+      ".....",
+      ".....",
+      ".....",
+      "C...C"
+    ],
+    [
+      "WWWWW",
+      "WWWWW",
+      "WWWWW",
+      "WWWWW",
+      "WWWWW"
+    ],
+    [
+      "W...W",
+      ".....",
+      ".....",
+      ".....",
+      "W...W"
+    ],
+    [
+      "WWWWW",
+      "W...W",
+      "W...W",
+      "W...W",
+      "WWWWW"
+    ],
+    [
+      ".....",
+      ".....",
+      "..T..",
+      ".....",
+      "....."
+    ]
+  ]
+}
