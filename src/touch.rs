@@ -109,6 +109,24 @@ enum FingerRole {
     Button(TouchButton),
 }
 
+/// True if the point is inside the joystick's capture circle: the **same**
+/// `joy_radius` that gets drawn, centred on its home.
+///
+/// This used to be `x < lw * 0.45 && y < lh * 0.40` — a literal quadrant worth
+/// 27 % of the screen, unrelated to anything the user can see. It swallowed
+/// the hotbar, the stair panel, the left half of the inventory and the menu's
+/// lower rows, because a finger taken by the joystick never becomes a tap and
+/// the PC HUD is only consulted for taps (`App::tap_at`).
+///
+/// A circle, not the drawn square: `joy_radius` is what normalises the movement
+/// vector, so the capture matches the maths the stick already does. The corners
+/// of the drawn quad fall outside it, which is the smaller surprise of the two.
+fn joy_captures(lay: &TouchLayout, x: f32, y: f32) -> bool {
+    let dx = x - lay.joy_home.0;
+    let dy = y - lay.joy_home.1;
+    dx * dx + dy * dy <= lay.joy_radius * lay.joy_radius
+}
+
 /// Candidato a toque: dedo quieto en zona de mirada.
 #[derive(Clone, Copy, Debug)]
 struct TapCandidate {
@@ -146,6 +164,9 @@ pub struct TouchControls {
     pinch_pos: (f32, f32),
     /// Zoom acumulado del pellizco (lo drena `App` cada frame).
     zoom_delta: f32,
+    /// Rects interactivos del HUD de PC de este frame, publicados por `App`
+    /// (ver [`Self::set_hud_rects`]).
+    hud_rects: Vec<HudRect>,
 }
 
 impl TouchControls {
@@ -168,7 +189,26 @@ impl TouchControls {
             pinch_id: None,
             pinch_pos: (0.0, 0.0),
             zoom_delta: 0.0,
+            hud_rects: Vec::new(),
         }
+    }
+
+    /// Publish the PC HUD's interactive rects for this frame, so a touch that
+    /// lands on one of them is never taken as the joystick.
+    ///
+    /// Only the rects, not the actions: deciding "this point is a button"
+    /// belongs to the HUD, which already answers it in `App::tap_at`. This
+    /// module only needs to know it must keep its hands off. Called once per
+    /// frame by `App` after the HUD is rebuilt, so a one-frame-stale list is
+    /// fine. Takes an iterator so the caller does not allocate per frame.
+    pub fn set_hud_rects<I: IntoIterator<Item = HudRect>>(&mut self, rects: I) {
+        self.hud_rects.clear();
+        self.hud_rects.extend(rects);
+    }
+
+    /// True when the point is inside a PC HUD button published this frame.
+    fn on_hud(&self, x: f32, y: f32) -> bool {
+        self.hud_rects.iter().any(|r| r.contains(x, y))
     }
 
     pub fn jump_held(&self) -> bool {
@@ -259,8 +299,10 @@ impl TouchControls {
                         self.mine_id = Some(id);
                         self.set_role(id, FingerRole::Button(TouchButton::Mine));
                     }
-                } else if x < lw * 0.45 && y > lh * 0.40 {
-                    // Zona joystick: origen flotante donde cae el dedo.
+                } else if joy_captures(&lay, x, y) && !self.on_hud(x, y) {
+                    // Zona joystick: origen flotante donde cae el dedo. Solo
+                    // dentro del círculo dibujado, y nunca sobre un botón del
+                    // HUD de PC (el panel manda: ahí el dedo es un tap).
                     if self.joy_id.is_none() {
                         self.joy_id = Some(id);
                         self.joy_origin = (x, y);
@@ -614,5 +656,144 @@ mod tests {
         let mut off = TouchControls::new();
         off.enabled = false;
         assert!(off.build_touch_hud(1280.0, 720.0).vertices.is_empty());
+    }
+
+    /// El radio de captura es el que el joystick dibuja, no el cuadrado ni un
+    /// cuadrante de pantalla. Los 3 tests de joystick de arriba caen dentro
+    /// del círculo, así que no detectan este cambio: hace falta uno que mire
+    /// justo fuera del borde.
+    #[test]
+    fn joystick_capture_is_the_drawn_circle() {
+        let (lw, lh) = (1280.0, 720.0);
+        let lay = layout(lw, lh);
+        let (hx, hy) = lay.joy_home;
+        let r = lay.joy_radius;
+        // Justo dentro y justo fuera del borde, sobre el eje X del centro.
+        assert!(joy_captures(&lay, hx + r * 0.98, hy), "dentro del borde");
+        assert!(!joy_captures(&lay, hx + r * 1.02, hy), "fuera del borde");
+        // La esquina del cuadrado dibujado (r * 1.41 en diagonal) queda fuera:
+        // es la consecuencia de usar círculo, y es la documentada.
+        assert!(!joy_captures(&lay, hx + r * 1.3, hy + r * 1.3), "esquina");
+        // Y el punto que el cuadrante viejo sí capturaba, muy lejos del stick.
+        let (ox, oy) = (lw * 0.40, lh * 0.90);
+        assert!(ox < lw * 0.45 && oy > lh * 0.40, "el cuadrante viejo lo tenía");
+        assert!(!joy_captures(&lay, ox, oy), "ahora no");
+    }
+
+    /// El dedo solo se vuelve joystick si el círculo lo captura. Lejos del
+    /// círculo tiene que ser un dedo de mirada (o sea, un tap), que es lo que
+    /// deja vivo el HUD de PC.
+    #[test]
+    fn a_touch_outside_the_circle_is_a_tap_not_the_stick() {
+        let mut t = TouchControls::new();
+        t.enabled = true;
+        let (lw, lh) = (1280.0, 720.0);
+        // x = 40 % del ancho, y = 90 % del alto: dentro del cuadrante viejo.
+        let (x, y) = (lw * 0.40, lh * 0.90);
+        t.handle(TouchPhase::Started, 1, x, y, lw, lh);
+        // Si fuera el stick, aplicaría teclas de movimiento.
+        let mut k = keys();
+        t.apply_to_keys(&mut k);
+        assert!(
+            !(k.forward || k.back || k.left || k.right || k.up || k.down || k.sprint),
+            "un dedo fuera del círculo no mueve al héroe"
+        );
+        // Y al soltarlo quieto emite tap, que es la ruta de la hotbar.
+        let acts = t.handle(TouchPhase::Ended, 1, x, y, lw, lh);
+        assert!(
+            acts.iter().any(|a| matches!(a, TouchAction::Tap(tx, ty)
+                if (tx - x).abs() < 1.0 && (ty - y).abs() < 1.0)),
+            "debe ser un tap: {acts:?}"
+        );
+    }
+
+    /// Un rect del HUD de PC gana al círculo del stick, aunque el punto caiga
+    /// dentro del joystick. Sin esto, el pulgar apoyado en la hotbar se
+    /// comía el dedo y esa franja de la hotbar quedaba muerta.
+    #[test]
+    fn a_hud_rect_wins_over_the_joystick() {
+        let mut t = TouchControls::new();
+        t.enabled = true;
+        let (lw, lh) = (1280.0, 720.0);
+        let lay = layout(lw, lh);
+        // La hotbar de PC, tal cual la construye `build_hotbar_hud`: abajo a
+        // la izquierda, en 1280x720 solapada con el joystick en su franja
+        // inferior (y 517..588 contra un joystick que llega hasta y=693).
+        let hotbar = HudRect {
+            x: 14.0,
+            y: 440.0,
+            w: 340.0,
+            h: 148.0,
+        };
+        let (x, y) = (150.0, 550.0);
+        assert!(hotbar.contains(x, y), "el punto está en el botón");
+        assert!(joy_captures(&lay, x, y), "y también en el joystick");
+
+        // Sin la lista del HUD, ese punto es del joystick y mueve al héroe.
+        t.handle(TouchPhase::Started, 1, x, y, lw, lh);
+        t.handle(TouchPhase::Moved, 1, x + 80.0, y, lw, lh);
+        let mut k = keys();
+        t.apply_to_keys(&mut k);
+        assert!(k.right, "sin HUD, manda el stick");
+
+        // Con la lista, el dedo es un tap y el stick no se mueve.
+        let mut t2 = TouchControls::new();
+        t2.enabled = true;
+        t2.set_hud_rects([hotbar]);
+        assert!(t2.on_hud(x, y));
+        t2.handle(TouchPhase::Started, 1, x, y, lw, lh);
+        t2.handle(TouchPhase::Moved, 1, x + 80.0, y, lw, lh);
+        let mut k2 = keys();
+        t2.apply_to_keys(&mut k2);
+        assert!(
+            !(k2.forward || k2.back || k2.left || k2.right || k2.up || k2.down || k2.sprint),
+            "con el HUD encima, el stick no se mueve"
+        );
+        // Toca y suelta sin moverse: tap, que es lo que enciende la hotbar.
+        let mut t3 = TouchControls::new();
+        t3.enabled = true;
+        t3.set_hud_rects([hotbar]);
+        t3.handle(TouchPhase::Started, 2, x, y, lw, lh);
+        let acts = t3.handle(TouchPhase::Ended, 2, x, y, lw, lh);
+        assert!(acts.iter().any(|a| matches!(a, TouchAction::Tap(..))));
+    }
+
+    /// Con A solo, la parte de la hotbar que **no** toca el círculo ya
+    /// funciona. Este test fija ese avance, para que B no parezca hacerlo todo.
+    #[test]
+    fn the_hotbar_outside_the_circle_works_without_the_hud_list() {
+        let mut t = TouchControls::new();
+        t.enabled = true;
+        let (lw, lh) = (1280.0, 720.0);
+        let lay = layout(lw, lh);
+        // Slot 0 de la hotbar: dentro del panel, fuera del círculo.
+        let (x, y) = (50.0, 490.0);
+        assert!(!joy_captures(&lay, x, y), "fuera del círculo");
+        t.handle(TouchPhase::Started, 1, x, y, lw, lh);
+        t.handle(TouchPhase::Moved, 1, x + 80.0, y, lw, lh);
+        let mut k = keys();
+        t.apply_to_keys(&mut k);
+        assert!(
+            !(k.forward || k.back || k.left || k.right || k.up || k.down || k.sprint),
+            "A sola ya libera esta parte de la hotbar"
+        );
+    }
+
+    /// La lista se sustituye cada frame, no se acumula: el HUD se rehace
+    /// entero y los rects de un frame pueden no existir al siguiente.
+    #[test]
+    fn hud_rects_are_replaced_not_accumulated() {
+        let mut t = TouchControls::new();
+        t.enabled = true;
+        let a = HudRect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
+        let b = HudRect { x: 500.0, y: 500.0, w: 50.0, h: 50.0 };
+        t.set_hud_rects([a, b]);
+        assert!(t.on_hud(10.0, 10.0) && t.on_hud(510.0, 510.0));
+        t.set_hud_rects([b]);
+        assert!(!t.on_hud(10.0, 10.0), "el rect viejo se fue con el frame");
+        assert!(t.on_hud(510.0, 510.0));
+        // Lista vacía = sin HUD: el joystick vuelve a capturar.
+        t.set_hud_rects([]);
+        assert!(!t.on_hud(510.0, 510.0));
     }
 }

@@ -1107,6 +1107,17 @@ fn wrap_deg(mut d: f32) -> f32 {
     d
 }
 
+/// Whether the touch controls read input on this screen.
+///
+/// Gameplay only. In `Menu` and `Editor` the pointer belongs to the PC HUD, and
+/// the touch overlay used to be live there anyway: the joystick's capture zone
+/// ate the lower-left of the editor's entity list and of the menu's rows, for
+/// controls the player never sees. A free function so it can be tested without
+/// a window (`touch_controls_read_only_in_play`).
+fn touch_input_live(screen: Screen) -> bool {
+    matches!(screen, Screen::Playing)
+}
+
 struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
@@ -2580,6 +2591,15 @@ WindowEvent::RedrawRequested => {
                     }
                 };
 
+                // El HUD de PC acaba de rehacerse: se le publica al táctil la
+                // lista de rects interactivos, para que un dedo que caiga en
+                // un botón no lo robe el joystick (ver `TouchControls`).
+                // En todas las pantallas, no solo Playing: con la guarda del
+                // handler de eventos, fuera de partida el táctil no lee nada,
+                // pero la lista queda al dia igual.
+                self.touch
+                    .set_hud_rects(self.stair_hud.hits.iter().map(|h| h.rect));
+
                 self.title_frames = self.title_frames.wrapping_add(1);
                 if self.last_autosave.elapsed().as_secs_f32() >= save::AUTOSAVE_SECS {
                     self.persist("auto");
@@ -3011,6 +3031,12 @@ WindowEvent::RedrawRequested => {
                 }
             }
             WindowEvent::Touch(t) => {
+                // Los controles táctiles son de juego. En Menu y Editor el
+                // puntero es del HUD de PC, y el joystick se comia el
+                // cuadrante inferior izquierdo de sus paneles.
+                if !touch_input_live(self.screen) {
+                    return;
+                }
                 // Táctil: el menú de PC no se entera (sus hits no incluyen
                 // botones táctiles; ver touch.rs). En PC el primer toque
                 // enciende el modo; en Android nace encendido.
@@ -4212,5 +4238,15 @@ mod hitch_tests {
         // Al borrar el estado que traía el override, se vuelve a heredar.
         ed.apply(EditorAction::StateDel);
         assert!(ed.preview().expect("preview").palette.is_none());
+    }
+
+    /// Los controles táctiles son de juego. En Menu y Editor el puntero es del
+    /// HUD de PC, y con el joystick vivo ahí se comía el cuadrante inferior
+    /// izquierdo de sus paneles.
+    #[test]
+    fn touch_controls_read_only_in_play() {
+        assert!(touch_input_live(Screen::Playing));
+        assert!(!touch_input_live(Screen::Menu));
+        assert!(!touch_input_live(Screen::Editor));
     }
 }
