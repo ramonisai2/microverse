@@ -17,6 +17,20 @@ Esto manda sobre cualquier intuición, tutorial de Minecraft/wgpu, o conversaci�
 - **Diff mínimo y verdadero.** No añadas archivos, constantes o pases “por si acaso”. Si una función ya existe, úsala; no dupliques con otro nombre.
 - **Incertidumbre explícita.** Ante duda: (1) leer el archivo, (2) si sigue ambiguo, preguntar al usuario. Nunca adivinar un diseño y presentarlo como hecho.
 
+## Texto corrupto: pasa el checker antes de entregar
+
+Un texto generado puede traer basura pegada dentro de una palabra: Hangul, CJK, un fragmento en inglés, una ligadura. Ha pasado cuatro veces en un solo turno, una de ellas con la herramienta ya disponible. No es un problema de UTF-8 — el archivo se guarda con esos bytes dentro y el diff los enseña como si fueran texto.
+
+```bash
+python3 tools/check_text.py $(git diff --name-only) CONVENTIONS.md
+```
+
+Sale 1 si algo salta, 0 si está limpio. Pásalo por **todo** lo que entregues o comitees, y también por tu propia respuesta antes de mandarla.
+
+Por qué no es "¿es ASCII?": el repo está en español con rayas, flechas, `+-`, `<=`, así que el test va al revés — un carácter es sospechoso **solo si no aparece ya en algún archivo del repo** (el repo es el corpus de lo que es tipografía legítima aquí). Encima hay una lista dura de scripts que este proyecto nunca usa (Hangul, CJK, cirílico, hebreo, árabe, devanagari, thai, formas de ancho completo), para que una corrupción que llegue a comitearse no se vuelva "legítima" por estar en el corpus. También marca caracteres de control y U+FFFD.
+
+**Límite conocido:** ve caracteres, no empalmes. Una corrupción dentro de ASCII (`seinna` por "se ancla") pasa el checker. Es necesaria, no suficiente: lee el diff igual. Apúntala a lo que vas a entregar, no al repo entero — las transcripciones `session-*.md` citan corrupciones a propósito.
+
 ## Cómo correr (Linux)
 
 Juego:
