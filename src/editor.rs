@@ -293,6 +293,47 @@ impl EditorEntity {
         (min, max)
     }
 
+    /// Distance from `origin` to where `dir` first enters the box, or `None`
+    /// when the ray misses it. Slab test, one axis at a time.
+    ///
+    /// The same box the marker is drawn from ([`Self::aabb`]), so what a click
+    /// can pick is what the user can see. Two details are deliberate:
+    ///
+    /// - An axis the ray runs parallel to (`|dir| < 1e-8`) does not bound `t` if
+    ///   the origin is between the planes, and misses otherwise. The classic
+    ///   `1/dir` form is avoided on purpose: `0 * inf` is `NaN` and poisons the
+    ///   comparisons.
+    /// - A non-finite box (a zero scale on an axis, broken data) is never
+    ///   picked, same as [`Self::cover_cells`]. The bounds are compared too,
+    ///   not just checked for finiteness: a `NaN` in the transform survives
+    ///   `aabb()` (`f32::min`/`max` skip the `NaN`) and leaves the box
+    ///   inverted, which would otherwise read as a box around the origin.
+    pub fn ray_hit(&self, origin: Vec3, dir: Vec3) -> Option<f32> {
+        let (min, max) = self.aabb();
+        if !min.is_finite() || !max.is_finite() || !min.cmple(max).all() {
+            return None;
+        }
+        let mut t_enter = 0.0f32;
+        let mut t_exit = f32::INFINITY;
+        for axis in 0..3 {
+            let (o, d, lo, hi) = (origin[axis], dir[axis], min[axis], max[axis]);
+            if d.abs() < 1e-8 {
+                if o < lo || o > hi {
+                    return None;
+                }
+                continue;
+            }
+            let (t0, t1) = ((lo - o) / d, (hi - o) / d);
+            let (near, far) = if t0 <= t1 { (t0, t1) } else { (t1, t0) };
+            t_enter = t_enter.max(near);
+            t_exit = t_exit.min(far);
+            if t_enter > t_exit {
+                return None;
+            }
+        }
+        Some(t_enter)
+    }
+
     /// Cells of the voxel grid that cover the box, at most `max_cells`.
     ///
     /// A small box is filled solid. A big one is drawn as its **shell** (the
@@ -607,6 +648,12 @@ mod tests {
         (a - b).length() < 1e-3
     }
 
+    /// A hit distance within a hair of the expected one. `t` is a distance
+    /// walked from the ray origin, so it is not the face's own coordinate.
+    fn near_t(got: Option<f32>, want: f32) -> bool {
+        got.is_some_and(|t| (t - want).abs() < 1e-3)
+    }
+
     #[test]
     fn unit_box_aabb_is_the_size_around_the_position() {
         let e = EditorEntity::new("prop", [2.0, 24.0, -3.0]);
@@ -622,6 +669,85 @@ mod tests {
         e.scale = [3.0, 1.0, 1.0];
         let (min, max) = e.aabb();
         assert!(near(max - min, Vec3::new(6.0, 1.0, 1.0)), "{:?}", max - min);
+    }
+
+    /// A ray from outside stops at the near face, not at the centre. `t` is a
+    /// distance walked from `origin`, so it is not the face's coordinate.
+    #[test]
+    fn ray_hit_stops_at_the_near_face() {
+        let e = EditorEntity::new("prop", [10.0, 0.0, 0.0]);
+        // Box x in 9.5..10.5, walked from the origin: 9.5 blocks.
+        assert!(near_t(e.ray_hit(Vec3::ZERO, Vec3::X), 9.5));
+    }
+
+    /// Same measurement from the other side: the box is symmetric.
+    #[test]
+    fn ray_hit_works_from_any_side() {
+        let e = EditorEntity::new("prop", [0.0, 5.0, 0.0]);
+        // Box y in 4.5..5.5, walked down from y = 20: 20 - 5.5 = 14.5.
+        assert!(near_t(e.ray_hit(Vec3::new(0.0, 20.0, 0.0), -Vec3::Y), 14.5));
+    }
+
+    #[test]
+    fn ray_hit_misses_beside_and_behind_the_box() {
+        let e = EditorEntity::new("prop", [10.0, 0.0, 0.0]);
+        // 1.5 above a box that spans y in -0.5..0.5.
+        assert_eq!(e.ray_hit(Vec3::new(0.0, 1.5, 0.0), Vec3::X), None);
+        // Pointing away from it.
+        assert_eq!(e.ray_hit(Vec3::ZERO, -Vec3::X), None);
+    }
+
+    /// The camera inside the box still hits it, at distance 0.
+    #[test]
+    fn ray_hit_from_inside_is_zero() {
+        let e = EditorEntity::new("prop", [0.0; 3]);
+        assert_eq!(e.ray_hit(Vec3::new(0.1, 0.0, 0.0), Vec3::X), Some(0.0));
+    }
+
+    /// A ray parallel to an axis is unbounded on it, so only the other two
+    /// axes decide. This is the case a `1/dir` implementation gets wrong.
+    #[test]
+    fn ray_hit_parallel_axis_does_not_bound_the_hit() {
+        let mut e = EditorEntity::new("prop", [4.0, 0.0, 0.0]);
+        e.size = [2.0, 1.0, 2.0];
+        // Travelling along X at y = 100: parallel to X, but outside Y and Z.
+        assert_eq!(e.ray_hit(Vec3::new(0.0, 100.0, 0.0), Vec3::X), None);
+        // Travelling along X at y = 0 (inside Y and Z): the X slab decides,
+        // box x in 3..5.
+        assert!(near_t(e.ray_hit(Vec3::ZERO, Vec3::X), 3.0));
+    }
+
+    /// A zero scale leaves the box flat, and the flat plane is still a box: a
+    /// ray in that plane hits it. What must never happen is a `NaN`.
+    #[test]
+    fn ray_hit_survives_a_degenerate_scale() {
+        let mut e = EditorEntity::new("prop", [0.0; 3]);
+        e.scale = [0.0, 1.0, 1.0];
+        // Sheet on x = 0, walked from x = 5.
+        assert!(near_t(e.ray_hit(Vec3::new(5.0, 0.0, 0.0), -Vec3::X), 5.0));
+        // Off the sheet: no hit, and no NaN leaking out as `Some(NaN)`.
+        assert_eq!(e.ray_hit(Vec3::new(5.0, 3.0, 0.0), -Vec3::X), None);
+    }
+
+    /// Broken data (NaN in the transform) is never pickable, even though
+    /// `aabb()` washes the NaN out into an inverted box.
+    #[test]
+    fn ray_hit_rejects_a_non_finite_box() {
+        let mut e = EditorEntity::new("prop", [0.0; 3]);
+        e.position = [f32::NAN, 0.0, 0.0];
+        assert_eq!(e.ray_hit(Vec3::ZERO, Vec3::X), None);
+    }
+
+    /// Picking uses the transformed box, not the local one: a rotated entity
+    /// is hit where it is drawn.
+    #[test]
+    fn ray_hit_follows_the_rotation() {
+        let mut e = EditorEntity::new("prop", [0.0; 3]);
+        e.size = [4.0, 1.0, 1.0];
+        e.rotation = [0.0, 90.0, 0.0];
+        // Turned 90 deg: the long axis is now Z and X only spans -0.5..0.5, so
+        // a ray down X from x = 20 enters at 0.5 — 19.5 blocks walked.
+        assert!(near_t(e.ray_hit(Vec3::new(20.0, 0.0, 0.0), -Vec3::X), 19.5));
     }
 
     #[test]

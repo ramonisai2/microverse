@@ -100,6 +100,15 @@ const ED_FLY_MIN_Y: f32 = 2.0;
 const ED_FLY_MAX_Y: f32 = 60.0;
 /// Distance from the camera at which an entity stops drawing its marker.
 const ED_MARKER_RANGE: f32 = 72.0;
+/// How far a click reaches when picking. The marker range on purpose, not a
+/// new number: the pick radius must not drift from the draw radius, or you
+/// could select an entity you cannot see.
+const ED_PICK_RANGE: f32 = ED_MARKER_RANGE;
+/// A second click this close (logical px) to the previous one counts as
+/// "clicking again" and cycles to the entity behind.
+const ED_PICK_SLOP: f32 = 4.0;
+/// ...and only within this many seconds of the previous click.
+const ED_PICK_WINDOW: f32 = 0.4;
 /// Cells per entity marker, and the ceiling for the whole frame.
 const ED_CELLS_PER_ENTITY: usize = 192;
 const ED_MAX_MARKER_CELLS: usize = 1200;
@@ -162,6 +171,25 @@ struct EditorSnapshot {
     state_sel: usize,
 }
 
+/// What the previous click in the 3D scene hit, so the next one can cycle to
+/// the entity behind it (`docs/plan_picking.md` §3.1).
+///
+/// Pure UI memory, so it is **not** in [`EditorSnapshot`]: it describes where
+/// the mouse was, not the document. `Undo`/`Redo` drop it instead of carrying
+/// it, because a restored document can make the saved slot mean something else.
+#[derive(Clone, Copy, Debug)]
+struct PickCycle {
+    /// Logical pixel of the click (top-left origin, like `mouse_logical`).
+    px: f32,
+    py: f32,
+    /// Seconds on the app clock when the click landed.
+    at: f32,
+    /// Slot it chose in the depth-sorted candidate list.
+    slot: usize,
+    /// The entity index that slot held, to tell "same list" from "new list".
+    entity: usize,
+}
+
 /// Editor state: the scene being arranged plus the free focus the HD-2D camera
 /// frames. The world is the game's; only `EditorScene` is the editor's.
 struct EditorState {
@@ -199,6 +227,8 @@ struct EditorState {
     kf_sel: usize,
     /// Active joint, index into `animation::joint_names()`.
     joint_sel: usize,
+    /// Last click in the 3D scene, for cycling through stacked entities.
+    last_pick: Option<PickCycle>,
 }
 
 impl EditorState {
@@ -226,6 +256,7 @@ impl EditorState {
             target: StepTarget::EntityOrState,
             kf_sel: 0,
             joint_sel: 0,
+            last_pick: None,
         }
     }
 
@@ -303,6 +334,7 @@ impl EditorState {
             | ScrollNext
             | SelPrev
             | SelNext
+            | Pick(_)
             | OpenPanel(_)
             | ClosePanel
             | StateSel(_)
@@ -344,6 +376,9 @@ impl EditorState {
         self.clip = snap.clip;
         self.selected = snap.selected;
         self.state_sel = snap.state_sel;
+        // The document moved under the cursor, so the slot a click cycled to
+        // may mean a different entity now. Start the next click over.
+        self.last_pick = None;
         self.clamp_scroll();
         self.clamp_state_sel();
     }
@@ -425,6 +460,19 @@ impl EditorState {
                     self.selected as i64
                 };
                 self.selected = ((cur + step).rem_euclid(n as i64)) as usize;
+                self.clamp_scroll();
+                self.clamp_state_sel();
+                return;
+            }
+            EditorAction::Pick(i) => {
+                // The click resolved to an index the scene may not have (an
+                // empty scene, or a stale one): ignore it instead of
+                // deselecting. Same tail as `SelNext` — a click and a key
+                // press leave the editor in the same state.
+                if self.scene.entities.get(i).is_none() {
+                    return;
+                }
+                self.selected = i;
                 self.clamp_scroll();
                 self.clamp_state_sel();
                 return;
@@ -768,6 +816,7 @@ impl EditorState {
             | EditorAction::ScrollNext
             | EditorAction::SelPrev
             | EditorAction::SelNext
+            | EditorAction::Pick(_)
             | EditorAction::KindPrev
             | EditorAction::KindNext
             | EditorAction::Add
@@ -947,6 +996,77 @@ impl EditorState {
             }
         }
         out
+    }
+
+    /// Entities the ray crosses, nearest hit first, as `(distance, index)`.
+    ///
+    /// Depth order is the whole contract: the first entry is what a click
+    /// picks, the second is what the next click on the same spot reaches, and
+    /// so on (`docs/plan_picking.md` §3.1). Ties break by index so two boxes
+    /// at the same distance don't swap places between frames.
+    fn pick_candidates(&self, origin: glam::Vec3, dir: glam::Vec3) -> Vec<(f32, usize)> {
+        let mut hits: Vec<(f32, usize)> = self
+            .scene
+            .entities
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| e.ray_hit(origin, dir).map(|t| (t, i)))
+            .filter(|(t, _)| *t <= ED_PICK_RANGE)
+            .collect();
+        hits.sort_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.1.cmp(&b.1))
+        });
+        hits
+    }
+
+    /// Resolve a click in the 3D scene to an entity index: `None` when the ray
+    /// hits nothing in range.
+    ///
+    /// The first click takes the nearest hit. A click within
+    /// [`ED_PICK_SLOP`] px and [`ED_PICK_WINDOW`] s of the previous one cycles
+    /// to the next candidate, wrapping around, so stacked entities are all
+    /// reachable without moving the camera.
+    ///
+    /// Only the cycle memory is written here. The selection itself goes
+    /// through [`Self::apply`] as [`EditorAction::Pick`], so
+    /// [`Self::history_effect`] stays the single place that decides what
+    /// touches the document.
+    fn pick_at(
+        &mut self,
+        origin: glam::Vec3,
+        dir: glam::Vec3,
+        px: (f32, f32),
+        now: f32,
+    ) -> Option<usize> {
+        let cands = self.pick_candidates(origin, dir);
+        if cands.is_empty() {
+            self.last_pick = None;
+            return None;
+        }
+        // Cycle only when the click repeats *and* the list is still the same
+        // one: if the camera moved enough for that slot to hold a different
+        // entity, this is a new pick, not a second one.
+        let repeats = self.last_pick.is_some_and(|prev| {
+            (prev.px - px.0).abs() <= ED_PICK_SLOP
+                && (prev.py - px.1).abs() <= ED_PICK_SLOP
+                && (now - prev.at) <= ED_PICK_WINDOW
+                && cands.get(prev.slot).is_some_and(|&(_, i)| i == prev.entity)
+        });
+        let slot = match (repeats, self.last_pick) {
+            (true, Some(prev)) => (prev.slot + 1) % cands.len(),
+            _ => 0,
+        };
+        let entity = cands[slot].1;
+        self.last_pick = Some(PickCycle {
+            px: px.0,
+            py: px.1,
+            at: now,
+            slot,
+            entity,
+        });
+        Some(entity)
     }
 
     /// Mesh of the selected entity, for the editor's 3D preview. `None` when
@@ -1727,6 +1847,23 @@ impl App {
         }
         let (origin, dir) = self.camera.screen_ray(x, y, lw, lh);
         self.press_mine_aimed(origin, dir, false);
+    }
+
+    /// Clic en la escena 3D del editor: rayo desde el píxel y elección de
+    /// entidad. El panel ya se consultó antes de llegar aquí, así que un clic
+    /// que entra en esta función es, por definición, un clic en la escena.
+    ///
+    /// El reloj es el del frame (`Instant`, monótono) y va como `f32` para que
+    /// `pick_at` siga siendo pura. Móvil/androide no entra por aquí: `tap_at`
+    /// corta con `screen != Playing` (decisión, `docs/plan_picking.md` §3.5).
+    fn editor_pick_click(&mut self) {
+        let (lw, lh) = self.logical_size();
+        let (x, y) = self.mouse_logical;
+        let (origin, dir) = self.camera.screen_ray(x, y, lw, lh);
+        let now = self.last_frame.elapsed().as_secs_f32();
+        if let Some(i) = self.editor.pick_at(origin, dir, (x, y), now) {
+            self.editor.apply(EditorAction::Pick(i));
+        }
     }
 
     fn break_targeted_block(&mut self) {
@@ -2940,9 +3077,13 @@ WindowEvent::RedrawRequested => {
                     }
                 }
 
-                // Editor: el ratón solo pulsa botones del panel; el mundo no
-                // se pica ni se coloca nada.
+                // Editor: the panel was already hit-tested above, so a click
+                // that gets here landed on the 3D scene and picks an entity.
+                // Nothing is mined or placed.
                 if self.screen == Screen::Editor {
+                    if button == MouseButton::Left {
+                        self.editor_pick_click();
+                    }
                     return;
                 }
 
@@ -3536,6 +3677,7 @@ mod hitch_tests {
             | EditorAction::ScrollNext
             | EditorAction::SelPrev
             | EditorAction::SelNext
+            | EditorAction::Pick(_)
             | EditorAction::KindPrev
             | EditorAction::KindNext
             | EditorAction::Add
@@ -3586,7 +3728,7 @@ mod hitch_tests {
             | EditorAction::JointPrev
             | EditorAction::JointNext
             | EditorAction::EditEntity
-            | EditorAction::EditJoint => 55,
+            | EditorAction::EditJoint => 56,
         }
     }
 
@@ -3598,6 +3740,7 @@ mod hitch_tests {
             ScrollNext,
             SelPrev,
             SelNext,
+            Pick(0),
             KindPrev,
             KindNext,
             Add,
@@ -3854,6 +3997,176 @@ mod hitch_tests {
             .any(|(cell, c)| cell.x == sel_x as i32 && is_white(*c)));
         assert!(mesh.iter().any(|(cell, _)| cell.x == other_x as i32));
         assert!(mesh.len() < cage.len());
+    }
+
+    /// Cámara y rayo de los tests de picking: mirando a +X desde el origen.
+    const PICK_CAM: glam::Vec3 = glam::Vec3::new(0.0, 24.0, 0.0);
+    const PICK_DIR: glam::Vec3 = glam::Vec3::X;
+    /// Píxel de los clicks, lejos de cualquier borde.
+    const PICK_PX: (f32, f32) = (400.0, 300.0);
+
+    /// Editor con `n` cajas de 1 bloque alineadas con el eje X en `y = 24`, la
+    /// primera en `x = 4`: la 0 es la más cercana a [`PICK_CAM`].
+    fn stacked_pick_scene(n: usize) -> EditorState {
+        let mut ed = EditorState::new(PICK_CAM);
+        ed.scene.entities.clear();
+        for i in 0..n {
+            let mut e = EditorEntity::new("prop", [4.0 + i as f32 * 3.0, 24.0, 0.0]);
+            e.size = [1.0, 1.0, 1.0];
+            ed.scene.entities.push(e);
+        }
+        ed
+    }
+
+    /// N cajas en el MISMO sitio: el caso que motive el ciclo.
+    fn overlapped_pick_scene(n: usize) -> EditorState {
+        let mut ed = stacked_pick_scene(n);
+        for e in ed.scene.entities.iter_mut() {
+            e.position = [4.0, 24.0, 0.0];
+            e.size = [2.0, 2.0, 2.0];
+        }
+        ed
+    }
+
+    /// El clic elige lo que hay bajo el cursor: el rayo que cruza una entidad
+    /// la selecciona, y uno que no la cruza no la toca.
+    #[test]
+    fn editor_pick_selects_the_entity_under_the_cursor() {
+        let mut ed = stacked_pick_scene(2);
+        let cands = ed.pick_candidates(PICK_CAM, PICK_DIR);
+        assert_eq!(cands.len(), 2, "el rayo cruza las dos: {cands:?}");
+        // Orden de profundidad: la de x = 4 antes que la de x = 7.
+        assert_eq!(cands[0].1, 0);
+        assert!(cands[0].0 < cands[1].0, "profundidad: {cands:?}");
+
+        let hit = ed.pick_at(PICK_CAM, PICK_DIR, PICK_PX, 1.0).expect("hay entidad");
+        ed.apply(EditorAction::Pick(hit));
+        assert_eq!(ed.selected, 0);
+
+        // Un rayo por encima de las cajas no pica nada, y olvida el click.
+        assert_eq!(ed.pick_at(PICK_CAM, glam::Vec3::Y, PICK_PX, 1.1), None);
+        assert!(ed.last_pick.is_none(), "un click al vacío reinicia el ciclo");
+    }
+
+    /// Solapadas de verdad: la primera elige la de delante, las siguientes
+    /// ciclan, y al llegar al final vuelve a la primera.
+    #[test]
+    fn editor_pick_cycles_through_overlapping_entities() {
+        let mut ed = overlapped_pick_scene(3);
+        let click = |ed: &mut EditorState, at: f32| {
+            let i = ed
+                .pick_at(PICK_CAM, PICK_DIR, PICK_PX, at)
+                .expect("hay entidad");
+            ed.apply(EditorAction::Pick(i));
+            ed.selected
+        };
+        assert_eq!(click(&mut ed, 10.0), 0, "la más cercana primero");
+        assert_eq!(click(&mut ed, 10.1), 1, "el segundo click va a la de detrás");
+        assert_eq!(click(&mut ed, 10.2), 2);
+        assert_eq!(click(&mut ed, 10.3), 0, "y el cuarto envuelve");
+    }
+
+    /// El ciclo solo cicla si el click **repite**: mismo sitio (dentro del
+    /// slop) y dentro de la ventana de tiempo.
+    #[test]
+    fn editor_pick_cycle_resets_on_a_different_click() {
+        let mut ed = overlapped_pick_scene(2);
+        let pick = |ed: &mut EditorState, px: (f32, f32), at: f32| {
+            ed.pick_at(PICK_CAM, PICK_DIR, px, at).expect("hay entidad")
+        };
+        // Slot 0 memorizado...
+        assert_eq!(pick(&mut ed, PICK_PX, 10.0), 0);
+        // ...y un click 1 px al lado, dentro del slop, cicla.
+        assert_eq!(pick(&mut ed, (401.0, 300.0), 10.1), 1, "slop: cicla");
+        // Lejos en el sitio: click nuevo, vuelve al primero.
+        assert_eq!(pick(&mut ed, (460.0, 300.0), 10.2), 0, "otro sitio: reinicia");
+        assert_eq!(pick(&mut ed, (460.0, 300.0), 10.3), 1);
+        // Fuera de la ventana de tiempo: click nuevo, aunque el sitio sea el
+        // mismo. El reloj no puede ir hacia atrás, así que `at` solo crece.
+        let far = 10.3 + ED_PICK_WINDOW + 0.05;
+        assert_eq!(pick(&mut ed, (460.0, 300.0), far), 0, "ventana: reinicia");
+        // Justo en el límite de la ventana todavía cicla (`<=`).
+        assert_eq!(pick(&mut ed, (460.0, 300.0), far + ED_PICK_WINDOW), 1);
+        // Y un click justo fuera ya no.
+        assert_eq!(
+            pick(&mut ed, (460.0, 300.0), far + ED_PICK_WINDOW * 2.0 + 0.05),
+            0
+        );
+    }
+
+    /// Si la lista de candidatos cambió, el slot guardado apunta a otra entidad
+    /// y el click cuenta como nuevo (si no, el ciclo saltaría a un slot
+    /// distinto del que el usuario espera).
+    #[test]
+    fn editor_pick_cycle_resets_when_the_list_changed() {
+        let mut ed = stacked_pick_scene(3);
+        assert_eq!(ed.pick_at(PICK_CAM, PICK_DIR, PICK_PX, 10.0), Some(0));
+        // La 0 se va: la lista pasa a ser [1, 2]. Sin la comprobación de
+        // "el slot sigue siendo la misma entidad", el ciclo avanzaría al slot
+        // 1 y elegiría la 2.
+        ed.scene.entities[0].position = [900.0, 24.0, 0.0];
+        assert_eq!(
+            ed.pick_at(PICK_CAM, PICK_DIR, PICK_PX, 10.1),
+            Some(1),
+            "cambió la lista: empieza por el primero"
+        );
+    }
+
+    /// El rango de picking es el de dibujado: lo que no se dibuja, no se elige.
+    #[test]
+    fn editor_pick_stops_at_the_marker_range() {
+        let mut ed = stacked_pick_scene(1);
+        ed.scene.entities[0].position = [ED_PICK_RANGE + 10.0, 24.0, 0.0];
+        assert!(ed.pick_candidates(PICK_CAM, PICK_DIR).is_empty());
+        assert_eq!(ed.pick_at(PICK_CAM, PICK_DIR, PICK_PX, 1.0), None);
+        // Y coincide con el rango del marcador, por construcción.
+        assert_eq!(ED_PICK_RANGE, ED_MARKER_RANGE);
+    }
+
+    /// Elegir es una acción de vista, como `SelNext`: no empuja undo ni toca
+    /// el redo. (Lo que `Undo` haga después con `selected` es lo de siempre:
+    /// el snapshot guarda el cursor, así que lo restaura — eso no lo cambia
+    /// `Pick`.)
+    #[test]
+    fn editor_pick_is_not_an_undo_step() {
+        let mut ed = stacked_pick_scene(3);
+        ed.apply(EditorAction::PosXInc);
+        let undo_before = ed.undo.len();
+        let redo_before = ed.redo.len();
+        assert_eq!(undo_before, 1);
+
+        ed.apply(EditorAction::Pick(1));
+        assert_eq!(ed.selected, 1, "el click elige");
+        assert_eq!(ed.undo.len(), undo_before, "elegir no empuja undo");
+        assert_eq!(ed.redo.len(), redo_before, "ni toca el redo");
+    }
+
+    /// `Undo` restaura el documento, así que la memoria del clic (que
+    /// describe el documento anterior) se invalida.
+    #[test]
+    fn editor_pick_cycle_drops_on_undo() {
+        let mut ed = stacked_pick_scene(2);
+        ed.apply(EditorAction::PosXInc);
+        assert_eq!(ed.pick_at(PICK_CAM, PICK_DIR, PICK_PX, 10.0), Some(0));
+        assert!(ed.last_pick.is_some());
+        ed.apply(EditorAction::Undo);
+        assert!(ed.last_pick.is_none(), "el documento se restauró");
+        // Y el siguiente click vuelve a empezar por el más cercano.
+        assert_eq!(ed.pick_at(PICK_CAM, PICK_DIR, PICK_PX, 10.1), Some(0));
+    }
+
+    /// Un índice que la escena no tiene (una escena vacía, o un click
+    /// enlatado) no rompe nada.
+    #[test]
+    fn editor_pick_of_a_missing_entity_is_ignored() {
+        let mut ed = stacked_pick_scene(1);
+        ed.apply(EditorAction::Pick(9));
+        assert_eq!(ed.selected, 0, "sigue la selección que hubiera");
+        let mut empty = EditorState::new(glam::Vec3::ZERO);
+        empty.scene.entities.clear();
+        empty.selected = usize::MAX;
+        empty.apply(EditorAction::Pick(0));
+        assert_eq!(empty.selected, usize::MAX, "no selecciona la nada");
     }
 
     /// La entidad por defecto del editor trae `model: "hero"`, así que la

@@ -69,6 +69,10 @@ pub enum EditorAction {
     /// Pick another entity from the list.
     SelPrev,
     SelNext,
+    /// Pick entity `i` by clicking it in the 3D scene. Emitted by the mouse
+    /// handler, not by a button: the panel is hit-tested first, so a click that
+    /// reaches this one landed on the scene.
+    Pick(usize),
     /// Cycle the type tag of the selected entity.
     KindPrev,
     KindNext,
