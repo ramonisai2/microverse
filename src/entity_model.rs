@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-pub const PALETTE_LEN: usize = 32;
+pub const PALETTE_LEN: usize = 40;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EntityGrid {
@@ -21,7 +21,7 @@ pub struct EntityVoxel {
     pub x: i32,
     pub y: i32,
     pub z: i32,
-    /// Palette index `0..31`.
+    /// Palette index `0..39`.
     pub c: u8,
 }
 
@@ -121,7 +121,7 @@ pub struct EntityModel {
     pub top_y: i32,
     #[allow(dead_code)]
     pub palette_name: String,
-    /// RGB for each of 32 slots.
+    /// RGB for each of the `PALETTE_LEN` slots.
     pub palette: [[f32; 3]; PALETTE_LEN],
     /// Occupancy + colour index.
     pub cells: FxHashMap<(i32, i32, i32), u8>,
@@ -922,5 +922,92 @@ mod tests {
             *preview_palette("no-existe").expect("fallback"),
             palette_by_name("classic")
         );
+    }
+
+    /// Cada paleta en disco tiene exactamente `PALETTE_LEN` entradas, todas
+    /// hex de 6 dígitos. Sin esto, un archivo que no cuadre hace que
+    /// `load_palette_json` devuelva `None` y `palette_by_name` caiga al
+    /// fallback magenta, sin decir nada.
+    #[test]
+    fn every_palette_json_has_palette_len_entries() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/palettes");
+        let entries = std::fs::read_dir(&dir).expect("assets/palettes");
+        let mut checked = 0;
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
+            let text = std::fs::read_to_string(&path).expect("leer paleta");
+            let arr: Vec<String> = serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("{name}: JSON inválido: {e}"));
+            assert_eq!(
+                arr.len(),
+                PALETTE_LEN,
+                "{name} tiene {} entradas, hacen falta {PALETTE_LEN}",
+                arr.len()
+            );
+            for (i, hex) in arr.iter().enumerate() {
+                assert!(
+                    hex.len() == 7 && hex.starts_with('#'),
+                    "{name}[{i}] = {hex:?} no es #RRGGBB"
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked >= 10, "esperaba al menos 10 paletas, vi {checked}");
+    }
+
+    /// Ningún `c` de los assets apunta fuera de la paleta. `from_file` recorta
+    /// con `.min(PALETTE_LEN - 1)`, así que un índice fuera de rango no
+    /// revienta: se lee como el último color y nadie se entera.
+    #[test]
+    fn no_asset_voxel_points_outside_the_palette() {
+        fn walk(v: &serde_json::Value, limit: u64, name: &str, seen: &mut usize) {
+            match v {
+                serde_json::Value::Object(map) => {
+                    if let Some(c) = map.get("c").and_then(|x| x.as_u64()) {
+                        assert!(
+                            c < limit,
+                            "{name}: un vóxel tiene c={c}, el tope es {limit}"
+                        );
+                        *seen += 1;
+                    }
+                    for child in map.values() {
+                        walk(child, limit, name, seen);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for child in items {
+                        walk(child, limit, name, seen);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut files = 0;
+        for root in ["assets/entities", "assets/items"] {
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(root);
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.filter_map(|e| e.ok()) {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
+                let text = std::fs::read_to_string(&path).expect("leer asset");
+                let value: serde_json::Value = serde_json::from_str(&text)
+                    .unwrap_or_else(|e| panic!("{name}: JSON inválido: {e}"));
+                let mut seen = 0usize;
+                walk(&value, PALETTE_LEN as u64, name, &mut seen);
+                if seen > 0 {
+                    files += 1;
+                }
+            }
+        }
+        assert!(files >= 3, "esperaba al menos 3 mallas con vóxeles, vi {files}");
     }
 }
