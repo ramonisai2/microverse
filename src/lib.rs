@@ -24,11 +24,11 @@ pub mod touch;
 pub mod world;
 
 use camera::{Camera, HeldKeys, MAX_TICKS_PER_FRAME, TICKS_PER_SECOND};
-use editor::{EditorEntity, EditorScene};
+use editor::{EditorEntity, EditorScene, TransformField};
 use hud::{
     append_hud, build_compass_hud, build_hotbar_hud, build_inventory_hud, build_loading_hud,
     build_stair_hud, build_status_hud, hit_test, EditorAction, EditorPanel, Hotbar, HudAction,
-    HudMesh, MENU_ROWS,
+    HudMesh, HudRect, MENU_ROWS,
 };
 use inventory::{InvItem, PlayerInventory};
 use items::{bare_hand_can_mine, bare_hand_dig_interval, spawn_wooden_pickaxe, ToolInstance};
@@ -123,10 +123,263 @@ const ED_SKEW_LIMIT: f32 = 2.0;
 const ED_SIZE_RANGE: (f32, f32) = (0.5, 24.0);
 /// How far from the spawn an entity may be placed.
 const ED_POS_LIMIT: f32 = 512.0;
+
 /// Undo depth of the editor document (scene + clip). Oldest entry is dropped.
 const ED_UNDO_MAX: usize = 100;
 /// Seconds one `KeyframeTime*` press moves the active keyframe.
 const ED_KEYFRAME_TIME_STEP: f32 = 0.05;
+/// Logical pixels of horizontal travel that make one step when a transform bar
+/// is dragged. A drag is priced in pixels, not in steps, so the same gesture
+/// covers the same ground at any step size.
+const ED_BAR_PX_PER_STEP: f32 = 24.0;
+/// How far the pointer may travel (logical px) and still count as a click: a
+/// click is one exact step, a drag is however many steps the travel earned.
+const ED_BAR_DRAG_SLOP: f32 = 3.0;
+/// Shift divides a step by this: a fine step is an eighth of a normal one.
+const ED_FINE_DIVISOR: u32 = 8;
+
+/// A transient line under the editor's top strip: what the last gesture did.
+///
+/// It is **not** [`EditorState::status`]. That one is the editor's memory — it
+/// stays until something replaces it, which is what a file action wants. This
+/// one is a message about a movement, and it goes away on its own.
+///
+/// Pure UI, so it is **not** in [`EditorSnapshot`]: undoing a drag does not
+/// resurrect the line that described it.
+#[derive(Clone, Debug, Default)]
+struct Subtitle {
+    /// Empty = nothing to say. Drawn as-is, so no `Option` to unwrap.
+    text: String,
+    /// Seconds on the app clock (`App::app_secs`) when it was written.
+    at: f32,
+}
+
+/// A drag in progress on a transform bar.
+///
+/// Only the gesture's own bookkeeping, so it is separate from `App`: the app
+/// feeds it pixels and applies the steps. **One drag is one undo entry** — the
+/// document is captured when the pointer goes down and pushed when it comes up,
+/// and only if the drag actually moved something, so a drag that ends at a
+/// clamp leaves the history alone.
+#[derive(Clone, Debug)]
+struct BarDrag {
+    /// Field under the pointer.
+    field: TransformField,
+    /// The document as it was when the pointer went down.
+    before: EditorSnapshot,
+    /// Logical pixel of the previous move, to measure the delta against.
+    last_px: f32,
+    /// Logical pixel of the press, for the click slop.
+    press_px: f32,
+    /// Logical pixel in the middle of the bar: a click below it steps down and a
+    /// click above it steps up, which is the only thing the bar's own position
+    /// decides.
+    mid_px: f32,
+    /// Horizontal pixels travelled that do not add up to a step yet.
+    acc_px: f32,
+    /// Shift when the drag started: an [`ED_FINE_DIVISOR`] of a step. Latched
+    /// at the press so one gesture never mixes fine and normal steps.
+    fine: bool,
+    /// Whether any step of this drag moved the document.
+    changed: bool,
+}
+
+impl BarDrag {
+    fn new(field: TransformField, before: EditorSnapshot, rect: HudRect, px: f32, fine: bool) -> Self {
+        Self {
+            field,
+            before,
+            last_px: px,
+            press_px: px,
+            mid_px: rect.x + rect.w * 0.5,
+            acc_px: 0.0,
+            fine,
+            changed: false,
+        }
+    }
+
+    /// Has the pointer left the press by enough to be a drag? A press that never
+    /// did is a click, and a click is decided on release (which half of the bar
+    /// was pressed), so a press cannot both step and drag.
+    fn dragged(&self, px: f32) -> bool {
+        (px - self.press_px).abs() >= ED_BAR_DRAG_SLOP
+    }
+
+    /// Steps the pointer has earned since the last call, consuming the pixels
+    /// that paid for them. The remainder stays in `acc_px`, so a slow drag
+    /// still lands on exact steps instead of rounding them away, and only the
+    /// horizontal travel counts: the bar is a slider, not a 2D pad.
+    ///
+    /// The sign is the sign of the travel: right grows the field.
+    fn take_steps(&mut self, px: f32) -> i32 {
+        self.acc_px += px - self.last_px;
+        self.last_px = px;
+        let units = self.acc_px / ED_BAR_PX_PER_STEP;
+        let whole = units.trunc();
+        self.acc_px -= whole * ED_BAR_PX_PER_STEP;
+        whole as i32
+    }
+
+    /// Divisor of a step for this drag: a fine step is an eighth of a normal
+    /// one, so the same travel buys eight times less.
+    fn divisor(&self) -> u32 {
+        if self.fine {
+            ED_FINE_DIVISOR
+        } else {
+            1
+        }
+    }
+}
+
+/// One transform field's step and its limits, as data.
+///
+/// The panel, the keyboard and a drag all read this descriptor, so a number is
+/// written once instead of once per input. `wrap` is how a rotation escapes:
+/// it has no range to sit in, so it wraps instead of clamping. `uniform` is the
+/// size box, which moves the three axes of the marker together instead of one
+/// of them.
+#[derive(Clone, Copy, Debug)]
+struct FieldSpec {
+    /// One step, in the field's own unit (blocks, degrees, scale, shear).
+    step: f32,
+    lo: f32,
+    hi: f32,
+    wrap: bool,
+    uniform: bool,
+}
+
+/// Base of a field that simply clamps inside a range. [`field_spec`] spells out
+/// only what makes a field different from this.
+const FIELD_CLAMPED: FieldSpec = FieldSpec {
+    step: 0.0,
+    lo: 0.0,
+    hi: 0.0,
+    wrap: false,
+    uniform: false,
+};
+
+/// The descriptor of one field: a single table, one entry per
+/// [`TransformField`].
+///
+/// One table and not one per channel, because the limits are not per channel:
+/// Y never goes under the ground, the shear has a limit of its own and a
+/// rotation has none to clamp against.
+fn field_spec(field: TransformField) -> FieldSpec {
+    use TransformField::*;
+    match field {
+        PosX | PosZ => FieldSpec {
+            step: ED_POS_STEP,
+            lo: -ED_POS_LIMIT,
+            hi: ED_POS_LIMIT,
+            ..FIELD_CLAMPED
+        },
+        PosY => FieldSpec {
+            step: ED_POS_STEP,
+            lo: 0.0,
+            hi: ED_POS_LIMIT,
+            ..FIELD_CLAMPED
+        },
+        RotX | RotY | RotZ => FieldSpec {
+            step: ED_ROT_STEP,
+            wrap: true,
+            ..FIELD_CLAMPED
+        },
+        SclX | SclY | SclZ => FieldSpec {
+            step: ED_SCALE_STEP,
+            lo: ED_SCALE_RANGE.0,
+            hi: ED_SCALE_RANGE.1,
+            ..FIELD_CLAMPED
+        },
+        SkewZ => FieldSpec {
+            step: ED_SKEW_STEP,
+            lo: -ED_SKEW_LIMIT,
+            hi: ED_SKEW_LIMIT,
+            ..FIELD_CLAMPED
+        },
+        Size => FieldSpec {
+            step: ED_SIZE_STEP,
+            lo: ED_SIZE_RANGE.0,
+            hi: ED_SIZE_RANGE.1,
+            uniform: true,
+            ..FIELD_CLAMPED
+        },
+    }
+}
+
+/// The channels a field moves: the array inside the driven transform — or the
+/// size box, which is not a transform channel — and the axis inside it.
+///
+/// The axis is ignored by the uniform size box, which owns all three.
+fn field_target<'a>(
+    t: &'a mut editor::Transform,
+    size: &'a mut [f32; 3],
+    field: TransformField,
+) -> (&'a mut [f32; 3], usize) {
+    use TransformField::*;
+    match field {
+        PosX => (&mut t.position, 0),
+        PosY => (&mut t.position, 1),
+        PosZ => (&mut t.position, 2),
+        RotX => (&mut t.rotation, 0),
+        RotY => (&mut t.rotation, 1),
+        RotZ => (&mut t.rotation, 2),
+        SclX => (&mut t.scale, 0),
+        SclY => (&mut t.scale, 1),
+        SclZ => (&mut t.scale, 2),
+        SkewZ => (&mut t.skew, 2),
+        Size => (size, 0),
+    }
+}
+
+/// The value a field shows: the channel a step of that field would move.
+///
+/// The mirror of [`field_target`], so what a bar prints is by construction the
+/// number its own step is about to change.
+fn field_value(t: &editor::Transform, size: &[f32; 3], field: TransformField) -> f32 {
+    use TransformField::*;
+    match field {
+        PosX => t.position[0],
+        PosY => t.position[1],
+        PosZ => t.position[2],
+        RotX => t.rotation[0],
+        RotY => t.rotation[1],
+        RotZ => t.rotation[2],
+        SclX => t.scale[0],
+        SclY => t.scale[1],
+        SclZ => t.scale[2],
+        SkewZ => t.skew[2],
+        // The size box moves the three axes together; the bar shows the first
+        // one, like the readout on the right does.
+        Size => size[0],
+    }
+}
+
+/// One step of a field, applied to the channels it owns, split in `divisor`
+/// (Shift: a fine step is an eighth of a normal one, so `divisor` is
+/// [`ED_FINE_DIVISOR`]).
+///
+/// A clamped field stops at its limit and a wrapping one has none; the uniform
+/// size box is a floor/ceiling pair instead of a clamp, so a step only ever
+/// pushes the end it is heading for and a size read from a file outside the
+/// range is not snapped by the step in the other direction.
+fn bump_field(values: &mut [f32; 3], axis: usize, dir: f32, divisor: u32, spec: &FieldSpec) {
+    let d = dir * spec.step / divisor as f32;
+    if spec.wrap {
+        values[axis] = wrap_deg(values[axis] + d);
+        return;
+    }
+    if spec.uniform {
+        for a in values.iter_mut() {
+            *a = if d < 0.0 {
+                (*a + d).max(spec.lo)
+            } else {
+                (*a + d).min(spec.hi)
+            };
+        }
+        return;
+    }
+    values[axis] = (values[axis] + d).clamp(spec.lo, spec.hi);
+}
 
 /// What the transform steppers drive right now.
 ///
@@ -200,6 +453,8 @@ struct EditorState {
     scroll: usize,
     /// Last message shown in the panel's top strip.
     status: String,
+    /// Transient line under that strip, faded out by time (`Subtitle`).
+    subtitle: Subtitle,
     /// Point the camera frames; WASD / joystick flies it.
     focus: glam::Vec3,
     /// File this session has open, so `GUARDAR` rewrites it instead of
@@ -243,6 +498,7 @@ impl EditorState {
             selected: 0,
             scroll: 0,
             status: "WASD vuela · Q/E gira · F2 guarda · Esc vuelve".into(),
+            subtitle: Subtitle::default(),
             focus,
             path: None,
             load_cursor: 0,
@@ -294,6 +550,54 @@ impl EditorState {
     /// Number of states of the selection (0 when it has none).
     fn state_len(&self) -> usize {
         self.selected_entity().map_or(0, |e| e.states.len())
+    }
+
+    /// Say in the subtitle what a gesture just did: the field and the value it
+    /// left. `at` is the app clock, so this state stays pure (same rule as
+    /// `pick_at`).
+    fn say_subtitle(&mut self, field: TransformField, value: f32, at: f32) {
+        self.subtitle = Subtitle {
+            text: format!("{} {:.*}", field.label(), field.decimals(), value),
+            at,
+        };
+    }
+
+    /// The subtitle and how many seconds ago it was written, for the panel to
+    /// fade it out. An empty line comes back with the age anyway: the panel
+    /// checks the text, not the clock.
+    fn subtitle(&self, now: f32) -> (&str, f32) {
+        (&self.subtitle.text, (now - self.subtitle.at).max(0.0))
+    }
+
+    /// The transform panel's bars with the value each one shows.
+    ///
+    /// The value is the one a step would move — the active state when the entity
+    /// owns states, the entity otherwise, the same rule as `step_field` — and
+    /// the fill is where that value sits inside the field's own range.
+    fn transform_bars(&self, logical_w: f32, logical_h: f32) -> [hud::TransformBar; 11] {
+        let (driven, size) = self
+            .selected_entity()
+            .map(|e| {
+                let state_idx = e.clamp_state(self.state_sel);
+                (
+                    e.state(state_idx)
+                        .map(|s| s.transform())
+                        .unwrap_or_else(|| e.transform()),
+                    e.size,
+                )
+            })
+            .unwrap_or_default();
+        crate::hud::editor_transform_panel(logical_w, logical_h)
+            .bars
+            .map(|mut bar| {
+                let spec = field_spec(bar.field);
+                bar.value = field_value(&driven, &size, bar.field);
+                // A rotation wraps, so it has no range to sit in: its bar shows
+                // the number and nothing else.
+                bar.fill = (!spec.wrap)
+                    .then(|| ((bar.value - spec.lo) / (spec.hi - spec.lo)).clamp(0.0, 1.0));
+                bar
+            })
     }
 
     /// Number of keyframes of the open clip (0 when no clip is open).
@@ -385,10 +689,21 @@ impl EditorState {
 
     /// Record the current state before a change, and invalidate the redo path.
     fn push_undo(&mut self) {
+        self.push_undo_snapshot(self.snapshot());
+    }
+
+    /// Push a document state captured earlier as one entry of the history.
+    ///
+    /// A gesture captures the document when the pointer goes down and pushes it
+    /// when the pointer comes up, so a whole drag is a single entry — and a
+    /// gesture that never moved anything pushes nothing. Pushing *after* the
+    /// change is what allows that: the snapshot describes the document as it
+    /// was, not as it is.
+    fn push_undo_snapshot(&mut self, before: EditorSnapshot) {
         if self.undo.len() == ED_UNDO_MAX {
             self.undo.remove(0);
         }
-        self.undo.push(self.snapshot());
+        self.undo.push(before);
         self.redo.clear();
     }
 
@@ -753,13 +1068,28 @@ impl EditorState {
             _ => {}
         }
 
-        // Transform steps: dispatch on the active target (polymorphic target,
-        // `docs/plan_fase6.md` §4).
-        if self.target == StepTarget::Joint {
-            self.apply_joint_step(action);
-            return;
+        // Transform steps: the descriptor per field owns the step and the
+        // clamp, and the active target says which object they land on
+        // (polymorphic target, `docs/plan_fase6.md` §4). Anything that is not
+        // a step has already returned above.
+        if let Some((field, dir)) = TransformField::of(action) {
+            if self.target == StepTarget::Joint {
+                self.step_joint(field, dir);
+            } else {
+                self.step_field(field, dir, 1);
+            }
         }
+    }
 
+    /// Move one field of the selection by `dir` steps of `1 / divisor`, as its
+    /// descriptor says. Returns the value the field was left at, or `None` when
+    /// the step moved nothing — no selection, or already against the limit — so
+    /// a gesture that ends there leaves no history and nothing to say.
+    ///
+    /// The only writer of a transform step: a button, a key and a drag all land
+    /// here, so they cannot disagree about the step or about the clamp. The
+    /// undo history is left alone — the caller decides what one entry of it is.
+    fn step_field(&mut self, field: TransformField, dir: f32, divisor: u32) -> Option<f32> {
         // Transform steps need a selection. They drive the ACTIVE STATE when the
         // entity owns states — a state's transform is local and is applied
         // *before* the entity's, same documented order — and the entity itself
@@ -767,7 +1097,7 @@ impl EditorState {
         // not part of the mesh.
         let Some(e) = self.selected_entity() else {
             self.status = "sin entidad seleccionada".into();
-            return;
+            return None;
         };
         let in_state = e.has_states();
         let state_idx = e.clamp_state(self.state_sel);
@@ -778,77 +1108,16 @@ impl EditorState {
             .map(|s| s.transform())
             .unwrap_or_else(|| e.transform());
         let mut size = e.size;
-        let bump = |v: &mut f32, d: f32, lo: f32, hi: f32| {
-            *v = (*v + d).clamp(lo, hi);
-        };
-        match action {
-            EditorAction::PosXDec => bump(&mut t.position[0], -ED_POS_STEP, -ED_POS_LIMIT, ED_POS_LIMIT),
-            EditorAction::PosXInc => bump(&mut t.position[0], ED_POS_STEP, -ED_POS_LIMIT, ED_POS_LIMIT),
-            EditorAction::PosYDec => bump(&mut t.position[1], -ED_POS_STEP, 0.0, ED_POS_LIMIT),
-            EditorAction::PosYInc => bump(&mut t.position[1], ED_POS_STEP, 0.0, ED_POS_LIMIT),
-            EditorAction::PosZDec => bump(&mut t.position[2], -ED_POS_STEP, -ED_POS_LIMIT, ED_POS_LIMIT),
-            EditorAction::PosZInc => bump(&mut t.position[2], ED_POS_STEP, -ED_POS_LIMIT, ED_POS_LIMIT),
-            EditorAction::RotXDec => t.rotation[0] = wrap_deg(t.rotation[0] - ED_ROT_STEP),
-            EditorAction::RotXInc => t.rotation[0] = wrap_deg(t.rotation[0] + ED_ROT_STEP),
-            EditorAction::RotYDec => t.rotation[1] = wrap_deg(t.rotation[1] - ED_ROT_STEP),
-            EditorAction::RotYInc => t.rotation[1] = wrap_deg(t.rotation[1] + ED_ROT_STEP),
-            EditorAction::RotZDec => t.rotation[2] = wrap_deg(t.rotation[2] - ED_ROT_STEP),
-            EditorAction::RotZInc => t.rotation[2] = wrap_deg(t.rotation[2] + ED_ROT_STEP),
-            EditorAction::SclXDec => bump(&mut t.scale[0], -ED_SCALE_STEP, ED_SCALE_RANGE.0, ED_SCALE_RANGE.1),
-            EditorAction::SclXInc => bump(&mut t.scale[0], ED_SCALE_STEP, ED_SCALE_RANGE.0, ED_SCALE_RANGE.1),
-            EditorAction::SclYDec => bump(&mut t.scale[1], -ED_SCALE_STEP, ED_SCALE_RANGE.0, ED_SCALE_RANGE.1),
-            EditorAction::SclYInc => bump(&mut t.scale[1], ED_SCALE_STEP, ED_SCALE_RANGE.0, ED_SCALE_RANGE.1),
-            EditorAction::SclZDec => bump(&mut t.scale[2], -ED_SCALE_STEP, ED_SCALE_RANGE.0, ED_SCALE_RANGE.1),
-            EditorAction::SclZInc => bump(&mut t.scale[2], ED_SCALE_STEP, ED_SCALE_RANGE.0, ED_SCALE_RANGE.1),
-            EditorAction::SkewDec => bump(&mut t.skew[2], -ED_SKEW_STEP, -ED_SKEW_LIMIT, ED_SKEW_LIMIT),
-            EditorAction::SkewInc => bump(&mut t.skew[2], ED_SKEW_STEP, -ED_SKEW_LIMIT, ED_SKEW_LIMIT),
-            EditorAction::SizeDec => {
-                for a in size.iter_mut() {
-                    *a = (*a - ED_SIZE_STEP).max(ED_SIZE_RANGE.0);
-                }
-            }
-            EditorAction::SizeInc => {
-                for a in size.iter_mut() {
-                    *a = (*a + ED_SIZE_STEP).min(ED_SIZE_RANGE.1);
-                }
-            }
-            EditorAction::ScrollPrev
-            | EditorAction::ScrollNext
-            | EditorAction::SelPrev
-            | EditorAction::SelNext
-            | EditorAction::Pick(_)
-            | EditorAction::KindPrev
-            | EditorAction::KindNext
-            | EditorAction::Add
-            | EditorAction::Duplicate
-            | EditorAction::Delete
-            | EditorAction::Save
-            | EditorAction::Load
-            | EditorAction::StateSel(_)
-            | EditorAction::StatePrev
-            | EditorAction::StateNext
-            | EditorAction::StateAdd
-            | EditorAction::StateDup
-            | EditorAction::StateDel
-            | EditorAction::ClipLoad
-            | EditorAction::ClipSave
-            | EditorAction::Undo
-            | EditorAction::Redo
-            | EditorAction::KeyframeSel(_)
-            | EditorAction::KeyframePrev
-            | EditorAction::KeyframeNext
-            | EditorAction::KeyframeTimeDec
-            | EditorAction::KeyframeTimeInc
-            | EditorAction::JointPrev
-            | EditorAction::JointNext
-            | EditorAction::EditEntity
-            | EditorAction::EditJoint
-            | EditorAction::OpenPanel(_)
-            | EditorAction::ClosePanel
-            | EditorAction::Back => {}
+        let spec = field_spec(field);
+        let (values, axis) = field_target(&mut t, &mut size, field);
+        let before = *values;
+        bump_field(values, axis, dir, divisor, &spec);
+        if *values == before {
+            return None;
         }
+        let value = values[axis];
         let Some(e) = self.selected_entity_mut() else {
-            return;
+            return None;
         };
         e.size = size;
         if in_state {
@@ -858,6 +1127,44 @@ impl EditorState {
         } else {
             e.set_transform(t);
         }
+        Some(value)
+    }
+
+    /// Pointer moved during a drag: turn the travel into steps. No history is
+    /// touched here — the entry is closed when the pointer comes up. Returns the
+    /// value the field was left at if this move stepped it, so the caller can
+    /// say so in the subtitle.
+    fn drag_field(&mut self, drag: &mut BarDrag, px: f32) -> Option<f32> {
+        let steps = drag.take_steps(px);
+        let dir = steps.signum() as f32;
+        let mut stepped = None;
+        for _ in 0..steps.unsigned_abs() {
+            if let Some(v) = self.step_field(drag.field, dir, drag.divisor()) {
+                drag.changed = true;
+                stepped = Some(v);
+            }
+        }
+        stepped
+    }
+
+    /// Pointer released: a press that never left the bar is a click, and a click
+    /// is one exact step — down on the left half of the bar, up on the right.
+    /// A drag is one entry of history for everything it stepped. Either way the
+    /// gesture leaves at most one entry, and none at all if it moved nothing.
+    /// Returns what a click stepped, for the same reason as `drag_field`.
+    fn end_field_drag(&mut self, drag: BarDrag, px: f32) -> Option<f32> {
+        if !drag.dragged(px) {
+            let dir = if px < drag.mid_px { -1.0 } else { 1.0 };
+            let stepped = self.step_field(drag.field, dir, drag.divisor());
+            if stepped.is_some() {
+                self.push_undo_snapshot(drag.before);
+            }
+            return stepped;
+        }
+        if drag.changed {
+            self.push_undo_snapshot(drag.before);
+        }
+        None
     }
 
     /// One `Rot*` press on the active joint of the active keyframe, in
@@ -865,19 +1172,12 @@ impl EditorState {
     /// only appear at sample time, via `AnimationClip::from_file`).
     ///
     /// A joint rotates around exactly one axis — the last letter of its
-    /// canonical name — so a `Rot*` step for another axis has **no target** and
-    /// is ignored, as are `Pos*`, `Scl*`, `Size*` and `Skew*` (an angle has
-    /// neither position nor size nor shear).
-    fn apply_joint_step(&mut self, action: EditorAction) {
-        let (axis, dir) = match action {
-            EditorAction::RotXDec => ('x', -1.0),
-            EditorAction::RotXInc => ('x', 1.0),
-            EditorAction::RotYDec => ('y', -1.0),
-            EditorAction::RotYInc => ('y', 1.0),
-            EditorAction::RotZDec => ('z', -1.0),
-            EditorAction::RotZInc => ('z', 1.0),
-            // Channels with no meaning for a joint angle.
-            _ => return,
+    /// canonical name — so a rotation field for another axis has **no target**
+    /// and is ignored, as are the fields that are not an angle at all (an angle
+    /// has neither position nor size nor shear).
+    fn step_joint(&mut self, field: TransformField, dir: f32) {
+        let Some(axis) = field.rotation_axis() else {
+            return;
         };
         let Some(name) = self.joint_name() else {
             return;
@@ -1218,6 +1518,14 @@ struct App {
     has_save: bool,
     /// Escena + foco del editor nativo (pantalla `Screen::Editor`).
     editor: EditorState,
+    /// Arrastre en curso sobre una barra del panel Transform (`None` = no hay).
+    /// Vive en `App` y no en el documento porque describe el puntero, no la
+    /// escena: es UI, como el resto del estado del ratón.
+    bar_drag: Option<BarDrag>,
+    /// Arranque de la app: el reloj monótono en segundos. Hace falta uno propio
+    /// porque `last_frame` se reinicia en cada frame y da el tiempo *desde* el
+    /// frame, no el tiempo pasado (que es lo que necesita un fundido).
+    clock: Instant,
 }
 
 /// Fila del menú tras mover el resaltado `delta` pasos: envuelve arriba →
@@ -1309,6 +1617,8 @@ impl App {
             world_prepared: false,
             has_save: save::exists(),
             editor: EditorState::new(glam::Vec3::new(8.0, 24.0, 24.0)),
+            bar_drag: None,
+            clock: Instant::now(),
         }
     }
 
@@ -1400,6 +1710,61 @@ impl App {
         self.screen = Screen::Playing;
     }
 
+    /// Press on a transform bar: start a drag, holding the document as it is so
+    /// the whole gesture can be one undo entry. Returns whether the press landed
+    /// on a bar at all.
+    ///
+    /// Nothing is stepped here. A press that never leaves the bar is a click and
+    /// a click is one exact step, but its direction comes from which half was
+    /// pressed — that is only known on release, and deciding it now would make a
+    /// press that turns into a drag step twice.
+    fn editor_bar_press(&mut self) -> bool {
+        let (lw, lh) = self.logical_size();
+        let (x, y) = self.mouse_logical;
+        let Some(bar) = crate::hud::editor_transform_panel(lw, lh)
+            .bars
+            .into_iter()
+            .find(|b| b.rect.contains(x, y))
+        else {
+            return false;
+        };
+        self.bar_drag = Some(BarDrag::new(
+            bar.field,
+            self.editor.snapshot(),
+            bar.rect,
+            x,
+            // Shift is latched at the press: one gesture, one kind of step.
+            self.keys.sprint,
+        ));
+        true
+    }
+
+    /// Pointer moved while a drag is in progress: turn the travel into steps.
+    /// Nothing to do without a drag, so the pointer moving over the panel or the
+    /// scene costs one branch.
+    fn editor_bar_move(&mut self) {
+        let Some(mut drag) = self.bar_drag.take() else {
+            return;
+        };
+        let stepped = self.editor.drag_field(&mut drag, self.mouse_logical.0);
+        if let Some(v) = stepped {
+            self.editor.say_subtitle(drag.field, v, self.app_secs());
+        }
+        self.bar_drag = Some(drag);
+    }
+
+    /// Pointer released: a click becomes one exact step (left half down, right
+    /// half up) and a drag becomes one undo entry for everything it stepped.
+    fn editor_bar_release(&mut self) {
+        let Some(drag) = self.bar_drag.take() else {
+            return;
+        };
+        let field = drag.field;
+        if let Some(v) = self.editor.end_field_drag(drag, self.mouse_logical.0) {
+            self.editor.say_subtitle(field, v, self.app_secs());
+        }
+    }
+
     /// Entra al editor nativo. El foco arranca sobre el terreno del spawn y la
     /// entidad inicial queda justo delante, para tener algo que editar.
     fn enter_editor(&mut self) {
@@ -1407,6 +1772,9 @@ impl App {
         // Mismo punto que encuadra la cámara en juego, para que el editor
         // arranque con el encuadre conocido (sin héroe, eso sí).
         self.editor = EditorState::new(self.player.display_focus(0.0));
+        // Editor nuevo, documento nuevo: un arrastre a medias pertenece a la
+        // escena que el usuario acaba de dejar.
+        self.bar_drag = None;
         self.inventory_open = false;
         self.screen = Screen::Editor;
     }
@@ -2145,6 +2513,12 @@ impl App {
             s.height as f32 / scale.max(0.01),
         )
     }
+
+    /// Seconds since the app started, monotonic. The clock the editor's
+    /// subtitle is stamped and faded against.
+    fn app_secs(&self) -> f32 {
+        self.clock.elapsed().as_secs_f32()
+    }
 }
 
 impl ApplicationHandler for App {
@@ -2252,6 +2626,11 @@ impl ApplicationHandler for App {
                     .unwrap_or(1.0)
                     .max(0.01);
                 self.mouse_logical = (position.x as f32 / scale, position.y as f32 / scale);
+                // Un arrastre en curso sigue al puntero: la presión ya se
+                // resolvió, así que el movimiento se lee aquí y no en el clic.
+                if self.screen == Screen::Editor {
+                    self.editor_bar_move();
+                }
             }
 WindowEvent::RedrawRequested => {
                 let now = Instant::now();
@@ -2565,9 +2944,15 @@ WindowEvent::RedrawRequested => {
                         lh,
                     ),
                     Screen::Editor => {
+                        // Las barras se leen aquí, con el documento delante: el
+                        // panel solo las dibuja.
+                        let bars = self.editor.transform_bars(lw, lh);
+                        let (subtitle, subtitle_age) = self.editor.subtitle(self.app_secs());
                         let mut hud = crate::hud::build_editor_hud(
                             &self.editor.scene.name,
                             &self.editor.status,
+                            subtitle,
+                            subtitle_age,
                             &self.editor.scene.entities,
                             crate::hud::EditorView {
                                 selected: self.editor.selected,
@@ -2579,6 +2964,7 @@ WindowEvent::RedrawRequested => {
                                 panel: self.editor.panel,
                             },
                             self.editor.clip.as_ref(),
+                            &bars,
                             lw,
                             lh,
                         );
@@ -3085,6 +3471,11 @@ WindowEvent::RedrawRequested => {
                     if button == MouseButton::Left {
                         self.attack_held = false;
                         self.mining.clear();
+                        // Soltar un arrastre de barra lo cierra (un clic = un
+                        // paso, un arrastre = una entrada de deshacer).
+                        if self.screen == Screen::Editor {
+                            self.editor_bar_release();
+                        }
                     }
                     if button == MouseButton::Right {
                         self.rmb_held = false;
@@ -3093,6 +3484,16 @@ WindowEvent::RedrawRequested => {
                 }
 
                 if matches!(button, MouseButton::Left | MouseButton::Right) {
+                    // Editor: una barra del panel Transform se pregunta antes
+                    // que los botones, porque no es una hit region sino algo
+                    // que se aprieta y se arrastra. Solo con el izquierdo: el
+                    // derecho en el editor no hace nada.
+                    if button == MouseButton::Left
+                        && self.screen == Screen::Editor
+                        && self.editor_bar_press()
+                    {
+                        return;
+                    }
                     if let Some(action) = hit_test(
                         &self.stair_hud.hits,
                         self.mouse_logical.0,
@@ -3423,6 +3824,179 @@ mod hitch_tests {
         ed.apply(EditorAction::OpenPanel(EditorPanel::Transform));
         ed.apply(EditorAction::Add);
         assert_eq!(ed.panel, Some(EditorPanel::Transform));
+    }
+
+    /// Un arrastre sobre una barra del panel Transform: los píxeles se cambian
+    /// por pasos, un clic es un paso exacto y el gesto entero deja una sola
+    /// entrada de deshacer.
+    #[test]
+    fn editor_bar_drag_steps_the_field_and_undoes_in_one_entry() {
+        let bar = crate::hud::editor_transform_panel(1280.0, 720.0).bars[0];
+        assert_eq!(bar.field, TransformField::PosX, "la primera barra es pos X");
+        let mut ed = EditorState::new(glam::Vec3::ZERO);
+        let start = ed.selected_entity().expect("starter").position[0];
+
+        // Un arrastre a la derecha: cada ED_BAR_PX_PER_STEP de viaje horizontal
+        // es un paso, y todo el gesto es una entrada del historial.
+        let mut drag = BarDrag::new(bar.field, ed.snapshot(), bar.rect, bar.rect.x + 4.0, false);
+        for i in 1..=5 {
+            ed.drag_field(&mut drag, bar.rect.x + 4.0 + i as f32 * ED_BAR_PX_PER_STEP);
+        }
+        ed.end_field_drag(drag, bar.rect.x + 4.0 + 5.0 * ED_BAR_PX_PER_STEP);
+        let after = ed.selected_entity().expect("starter").position[0];
+        assert!(
+            (after - start - 5.0 * ED_POS_STEP).abs() < 1e-4,
+            "{start} → {after}"
+        );
+        assert_eq!(ed.undo.len(), 1, "un arrastre, una entrada de deshacer");
+        ed.apply(EditorAction::Undo);
+        assert!(
+            (ed.selected_entity().expect("starter").position[0] - start).abs() < 1e-4,
+            "un solo deshacer vuelve al principio del arrastre"
+        );
+    }
+
+    /// El resto de px viaja con el gesto (no se pierde al redondear) y Shift
+    /// divide el paso: el mismo viaje compra ocho veces menos.
+    #[test]
+    fn editor_bar_drag_keeps_the_remainder_and_shift_is_fine() {
+        let bar = crate::hud::editor_transform_panel(1280.0, 720.0).bars[0];
+        let mut drag = BarDrag::new(
+            bar.field,
+            EditorSnapshot {
+                scene: EditorScene::default(),
+                clip: None,
+                selected: 0,
+                state_sel: 0,
+            },
+            bar.rect,
+            0.0,
+            false,
+        );
+        // Dos pasos y medio: el medio se queda para el siguiente evento.
+        assert_eq!(drag.take_steps(ED_BAR_PX_PER_STEP * 2.5), 2);
+        assert_eq!(drag.take_steps(ED_BAR_PX_PER_STEP * 2.5), 0);
+        assert_eq!(drag.take_steps(ED_BAR_PX_PER_STEP * 3.5), 1);
+        // Hacia la izquierda restan pasos, y el signo del viaje manda la
+        // dirección (de +3.5P a -0.5P son 4P, más el medio que quedó: -3).
+        assert_eq!(drag.take_steps(-ED_BAR_PX_PER_STEP * 0.5), -3);
+        // Un puntero que no sale del slop es un clic, no un arrastre.
+        let mut fresh = BarDrag::new(
+            bar.field,
+            EditorSnapshot {
+                scene: EditorScene::default(),
+                clip: None,
+                selected: 0,
+                state_sel: 0,
+            },
+            HudRect::default(),
+            100.0,
+            false,
+        );
+        assert!(!fresh.dragged(100.0 + ED_BAR_DRAG_SLOP - 0.01));
+        assert!(fresh.dragged(100.0 - ED_BAR_DRAG_SLOP));
+        assert_eq!(fresh.divisor(), 1);
+
+        // Shift: un paso de ED_POS_STEP / ED_FINE_DIVISOR.
+        let mut ed = EditorState::new(glam::Vec3::ZERO);
+        let start = ed.selected_entity().expect("starter").position[0];
+        let mut fine = BarDrag::new(bar.field, ed.snapshot(), bar.rect, 0.0, true);
+        assert_eq!(fine.divisor(), ED_FINE_DIVISOR);
+        ed.drag_field(&mut fine, ED_BAR_PX_PER_STEP);
+        let after = ed.selected_entity().expect("starter").position[0];
+        assert!(
+            (after - start - ED_POS_STEP / ED_FINE_DIVISOR as f32).abs() < 1e-4,
+            "{start} → {after}"
+        );
+    }
+
+    /// Un clic es un paso exacto y con dirección: mitad izquierda baja, mitad
+    /// derecha sube. Un arrastre que no mueve nada no deja historial.
+    #[test]
+    fn editor_bar_click_is_one_exact_step_and_a_still_drag_leaves_no_history() {
+        let bar = crate::hud::editor_transform_panel(1280.0, 720.0).bars[0];
+        let mid = bar.rect.x + bar.rect.w * 0.5;
+        let mut ed = EditorState::new(glam::Vec3::ZERO);
+
+        // Clic a la derecha de la mitad: un paso hacia arriba, una entrada.
+        let start = ed.selected_entity().expect("starter").position[0];
+        let press = BarDrag::new(bar.field, ed.snapshot(), bar.rect, mid + 10.0, false);
+        ed.end_field_drag(press, mid + 10.0);
+        assert!(
+            (ed.selected_entity().unwrap().position[0] - start - ED_POS_STEP).abs() < 1e-4
+        );
+        assert_eq!(ed.undo.len(), 1);
+
+        // Clic a la izquierda: un paso hacia abajo.
+        let down = ed.selected_entity().unwrap().position[0];
+        let press = BarDrag::new(bar.field, ed.snapshot(), bar.rect, mid - 10.0, false);
+        ed.end_field_drag(press, mid - 10.0);
+        assert!((ed.selected_entity().unwrap().position[0] - down + ED_POS_STEP).abs() < 1e-4);
+        assert_eq!(ed.undo.len(), 2);
+
+        // Un arrastre que no llega a un paso: ni mueve el campo ni ensucia el
+        // historial.
+        let before = ed.selected_entity().unwrap().position[0];
+        let mut still = BarDrag::new(bar.field, ed.snapshot(), bar.rect, mid, false);
+        ed.drag_field(&mut still, mid + ED_BAR_PX_PER_STEP * 0.5);
+        ed.end_field_drag(still, mid + ED_BAR_PX_PER_STEP * 0.5);
+        assert_eq!(ed.selected_entity().unwrap().position[0], before);
+        assert_eq!(ed.undo.len(), 2, "un gesto que no movió nada no deja entrada");
+    }
+
+    /// El descriptor por campo: un paso y un clamp por campo, y el tamaño mueve
+    /// los tres ejes a la vez mientras que el resto mueve solo el suyo.
+    #[test]
+    fn editor_field_descriptors_drive_every_field() {
+        assert!(!field_spec(TransformField::PosX).wrap, "la posición se recorta");
+        assert!(field_spec(TransformField::RotY).wrap, "una rotación envuelve");
+        assert!(field_spec(TransformField::Size).uniform);
+        assert!(!field_spec(TransformField::PosY).uniform);
+        assert_eq!(field_spec(TransformField::PosY).lo, 0.0, "Y no baja del suelo");
+        assert_eq!(field_spec(TransformField::PosX).lo, -ED_POS_LIMIT);
+        assert_eq!(field_spec(TransformField::SclX).step, ED_SCALE_STEP);
+        assert_eq!(field_spec(TransformField::SkewZ).hi, ED_SKEW_LIMIT);
+
+        // Un solo paso del size box mueve los tres ejes del marcador.
+        let mut ed = EditorState::new(glam::Vec3::ZERO);
+        let before = ed.selected_entity().expect("starter").size;
+        assert!(ed.step_field(TransformField::Size, 1.0, 1).is_some());
+        let after = ed.selected_entity().expect("starter").size;
+        for i in 0..3 {
+            assert!((after[i] - before[i] - ED_SIZE_STEP).abs() < 1e-4, "eje {i}");
+        }
+        // Y en el límite no dice que haya movido nada (nada de historial falso).
+        for _ in 0..100 {
+            ed.step_field(TransformField::Size, 1.0, 1);
+        }
+        assert!(ed.step_field(TransformField::Size, 1.0, 1).is_none());
+    }
+
+    /// El subtítulo es un canal aparte: no pisa `status` (que es la memoria del
+    /// editor) y tampoco viaja en el snapshot, así que deshacer un movimiento no
+    /// lo resucita.
+    #[test]
+    fn editor_subtitle_is_its_own_channel_and_is_not_undone() {
+        let mut ed = EditorState::new(glam::Vec3::ZERO);
+        assert_eq!(ed.subtitle(0.0), ("", 0.0), "nada que decir al abrir");
+        let status = ed.status.clone();
+
+        // Cada campo se anuncia con su nombre y su precisión: un bloque con un
+        // decimal, un grado sin decimales, una escala con dos.
+        ed.say_subtitle(TransformField::PosX, 8.5, 10.0);
+        assert_eq!(ed.subtitle(10.25), ("pos X 8.5", 0.25));
+        assert_eq!(ed.status, status, "el subtítulo no pisa el status");
+        ed.say_subtitle(TransformField::RotY, 45.0, 20.0);
+        assert_eq!(ed.subtitle(20.0).0, "rot Y 45");
+        ed.say_subtitle(TransformField::SclX, 1.25, 30.0);
+        assert_eq!(ed.subtitle(30.0).0, "esc X 1.25");
+
+        // Un undo no lo trae de vuelta: no está en el snapshot.
+        ed.apply(EditorAction::Undo);
+        assert_eq!(ed.subtitle(30.0).0, "esc X 1.25");
+        // Y la edad nunca sale negativa (el reloj no retrocede, pero la resta
+        // se recorta igual para que el fundido no dé un salto).
+        assert_eq!(ed.subtitle(29.0).1, 0.0);
     }
 
     #[test]

@@ -56,6 +56,62 @@ impl Default for Transform {
     }
 }
 
+/// One numeric field of the editor's transform controls, by name: the three
+/// positions, the three rotations, the three scales, the shear and the box
+/// size.
+///
+/// The enum is only an *address*, not a behaviour: how big a step is and where
+/// the field stops is one descriptor per field in the editor state
+/// (`field_spec` in `lib.rs`), so a button, a key and a drag all read the same
+/// numbers instead of each carrying its own copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransformField {
+    PosX,
+    PosY,
+    PosZ,
+    RotX,
+    RotY,
+    RotZ,
+    SclX,
+    SclY,
+    SclZ,
+    /// Shear on Z: the only axis the panel offers.
+    SkewZ,
+    /// Local box size. Not a transform channel: it is the marker box, and it
+    /// always stays on the entity even when a state owns the rest.
+    Size,
+}
+
+impl TransformField {
+    /// Every field, in the order the transform panel lays them out: three
+    /// positions, three rotations, three scales, the shear and the size box.
+    pub const ALL: [TransformField; 11] = [
+        Self::PosX,
+        Self::PosY,
+        Self::PosZ,
+        Self::RotX,
+        Self::RotY,
+        Self::RotZ,
+        Self::SclX,
+        Self::SclY,
+        Self::SclZ,
+        Self::SkewZ,
+        Self::Size,
+    ];
+
+    /// The rotation axis this field turns around, or `None` for the fields that
+    /// are not an angle. A joint rotates around exactly one axis, so this is
+    /// also what tells a joint step whether the field has a target at all.
+    pub fn rotation_axis(self) -> Option<char> {
+        match self {
+            Self::RotX => Some('x'),
+            Self::RotY => Some('y'),
+            Self::RotZ => Some('z'),
+            _ => None,
+        }
+    }
+}
+
 /// One visual state of an editable entity: which mesh/palette it shows and how
 /// that mesh is placed locally. An entity with `states: []` (every `v1` file)
 /// behaves as a single state that inherits the entity's own `model`.

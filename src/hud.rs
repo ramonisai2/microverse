@@ -1,4 +1,5 @@
 //! On-screen stair / tunnel controls (mouse hits UI, not the world).
+use crate::editor::TransformField;
 use crate::stair_dig::{
     facing_screen_angle, PadDir, StairPhase, StairTool, TunnelFacing, TunnelIncline,
     STAIR_WIDTH_MAX,
@@ -146,6 +147,209 @@ pub enum EditorAction {
     /// active keyframe. Set from the ANIMAR panel.
     EditEntity,
     EditJoint,
+}
+
+impl TransformField {
+    /// The field a step action moves, with its direction (`-1.0` dec, `+1.0`
+    /// inc), or `None` when the action is not a transform step.
+    ///
+    /// This is the only place that knows which button belongs to which field:
+    /// the step itself — its size and its clamp — is the descriptor in
+    /// `lib.rs`, so a press, a key and a drag cannot drift apart.
+    pub fn of(action: EditorAction) -> Option<(Self, f32)> {
+        use EditorAction as A;
+        Some(match action {
+            A::PosXDec => (Self::PosX, -1.0),
+            A::PosXInc => (Self::PosX, 1.0),
+            A::PosYDec => (Self::PosY, -1.0),
+            A::PosYInc => (Self::PosY, 1.0),
+            A::PosZDec => (Self::PosZ, -1.0),
+            A::PosZInc => (Self::PosZ, 1.0),
+            A::RotXDec => (Self::RotX, -1.0),
+            A::RotXInc => (Self::RotX, 1.0),
+            A::RotYDec => (Self::RotY, -1.0),
+            A::RotYInc => (Self::RotY, 1.0),
+            A::RotZDec => (Self::RotZ, -1.0),
+            A::RotZInc => (Self::RotZ, 1.0),
+            A::SclXDec => (Self::SclX, -1.0),
+            A::SclXInc => (Self::SclX, 1.0),
+            A::SclYDec => (Self::SclY, -1.0),
+            A::SclYInc => (Self::SclY, 1.0),
+            A::SclZDec => (Self::SclZ, -1.0),
+            A::SclZInc => (Self::SclZ, 1.0),
+            A::SkewDec => (Self::SkewZ, -1.0),
+            A::SkewInc => (Self::SkewZ, 1.0),
+            A::SizeDec => (Self::Size, -1.0),
+            A::SizeInc => (Self::Size, 1.0),
+            _ => return None,
+        })
+    }
+
+    /// Name the bar prints, the same words as the readout on the right of the
+    /// screen. ASCII only: `glyph5x7` has no accented glyphs.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::PosX => "pos X",
+            Self::PosY => "pos Y",
+            Self::PosZ => "pos Z",
+            Self::RotX => "rot X",
+            Self::RotY => "rot Y",
+            Self::RotZ => "rot Z",
+            Self::SclX => "esc X",
+            Self::SclY => "esc Y",
+            Self::SclZ => "esc Z",
+            Self::SkewZ => "zes",
+            Self::Size => "caja",
+        }
+    }
+
+    /// Decimals of the value a bar prints: a block with one, a degree with
+    /// none, a scale or a shear with two. Same precision as the readout.
+    pub fn decimals(self) -> usize {
+        match self {
+            Self::RotX | Self::RotY | Self::RotZ => 0,
+            Self::SclX | Self::SclY | Self::SclZ | Self::SkewZ => 2,
+            Self::PosX | Self::PosY | Self::PosZ | Self::Size => 1,
+        }
+    }
+}
+
+/// One bar of the transform panel: the field it drives, where it sits and what
+/// it shows.
+///
+/// A bar is **not** a hit region. A bar is something you press and drag, and a
+/// hit region can only carry a one-shot action, so the geometry lives here as
+/// its own value instead: the panel draws from it and the mouse handler asks it
+/// what is under the pointer, and both read the same rectangles.
+#[derive(Clone, Copy, Debug)]
+pub struct TransformBar {
+    pub field: TransformField,
+    pub rect: HudRect,
+    /// Current value of the field, in its own unit.
+    pub value: f32,
+    /// Where the value sits inside the field's range, `0..=1`: how much of the
+    /// bar is filled. `None` for a field with no range to sit in (a rotation
+    /// wraps instead of clamping), which then shows its number alone.
+    pub fill: Option<f32>,
+}
+
+/// Layout of the transform panel: its background and the bars on top of it.
+///
+/// One value because the background has to fit the bars exactly, and because
+/// the mouse handler hit-tests the same bars the panel draws.
+#[derive(Clone, Copy, Debug)]
+pub struct TransformPanel {
+    /// Background of the whole panel: the bars plus the row of buttons under
+    /// them.
+    pub rect: HudRect,
+    /// One bar per field, in [`TransformField::ALL`] order.
+    pub bars: [TransformBar; 11],
+}
+
+/// Geometry of the transform panel, centred at the bottom of the screen where
+/// the transform controls have always been: two columns of bars filled left to
+/// right and top to bottom, with a row of buttons under them. Recomputed per
+/// frame because the panel follows the window, and it is eleven rectangles.
+pub fn editor_transform_panel(logical_w: f32, logical_h: f32) -> TransformPanel {
+    let s = hud_scale();
+    let bar_w = 214.0 * s;
+    let bar_h = 24.0 * s;
+    let gap = 6.0 * s;
+    let pad = 10.0 * s;
+    let cols = 2;
+    let rows = TransformField::ALL.len().div_ceil(cols);
+    let w = pad * 2.0 + bar_w * cols as f32 + gap;
+    // The rows of bars plus the row of buttons under them.
+    let h = pad * 2.0 + (rows as f32 + 1.0) * bar_h + rows as f32 * gap;
+    let x0 = (logical_w - w) * 0.5;
+    let y0 = logical_h - h - gap;
+    let bars = std::array::from_fn(|i| TransformBar {
+        field: TransformField::ALL[i],
+        rect: HudRect {
+            x: x0 + pad + (i % cols) as f32 * (bar_w + gap),
+            y: y0 + pad + (i / cols) as f32 * (bar_h + gap),
+            w: bar_w,
+            h: bar_h,
+        },
+        value: 0.0,
+        fill: None,
+    });
+    TransformPanel {
+        rect: HudRect { x: x0, y: y0, w, h },
+        bars,
+    }
+}
+
+/// One transform bar: the track, how much of it is filled, and the value.
+///
+/// The label sits on the left and the value in a column of its own, so the
+/// numbers line up down the panel instead of following the length of each one.
+fn push_transform_bar(
+    mesh: &mut HudMesh,
+    bar: TransformBar,
+    logical_w: f32,
+    logical_h: f32,
+    track: [f32; 4],
+    fill_rgba: [f32; 4],
+) {
+    let s = hud_scale();
+    let px = 2.0 * s;
+    let text_y = bar.rect.y + (bar.rect.h - 7.0 * px) * 0.5;
+    push_panel(mesh, bar.rect, logical_w, logical_h, track);
+    if let Some(f) = bar.fill {
+        // The fill is the value's place in the field's range; a field that wraps
+        // has none, so its bar is only the track and the number.
+        let w = (bar.rect.w * f).max(2.0 * s);
+        push_panel(
+            mesh,
+            HudRect {
+                x: bar.rect.x,
+                y: bar.rect.y,
+                w,
+                h: bar.rect.h,
+            },
+            logical_w,
+            logical_h,
+            fill_rgba,
+        );
+    }
+    push_text(
+        mesh,
+        bar.rect.x + 6.0 * s,
+        text_y,
+        logical_w,
+        logical_h,
+        bar.field.label(),
+        px,
+        [0.70, 0.76, 0.84, 1.0],
+    );
+    let value = format!("{:.*}", bar.field.decimals(), bar.value);
+    push_text(
+        mesh,
+        bar.rect.x + 96.0 * s,
+        text_y,
+        logical_w,
+        logical_h,
+        &value,
+        px,
+        [0.98, 0.86, 0.42, 1.0],
+    );
+}
+
+/// How long the editor's subtitle stays fully visible, and how long it then
+/// takes to fade out. Time, not frames, so it looks the same at 30 fps and at
+/// 144.
+const ED_SUBTITLE_HOLD_SECS: f32 = 1.6;
+const ED_SUBTITLE_FADE_SECS: f32 = 1.2;
+
+/// Alpha of a subtitle `age` seconds old: solid while it holds, then a straight
+/// fade to nothing. Pure, so the curve is testable without a clock, and in
+/// seconds rather than frames so it does not depend on the frame rate.
+fn subtitle_alpha(age: f32) -> f32 {
+    if age < ED_SUBTITLE_HOLD_SECS {
+        return 1.0;
+    }
+    (1.0 - (age - ED_SUBTITLE_HOLD_SECS) / ED_SUBTITLE_FADE_SECS).clamp(0.0, 1.0)
 }
 
 /// Collapsible categories of the native editor. `None` (in `EditorState::panel`)
@@ -2254,15 +2458,23 @@ pub struct EditorView {
 /// screen carries just the selection and the menu.
 ///
 /// `entities` is the live scene, `view` the cursors and open panel, and `clip`
-/// the animation clip open in the editor. Only the buttons are hit regions, so
-/// the world stays visible and tappable behind the panel.
+/// the animation clip open in the editor. `bars` is what each transform bar
+/// shows, already read by the editor, so the panel only draws it. Only the
+/// buttons are hit regions, so the world stays visible and tappable behind the
+/// panel.
 pub fn build_editor_hud(
     scene_name: &str,
     status: &str,
+    // Transient line under the top strip, and how many seconds ago it was
+    // written: the panel fades it out by time.
+    subtitle: &str,
+    subtitle_age: f32,
     entities: &[crate::editor::EditorEntity],
     view: EditorView,
     // Animation clip open in the editor (`None` = none imported yet).
     clip: Option<&crate::editor_clip::EditorClip>,
+    // Value of each transform bar, in [`TransformField::ALL`] order.
+    bars: &[TransformBar],
     logical_w: f32,
     logical_h: f32,
 ) -> HudMesh {
@@ -2314,6 +2526,40 @@ pub fn build_editor_hud(
             1.8 * s,
             [0.78, 0.82, 0.88, 1.0],
         );
+    }
+
+    // Subtítulo: su propia línea bajo la tira, con su propio fondo, y un
+    // fundido por tiempo. No es `status` — esa línea es la memoria del editor y
+    // no se va sola; esto cuenta lo que acaba de pasar y se desvanece.
+    if !subtitle.is_empty() {
+        let a = subtitle_alpha(subtitle_age);
+        if a > 0.02 {
+            let px = 2.0 * s;
+            let tw = 6.0 * px * subtitle.bytes().count() as f32;
+            let box_ = HudRect {
+                x: (logical_w - tw) * 0.5 - pad * 0.5,
+                y: top.y + top.h + gap * 0.5,
+                w: tw + pad,
+                h: 7.0 * px + pad * 0.5,
+            };
+            push_panel(
+                &mut mesh,
+                box_,
+                logical_w,
+                logical_h,
+                [0.08, 0.09, 0.13, 0.86 * a],
+            );
+            push_text(
+                &mut mesh,
+                box_.x + pad * 0.5,
+                box_.y + pad * 0.25,
+                logical_w,
+                logical_h,
+                subtitle,
+                px,
+                [0.98, 0.86, 0.42, a],
+            );
+        }
     }
 
     // ── Left: entity list ─────────────────────────────────────────────────
@@ -2557,92 +2803,44 @@ pub fn build_editor_hud(
         }
 
         match current {
-            // Same 4×6 grid and same actions as before — only *when* it is
-            // drawn changed (it now needs the panel open).
+            // Barras, no botones: el transform se ajusta apretando y arrastrando
+            // cada campo (ver `editor_transform_panel`, la misma geometría que
+            // pregunta el ratón). Debajo solo queda lo que no es transform: la
+            // selección de entidad y el tipo.
             EditorPanel::Transform => {
-                let group_w = btn * 6.0 + gap * 5.0;
-                let bar_h = btn * 4.0 + gap * 3.0 + pad * 2.0;
-                let bar = HudRect {
-                    x: (logical_w - group_w - pad * 2.0) * 0.5,
-                    y: logical_h - bar_h - gap,
-                    w: group_w + pad * 2.0,
-                    h: bar_h,
-                };
-                push_panel(&mut mesh, bar, logical_w, logical_h, dim_bg);
-                let axes = ["X", "Y", "Z"];
-                let mut by = bar.y + pad;
-                for row_i in 0..4 {
-                    // Axes are laid out as dec/inc pairs; row 3 (skew) is a
-                    // single pair followed by selection / type cycling.
-                    let row_actions: [EditorAction; 6] = match row_i {
-                        0 => [
-                            EditorAction::PosXDec,
-                            EditorAction::PosXInc,
-                            EditorAction::PosYDec,
-                            EditorAction::PosYInc,
-                            EditorAction::PosZDec,
-                            EditorAction::PosZInc,
-                        ],
-                        1 => [
-                            EditorAction::RotXDec,
-                            EditorAction::RotXInc,
-                            EditorAction::RotYDec,
-                            EditorAction::RotYInc,
-                            EditorAction::RotZDec,
-                            EditorAction::RotZInc,
-                        ],
-                        2 => [
-                            EditorAction::SclXDec,
-                            EditorAction::SclXInc,
-                            EditorAction::SclYDec,
-                            EditorAction::SclYInc,
-                            EditorAction::SclZDec,
-                            EditorAction::SclZInc,
-                        ],
-                        _ => [
-                            EditorAction::SkewDec,
-                            EditorAction::SkewInc,
-                            EditorAction::SelPrev,
-                            EditorAction::SelNext,
-                            EditorAction::KindPrev,
-                            EditorAction::KindNext,
-                        ],
-                    };
-                    let row_labels: [&str; 6] = match row_i {
-                        0..=2 => [
-                            "", "", "", "", "", "",
-                        ],
-                        _ => [
-                            "zes-", "zes+", "ant", "sig", "tipo-", "tipo+",
-                        ],
-                    };
-                    for (i, act) in row_actions.iter().enumerate() {
-                        // Axis rows label themselves "X-", "X+"… per column.
-                        let axis_row = row_i <= 2;
-                        let dynamic;
-                        let label: &str = if axis_row {
-                            dynamic = format!("{}{}", axes[i / 2], if i % 2 == 0 { "-" } else { "+" });
-                            &dynamic
-                        } else {
-                            row_labels[i]
-                        };
-                        push_text_btn(
-                            &mut mesh,
-                            HudRect {
-                                x: bar.x + pad + i as f32 * (btn + gap),
-                                y: by,
-                                w: btn,
-                                h: btn,
-                            },
-                            logical_w,
-                            logical_h,
-                            label,
-                            text_px,
-                            btn_bg,
-                            HudAction::Ed(*act),
-                        );
-                    }
-                    by += btn + gap;
+                let layout = editor_transform_panel(logical_w, logical_h);
+                push_panel(&mut mesh, layout.rect, logical_w, logical_h, dim_bg);
+                for bar in bars {
+                    push_transform_bar(&mut mesh, *bar, logical_w, logical_h, btn_bg, accent);
+                }
+                // Fila de botones: cuatro repartidos en el ancho del panel,
+                // bajo las barras.
+                let row_y = layout.bars[TransformField::ALL.len() - 1].rect.y + gap
+                    + layout.bars[0].rect.h;
+                let inner = layout.rect.w - pad * 2.0;
+                let fw = (inner - gap * 3.0) * 0.25;
+                let picks: [(&str, EditorAction); 4] = [
+                    ("ant", EditorAction::SelPrev),
+                    ("sig", EditorAction::SelNext),
+                    ("tipo-", EditorAction::KindPrev),
+                    ("tipo+", EditorAction::KindNext),
+                ];
+                for (i, (label, act)) in picks.iter().enumerate() {
+                    push_text_btn(
+                        &mut mesh,
+                        HudRect {
+                            x: layout.rect.x + pad + i as f32 * (fw + gap),
+                            y: row_y,
+                            w: fw,
+                            h: layout.bars[0].rect.h,
+                        },
+                        logical_w,
+                        logical_h,
+                        label,
+                        text_px,
+                        btn_bg,
+                        HudAction::Ed(*act),
+                    );
                 }
             }
             EditorPanel::Archivo => {
@@ -3481,6 +3679,8 @@ mod tests {
             build_editor_hud(
                 "escena",
                 "",
+                "",
+                0.0,
                 &entities,
                 EditorView {
                     selected: 0,
@@ -3488,6 +3688,7 @@ mod tests {
                     ..Default::default()
                 },
                 None,
+                &[],
                 1280.0,
                 720.0,
             )
@@ -3513,10 +3714,24 @@ mod tests {
             assert!(!has(&closed, hidden), "{hidden:?} no debe verse sin panel");
         }
 
-        // Transform abierto → la parrilla vuelve, los archivos siguen ocultos.
+        // Transform abierto → la parrilla de barras vuelve (no son hit regions:
+        // una barra se aprieta y se arrastra, y eso lo pregunta el ratón), y los
+        // archivos siguen ocultos. Lo que sí son botones sigue siendo alcanzable.
         let transform = build(Some(EditorPanel::Transform));
-        assert!(has(&transform, EditorAction::PosXInc));
-        assert!(has(&transform, EditorAction::SkewInc));
+        for shown in [
+            EditorAction::SelPrev,
+            EditorAction::SelNext,
+            EditorAction::KindPrev,
+            EditorAction::KindNext,
+        ] {
+            assert!(has(&transform, shown), "{shown:?} sigue siendo un botón");
+        }
+        for gone in [EditorAction::PosXInc, EditorAction::SkewInc] {
+            assert!(
+                !has(&transform, gone),
+                "{gone:?} ya no es un botón: es una barra"
+            );
+        }
         assert!(!has(&transform, EditorAction::Save));
         // Con un panel abierto, las cinco categorías son alcanzables.
         for cat in EditorPanel::ALL {
@@ -3563,6 +3778,118 @@ mod tests {
         }
     }
 
+    /// Las barras del panel Transform: una por campo, dentro del panel y sin
+    /// solaparse, cada una con el valor que le pasa el editor y su parte de
+    /// barra llena. No son hit regions (eso lo pregunta el ratón), así que lo
+    /// que se asserta es la geometría y lo que se dibuja encima.
+    #[test]
+    fn editor_transform_bars_cover_the_panel_and_carry_their_value() {
+        let layout = editor_transform_panel(1280.0, 720.0);
+        // Una barra por campo, en el orden del panel, y todas dentro de él.
+        for (i, bar) in layout.bars.iter().enumerate() {
+            assert_eq!(bar.field, crate::editor::TransformField::ALL[i]);
+            assert!(layout.rect.contains(bar.rect.x + 1.0, bar.rect.y + 1.0));
+            assert!(layout.rect.contains(bar.rect.x + bar.rect.w - 1.0, bar.rect.y + bar.rect.h - 1.0));
+        }
+        // Ninguna se pisa con otra.
+        for (i, a) in layout.bars.iter().enumerate() {
+            for b in layout.bars.iter().skip(i + 1) {
+                let disjoint = a.rect.x + a.rect.w <= b.rect.x
+                    || b.rect.x + b.rect.w <= a.rect.x
+                    || a.rect.y + a.rect.h <= b.rect.y
+                    || b.rect.y + b.rect.h <= a.rect.y;
+                assert!(disjoint, "{:?} se pisa con {:?}", a.field, b.field);
+            }
+        }
+        // El skew es solo el eje Z y el size es una sola barra para los tres.
+        assert_eq!(layout.bars.iter().filter(|b| b.field == crate::editor::TransformField::SkewZ).count(), 1);
+        assert_eq!(layout.bars.iter().filter(|b| b.field == crate::editor::TransformField::Size).count(), 1);
+
+        // Con valores, el panel dibuja las barras: más geometría que sin ellas,
+        // y los botones de selección / tipo siguen siendo hits.
+        let entities = [crate::editor::EditorEntity::new("prop", [0.0, 24.0, 0.0])];
+        let view = EditorView {
+            selected: 0,
+            panel: Some(EditorPanel::Transform),
+            ..Default::default()
+        };
+        let bare = build_editor_hud("escena", "", "", 0.0, &entities, view, None, &[], 1280.0, 720.0);
+        let mut bars = layout.bars;
+        bars[0].value = 8.5;
+        bars[0].fill = Some(0.25);
+        let drawn = build_editor_hud("escena", "", "", 0.0, &entities, view, None, &bars, 1280.0, 720.0);
+        assert!(drawn.vertices.len() > bare.vertices.len());
+        let has = |mesh: &HudMesh, act: EditorAction| {
+            mesh.hits.iter().any(|h| h.action == HudAction::Ed(act))
+        };
+        for a in [
+            EditorAction::SelPrev,
+            EditorAction::SelNext,
+            EditorAction::KindPrev,
+            EditorAction::KindNext,
+        ] {
+            assert!(has(&drawn, a), "{a:?} debe seguir siendo botón");
+        }
+        // Y una barra nunca se confunde con un botón de paso.
+        assert!(!has(&drawn, EditorAction::PosXInc));
+    }
+
+    /// El subtítulo se mantiene y se desvanece por tiempo, no por frames, y solo
+    /// se dibuja mientras le queda algo de alpha.
+    #[test]
+    fn editor_subtitle_holds_then_fades_out_by_time() {
+        assert!((subtitle_alpha(0.0) - 1.0).abs() < 1e-6);
+        assert!((subtitle_alpha(ED_SUBTITLE_HOLD_SECS - 0.01) - 1.0).abs() < 1e-6);
+        let mid = ED_SUBTITLE_HOLD_SECS + ED_SUBTITLE_FADE_SECS * 0.5;
+        assert!((subtitle_alpha(mid) - 0.5).abs() < 1e-6, "la mitad del fundido");
+        assert_eq!(subtitle_alpha(ED_SUBTITLE_HOLD_SECS + ED_SUBTITLE_FADE_SECS), 0.0);
+        assert_eq!(subtitle_alpha(99.0), 0.0, "y se queda en cero");
+
+        let entities = [crate::editor::EditorEntity::new("prop", [0.0, 24.0, 0.0])];
+        let view = EditorView::default();
+        let fresh = build_editor_hud(
+            "escena",
+            "un estado",
+            "pos X 8.5",
+            0.0,
+            &entities,
+            view,
+            None,
+            &[],
+            1280.0,
+            720.0,
+        );
+        // Sin subtítulo, el panel dibuja lo mismo de siempre: la tira con su
+        // status y nada más.
+        let bare = build_editor_hud(
+            "escena",
+            "un estado",
+            "",
+            0.0,
+            &entities,
+            view,
+            None,
+            &[],
+            1280.0,
+            720.0,
+        );
+        assert!(fresh.vertices.len() > bare.vertices.len());
+        // Y ya desvanecido no dibuja nada, aunque el texto siga ahí.
+        let gone = build_editor_hud(
+            "escena",
+            "un estado",
+            "pos X 8.5",
+            ED_SUBTITLE_HOLD_SECS + ED_SUBTITLE_FADE_SECS,
+            &entities,
+            view,
+            None,
+            &[],
+            1280.0,
+            720.0,
+        );
+        assert_eq!(gone.vertices.len(), bare.vertices.len());
+    }
+
     /// Con dos estados, el panel ESTADO ofrece una fila por estado (la activa
     /// resaltada) y el readout sale del subconjunto que se le pasa.
     #[test]
@@ -3589,6 +3916,8 @@ mod tests {
         let mesh = build_editor_hud(
             "estados",
             "",
+            "",
+            0.0,
             &entities,
             EditorView {
                 selected: 0,
@@ -3597,6 +3926,7 @@ mod tests {
                 ..Default::default()
             },
             None,
+            &[],
             1280.0,
             720.0,
         );
@@ -3618,6 +3948,8 @@ mod tests {
             build_editor_hud(
                 "escena",
                 "",
+                "",
+                0.0,
                 &entities,
                 EditorView {
                     selected: 0,
@@ -3625,6 +3957,7 @@ mod tests {
                     ..Default::default()
                 },
                 clip,
+                &[],
                 1280.0,
                 720.0,
             )
@@ -3685,6 +4018,8 @@ mod tests {
         let mesh = build_editor_hud(
             "anim",
             "",
+            "",
+            0.0,
             &entities,
             EditorView {
                 selected: 0,
@@ -3695,6 +4030,7 @@ mod tests {
                 ..Default::default()
             },
             Some(&clip),
+            &[],
             1280.0,
             720.0,
         );
@@ -3740,6 +4076,8 @@ mod tests {
         let mesh = build_editor_hud(
             "anim",
             "",
+            "",
+            0.0,
             &entities,
             EditorView {
                 selected: 0,
@@ -3747,6 +4085,7 @@ mod tests {
                 ..Default::default()
             },
             None,
+            &[],
             1280.0,
             720.0,
         );
