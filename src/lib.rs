@@ -579,12 +579,7 @@ impl EditorState {
             .selected_entity()
             .map(|e| {
                 let state_idx = e.clamp_state(self.state_sel);
-                (
-                    e.state(state_idx)
-                        .map(|s| s.transform())
-                        .unwrap_or_else(|| e.transform()),
-                    e.size,
-                )
+                (e.driven_transform(state_idx), e.size)
             })
             .unwrap_or_default();
         crate::hud::editor_transform_panel(logical_w, logical_h)
@@ -1101,12 +1096,7 @@ impl EditorState {
         };
         let in_state = e.has_states();
         let state_idx = e.clamp_state(self.state_sel);
-        // `state()` is `None` exactly when the entity has no states, so this
-        // picks the active state when there is one and the entity otherwise.
-        let mut t = e
-            .state(state_idx)
-            .map(|s| s.transform())
-            .unwrap_or_else(|| e.transform());
+        let mut t = e.driven_transform(state_idx);
         let mut size = e.size;
         let spec = field_spec(field);
         let (values, axis) = field_target(&mut t, &mut size, field);

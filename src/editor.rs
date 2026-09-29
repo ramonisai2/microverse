@@ -282,6 +282,23 @@ impl EditorEntity {
         self.state(state).map(|s| s.palette.as_str()).unwrap_or("")
     }
 
+    /// The transform that the step buttons and both readouts must show: the
+    /// active state's own, or the entity's when the entity has no states.
+    ///
+    /// One place on purpose. The rule is easy to get half right, and the three
+    /// readers used to resolve it on their own: the bars, the step path and the
+    /// right-hand readout. The readout resolving straight off `entity` was a
+    /// real bug, and it was invisible for as long as no entity had states
+    /// because in that case the two sources are the same array.
+    ///
+    /// `size` is deliberately *not* resolved here: it is the marker's box, not
+    /// part of the mesh, and it always stays on the entity.
+    pub fn driven_transform(&self, state: usize) -> Transform {
+        self.state(state)
+            .map(|s| s.transform())
+            .unwrap_or_else(|| self.transform())
+    }
+
     /// The four transform channels copied out for read-modify-write.
     pub fn transform(&self) -> Transform {
         Transform {
@@ -985,5 +1002,68 @@ mod tests {
             e2.to_world_dir(Vec3::X),
             rot_y(Vec3::new(1.0, 0.0, 1.0), 90.0)
         ));
+    }
+
+    /// El readout y las barras tienen que leer el **mismo** transform, y ese es
+    /// el del estado activo cuando la entidad tiene estados.
+    ///
+    /// El bug que fija: el readout de la derecha imprimía `entity.position`
+    /// mientras las barras imprimían el del estado. Con una entidad sin estados
+    /// las dos fuentes son el mismo array y el bug es invisible; solo asoma en
+    /// cuanto hay un estado, y en un solo eje si el autor solo movió ese eje. Por
+    /// eso el caso de aquí mueve **los cuatro canales** y los pone todos
+    /// distintos de los de la entidad: cualquier lector que vuelva a la entidad
+    /// se ve en los cuatro a la vez.
+    ///
+    /// Se fija sobre `driven_transform` y no sobre el texto del readout porque
+    /// `HudMesh` no guarda las cadenas: `push_text` rasteriza los glifos en el
+    /// momento y no queda rastro de qué se pintó. El readout, las barras y el
+    /// camino de los pasos llaman a este mismo método, así que lo que se fija
+    /// aquí es la regla que comparten.
+    #[test]
+    fn driven_transform_follows_the_active_state_and_falls_back_to_the_entity() {
+        let mut e = EditorEntity::new("prop", [8.5, 30.0, 24.5]);
+        e.rotation = [0.0, 90.0, 0.0];
+        e.scale = [1.0, 1.0, 1.0];
+        e.skew = [0.0, 0.0, 0.0];
+
+        // Sin estados: la entidad, y da igual qué índice se le pase, porque
+        // `clamp_state` devuelve 0 y `state()` es `None`.
+        assert_eq!(e.driven_transform(0), e.transform());
+        assert_eq!(e.driven_transform(7), e.transform());
+
+        // Con estados: el activo, no el 0 y no la entidad. Todos los canales
+        // distintos, para que un lector que se quede en la entidad falle en los
+        // cuatro y no solo en el que se movió por casualidad.
+        let st = |y: f32, z: f32, s: f32, k: f32| EditorEntityState {
+            name: "s".into(),
+            position: [8.5, y, 24.5],
+            rotation: [0.0, 90.0, z],
+            scale: [s, s, s],
+            skew: [0.0, 0.0, k],
+            ..Default::default()
+        };
+        e.states.push(st(22.0, 12.0, 0.5, 0.25));
+        e.states.push(st(11.0, -30.0, 2.0, -1.5));
+        assert_eq!(e.states.len(), 2);
+
+        // Cada índice da el suyo, y ninguno es el de la entidad.
+        for (i, y) in [(0usize, 22.0f32), (1, 11.0)] {
+            let t = e.driven_transform(i);
+            assert_eq!(t.position[1], y, "estado {i}: pos Y");
+            assert_eq!(t.position[0], 8.5);
+            assert_eq!(t.position[2], 24.5);
+            assert!((t.scale[0] - if i == 0 { 0.5 } else { 2.0 }).abs() < 1e-6);
+            assert!((t.skew[2] - if i == 0 { 0.25 } else { -1.5 }).abs() < 1e-6);
+            assert!((t.rotation[2] - if i == 0 { 12.0 } else { -30.0 }).abs() < 1e-6);
+            assert_ne!(t.position[1], e.position[1], "no debe caer en la entidad");
+            assert_ne!(t.scale[0], e.scale[0], "esc tampoco");
+            assert_ne!(t.skew[2], e.skew[2], "zes tampoco");
+        }
+
+        // Índice fuera de rango: `driven_transform` no acota (eso es cosa de
+        // `clamp_state`), pero `state()` ya devuelve `None` y cae a la entidad,
+        // así que nunca sale de rango por la espalda.
+        assert_eq!(e.driven_transform(9), e.transform());
     }
 }
