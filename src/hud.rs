@@ -129,6 +129,9 @@ pub enum EditorAction {
     /// does for scenes (there is no file picker in the HUD).
     ClipLoad,
     ClipSave,
+    /// Write the selected entity's mesh to `assets/entities/<id>.json`.
+    /// Exports the file, not the document, and never over an existing one.
+    MeshSave,
     /// Undo / redo the last document change (Fase 6: blocking for refining
     /// keyframes by hand).
     Undo,
@@ -2861,8 +2864,8 @@ pub fn build_editor_hud(
                     [0.98, 0.86, 0.42, 1.0],
                 );
                 // Fila 1: clips (import/export) y salida. Fila 2: escena.
-                // Fila 3: historial (también en Ctrl+Z / Ctrl+Shift+Z).
-                let file_actions: [(&str, EditorAction); 10] = [
+                // Fila 3: malla e historial (también en Ctrl+Z / Ctrl+Shift+Z).
+                let file_actions: [(&str, EditorAction); 11] = [
                     ("IMPORTAR", EditorAction::ClipLoad),
                     ("EXPORTAR", EditorAction::ClipSave),
                     ("VOLVER", EditorAction::Back),
@@ -2871,6 +2874,7 @@ pub fn build_editor_hud(
                     ("BORRAR", EditorAction::Delete),
                     ("GUARDAR", EditorAction::Save),
                     ("CARGAR", EditorAction::Load),
+                    ("MALLA", EditorAction::MeshSave),
                     ("DESHACER", EditorAction::Undo),
                     ("REHACER", EditorAction::Redo),
                 ];
@@ -2878,6 +2882,9 @@ pub fn build_editor_hud(
                     let bg = match *act {
                         EditorAction::Back => [0.30, 0.16, 0.18, 0.95],
                         EditorAction::Save | EditorAction::ClipSave => [0.16, 0.34, 0.24, 0.95],
+                        // Exportar la malla es lo mismo que exportar el clip:
+                        // un fichero nuevo en disco, verde de "escribe".
+                        EditorAction::MeshSave => [0.16, 0.34, 0.24, 0.95],
                         EditorAction::ClipLoad => [0.24, 0.22, 0.36, 0.95],
                         EditorAction::Undo => [0.30, 0.26, 0.14, 0.95],
                         EditorAction::Redo => [0.26, 0.20, 0.30, 0.95],
@@ -4059,11 +4066,12 @@ mod tests {
         }"#;
         let clip = crate::editor_clip::EditorClip::from_json(clip_json, None).expect("clip");
 
-        // ARCHIVO: las 6 acciones de escena + import/export de clip.
+        // ARCHIVO: las 6 acciones de escena + import/export de clip + malla.
         let file = build(Some(EditorPanel::Archivo), None);
         for act in [
             EditorAction::ClipLoad,
             EditorAction::ClipSave,
+            EditorAction::MeshSave,
             EditorAction::Add,
             EditorAction::Save,
             EditorAction::Load,

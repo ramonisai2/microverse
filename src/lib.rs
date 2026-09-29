@@ -651,6 +651,7 @@ impl EditorState {
             // Escriben a disco, no al documento en memoria.
             | Save
             | ClipSave
+            | MeshSave
             // `Back` es una transición de pantalla: `apply_hud_action` la
             // intercepta antes de llegar aquí, así que no toca el documento.
             | Back => HistoryEffect::None,
@@ -985,6 +986,31 @@ impl EditorState {
                         self.status = format!("clip exportado {}", path.display());
                         self.clip_saved_to = Some(path);
                     }
+                    Err(e) => self.status = format!("error: {e}"),
+                }
+                return;
+            }
+            EditorAction::MeshSave => {
+                let Some(e) = self.selected_entity() else {
+                    self.status = "no hay entidad seleccionada".into();
+                    return;
+                };
+                // La misma malla que dibuja `preview`: la del estado activo, o
+                // la de la entidad si el estado no trae la suya.
+                let state = e.clamp_state(self.state_sel);
+                let Some(model) = crate::entity_model::preview_model(e.effective_model(state))
+                else {
+                    self.status = "no se encuentra la malla de la entidad".into();
+                    return;
+                };
+                // `label()` es nombre, o kind si no hay nombre: justo el campo
+                // que existe para identificar la entidad. El id del modelo de
+                // origen no vale —`picodemadera` y `special1_sword` son los dos
+                // "object"— y un índice se mueve al borrar.
+                let id = e.label().to_string();
+                let dir = std::path::Path::new("assets/entities");
+                match crate::entity_model::write_flat(model, &id, dir) {
+                    Ok(path) => self.status = format!("malla exportada {}", path.display()),
                     Err(e) => self.status = format!("error: {e}"),
                 }
                 return;
@@ -4201,12 +4227,16 @@ mod hitch_tests {
     ///    la historia (`Push` o `Reset`). Esta es la que caza un olvido.
     #[test]
     fn editor_history_policy_matches_every_action() {
-        // Única acción que no puede ejercitarse aquí: `Load` necesita una escena
-        // en disco y el repo no tiene ninguna en `saves/editor/`. Con escenas
-        // cargadas sí cambia el documento (y por tanto está en `Reset`).
-        let needs_saved_scene = [EditorAction::Load];
+        // Acciones que aquí no se pueden ejercitar, y por qué:
+        //  - `Load` necesita una escena en disco y el repo no tiene ninguna en
+        //    `saves/editor/`. Con escenas cargadas sí cambia el documento (y por
+        //    tanto está en `Reset`).
+        //  - `MeshSave` escribiría de verdad: la entidad que crea `Add` trae
+        //    `model: "hero"`, así que el test dejaría una copia del héroe dentro
+        //    de `assets/entities/`. Abajo se asserta su política aparte.
+        let needs_disk = [EditorAction::Load, EditorAction::MeshSave];
         for action in all_editor_actions() {
-            if needs_saved_scene.contains(&action) {
+            if needs_disk.contains(&action) {
                 continue;
             }
             let mut ed = ready_editor();
@@ -4255,6 +4285,13 @@ mod hitch_tests {
                 );
             }
         }
+        // Lo saltado no se queda sin cubrir: exportar la malla escribe un
+        // fichero, no toca el documento — igual que `Save` y `ClipSave`.
+        assert_eq!(
+            EditorState::history_effect(EditorAction::MeshSave),
+            HistoryEffect::None,
+            "exportar la malla no es un cambio del documento"
+        );
     }
 
     /// Guarda de compilación: este `match` no tiene `_`, así que **añadir una
@@ -4308,6 +4345,7 @@ mod hitch_tests {
             | EditorAction::StateDel
             | EditorAction::ClipLoad
             | EditorAction::ClipSave
+            | EditorAction::MeshSave
             | EditorAction::Undo
             | EditorAction::Redo
             | EditorAction::KeyframeSel(_)
@@ -4318,7 +4356,7 @@ mod hitch_tests {
             | EditorAction::JointPrev
             | EditorAction::JointNext
             | EditorAction::EditEntity
-            | EditorAction::EditJoint => 56,
+            | EditorAction::EditJoint => 57,
         }
     }
 
@@ -4371,6 +4409,7 @@ mod hitch_tests {
             StateDel,
             ClipLoad,
             ClipSave,
+            MeshSave,
             Undo,
             Redo,
             KeyframeSel(0),

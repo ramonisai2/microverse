@@ -5,7 +5,7 @@ use indexmap::IndexMap;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 pub const PALETTE_LEN: usize = 40;
@@ -207,6 +207,57 @@ impl EntityModel {
             return Self::from_parts_file(parts_file);
         }
         None
+    }
+
+    /// The flat file this model is, rebuilt: the inverse of [`Self::from_file`].
+    /// Backs the editor's mesh export.
+    ///
+    /// The two fields the format has no default for are measured off the cells,
+    /// because the model never kept them. `foot_y` is the lowest occupied row —
+    /// the same fallback `from_parts_file` uses, and what `for_each_face` stands
+    /// the mesh on. `grid` is the cell AABB, at least 1 per axis: `from_file`
+    /// never reads it, so a wrong value cannot corrupt a re-read, but a *missing*
+    /// one is a hard deserialization error, and a box that describes nothing is
+    /// worse than no box at all.
+    ///
+    /// `cells` is an `FxHashMap`, so the voxels are written in sorted key order:
+    /// the same model must always produce the same bytes, or an export diff is
+    /// noise.
+    pub fn to_file(&self, id: &str) -> EntityFile {
+        let mut min = (i32::MAX, i32::MAX, i32::MAX);
+        let mut max = (i32::MIN, i32::MIN, i32::MIN);
+        let mut keys: Vec<&(i32, i32, i32)> = self.cells.keys().collect();
+        keys.sort_unstable();
+        let mut voxels = Vec::with_capacity(keys.len());
+        for k in keys {
+            min = (min.0.min(k.0), min.1.min(k.1), min.2.min(k.2));
+            max = (max.0.max(k.0), max.1.max(k.1), max.2.max(k.2));
+            voxels.push(EntityVoxel {
+                x: k.0,
+                y: k.1,
+                z: k.2,
+                c: self.cells[k],
+            });
+        }
+        let (grid, foot_y) = if voxels.is_empty() {
+            (EntityGrid { x: 1, y: 1, z: 1 }, self.foot_y)
+        } else {
+            (
+                EntityGrid {
+                    x: (max.0 - min.0 + 1).max(1),
+                    y: (max.1 - min.1 + 1).max(1),
+                    z: (max.2 - min.2 + 1).max(1),
+                },
+                min.1,
+            )
+        };
+        EntityFile {
+            id: id.to_string(),
+            grid,
+            foot_y,
+            palette: self.palette_name.clone(),
+            voxels,
+        }
     }
 
     fn from_parts_file(file: EntityFileParts) -> Option<Self> {
@@ -584,6 +635,37 @@ fn load_entity_from_disk(rel: &str) -> Option<EntityModel> {
     None
 }
 
+/// Write `model` out as a new flat `<id>.json` in `dir`.
+///
+/// The writer twin of [`load_entity_from_disk`], and shaped like
+/// [`crate::editor_clip::EditorClip::save_to`]: `dir` is a parameter so a test
+/// can aim it somewhere harmless, and the editor passes `assets/entities/` — the
+/// first candidate `preview_model` tries for a bare name, so a mesh just
+/// exported is findable by the same lookup that found the original.
+///
+/// Two refusals, both deliberate. An existing path is never overwritten: this
+/// creates new meshes, and silently replacing a hand-made one is the one
+/// mistake the editor cannot undo. An empty model is never written either — a
+/// flat file with no voxels does not come back (`from_json_str` needs a
+/// non-empty `voxels`), so writing it would leave a file the game ignores.
+pub fn write_flat(model: &EntityModel, id: &str, dir: &Path) -> Result<PathBuf, String> {
+    if id.is_empty() {
+        return Err("la malla no tiene nombre".into());
+    }
+    if model.cells.is_empty() {
+        return Err("la malla no tiene voxels".into());
+    }
+    let path = dir.join(format!("{}.json", crate::editor::safe_name(id)));
+    if path.exists() {
+        return Err(format!("{} ya existe", path.display()));
+    }
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let text = serde_json::to_string_pretty(&model.to_file(id))
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path)
+}
+
 fn preview_cache() -> &'static Mutex<HashMap<String, &'static EntityModel>> {
     static CACHE: OnceLock<Mutex<HashMap<String, &'static EntityModel>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -939,6 +1021,92 @@ mod tests {
                 "eje {i}: esperadas 1 bloque, medido {e} (min {min:?}, max {max:?})"
             );
         }
+    }
+
+    /// Exportar y releer: el fichero que escribe el editor tiene que volver a
+    /// entrar por el cargador del juego, celda por celda, y seguir dibujando.
+    /// Dos celdas sueltas (no pegadas) para que el recuento de caras sea el de
+    /// dos cajas, no el de una más la cara tapada.
+    #[test]
+    fn write_flat_exports_a_file_the_game_reads_back_and_draws() {
+        // Insertadas fuera de orden a propósito: `cells` es un hash, y el
+        // export tiene que salir siempre con los mismos bytes.
+        let m = EntityModel::from_file(EntityFile {
+            id: "origen".into(),
+            grid: EntityGrid { x: 4, y: 4, z: 4 },
+            foot_y: 0,
+            palette: "candy".into(),
+            voxels: vec![
+                EntityVoxel {
+                    x: 1,
+                    y: 2,
+                    z: 0,
+                    c: 7,
+                },
+                EntityVoxel { x: 0, y: 0, z: 0, c: 3 },
+            ],
+        });
+        let dir = std::env::temp_dir().join("microvoxel_mesh_export_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        // El id va con acento y espacio: el fichero sale saneado, el campo `id`
+        // del JSON lo lleva tal cual.
+        let path = write_flat(&m, "pared nueva", &dir).expect("exporta");
+        assert_eq!(path, dir.join("pared_nueva.json"));
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let back = EntityModel::from_json_str(&text).expect("el juego debe releerlo");
+        assert_eq!(back.cells, m.cells, "mismas celdas con sus colores");
+        assert_eq!(back.foot_y, 0, "el suelo es la fila ocupada más baja");
+        assert_eq!(back.palette_name, "candy");
+        assert_eq!(back.id, "pared nueva");
+
+        // `from_file` no lee `grid`, pero es obligatorio al deserializar y tiene
+        // que describir lo que hay: x 0..1, y 0..2, solo z 0.
+        let file: EntityFile = serde_json::from_str(&text).unwrap();
+        assert_eq!((file.grid.x, file.grid.y, file.grid.z), (2, 3, 1));
+        assert_eq!(
+            (file.voxels[0].x, file.voxels[1].x),
+            (0, 1),
+            "ordenadas, no en el orden del hash: {:?}",
+            file.voxels
+        );
+
+        let mut faces = 0;
+        back.for_each_face(&back.palette, Vec3::ZERO, 0.0, 1.0, |_, _, _| faces += 1);
+        assert_eq!(faces, 12 * 4, "dos celdas sueltas = 12 caras");
+
+        // No pisa un fichero anterior. La segunda llamada lleva OTRA malla a
+        // propósito: si escribiera, los bytes cambiarían y el assert lo vería.
+        // Con la misma malla el test pasaría igual, porque el contenido sería
+        // idéntico y no probaría nada.
+        let antes = std::fs::read_to_string(&path).unwrap();
+        let otra = EntityModel::from_file(EntityFile {
+            id: "otra".into(),
+            grid: EntityGrid { x: 4, y: 4, z: 4 },
+            foot_y: 0,
+            palette: "classic".into(),
+            voxels: vec![EntityVoxel { x: 9, y: 9, z: 9, c: 1 }],
+        });
+        let err = write_flat(&otra, "pared nueva", &dir).unwrap_err();
+        assert!(err.contains("pared_nueva.json"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            antes,
+            "el fichero existente no puede cambiar"
+        );
+        // Malla vacía: se niega en vez de escribir algo que no se relee.
+        let empty = EntityModel::from_file(EntityFile {
+            id: "vacia".into(),
+            grid: EntityGrid { x: 1, y: 1, z: 1 },
+            foot_y: 6,
+            palette: "classic".into(),
+            voxels: vec![],
+        });
+        assert!(write_flat(&empty, "vacia", &dir).is_err());
+        assert!(!dir.join("vacia.json").exists());
+        assert!(write_flat(&m, "", &dir).is_err(), "un id vacío no es un nombre");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Una celda pegada a otra oculta la cara compartida: es el mismo culling
