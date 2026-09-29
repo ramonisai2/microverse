@@ -1,5 +1,5 @@
 //! On-screen stair / tunnel controls (mouse hits UI, not the world).
-use crate::editor::TransformField;
+use crate::editor::{EditorEntity, TransformField};
 use crate::stair_dig::{
     facing_screen_angle, PadDir, StairPhase, StairTool, TunnelFacing, TunnelIncline,
     STAIR_WIDTH_MAX,
@@ -2452,6 +2452,31 @@ pub struct EditorView {
     pub panel: Option<EditorPanel>,
 }
 
+/// The four transform lines of the right-hand readout (`pos`, `rot`, `esc`,
+/// `zes`), as they get printed.
+///
+/// Split out of [`build_editor_hud`] so the rule can be pinned: `HudMesh`
+/// rasterises the glyphs on the spot and keeps no strings, so nothing else
+/// can tell afterwards what the readout said.
+///
+/// All four channels come from `driven_transform`, the same object the step
+/// buttons drive — the active state when the entity has states, the entity
+/// itself otherwise. Reading them off `entity` outright made the readout and
+/// the bars disagree as soon as an entity had states: the bars edit the state
+/// and the readout printed the entity.
+///
+/// `caja` stays on the entity on purpose: it is the marker's box, not part of
+/// the mesh, and the bars have no equivalent for it.
+fn transform_readout(entity: &EditorEntity, state_idx: usize) -> [String; 4] {
+    let t = entity.driven_transform(state_idx);
+    [
+        format!("pos {:.1} {:.1} {:.1}", t.position[0], t.position[1], t.position[2]),
+        format!("rot {:.0} {:.0} {:.0}", t.rotation[0], t.rotation[1], t.rotation[2]),
+        format!("esc {:.2} {:.2} {:.2}", t.scale[0], t.scale[1], t.scale[2]),
+        format!("zes {:.2} · caja {:.1}", t.skew[2], entity.size[0]),
+    ]
+}
+
 /// Native editor panel: entity list (left), selection readout (right) and the
 /// menu button (bottom-left). Everything else lives inside a collapsible
 /// category panel, drawn only when `view.panel` is `Some` — with `None` the
@@ -2706,38 +2731,9 @@ pub fn build_editor_hud(
             format!("model {}", entity.effective_model(state_idx)),
             &mut iy,
         );
-        line(
-            &mut mesh,
-            format!(
-                "pos {:.1} {:.1} {:.1}",
-                entity.position[0], entity.position[1], entity.position[2]
-            ),
-            &mut iy,
-        );
-        line(
-            &mut mesh,
-            format!(
-                "rot {:.0} {:.0} {:.0}",
-                entity.rotation[0], entity.rotation[1], entity.rotation[2]
-            ),
-            &mut iy,
-        );
-        line(
-            &mut mesh,
-            format!(
-                "esc {:.2} {:.2} {:.2}",
-                entity.scale[0], entity.scale[1], entity.scale[2]
-            ),
-            &mut iy,
-        );
-        line(
-            &mut mesh,
-            format!(
-                "zes {:.2} · caja {:.1}",
-                entity.skew[2], entity.size[0]
-            ),
-            &mut iy,
-        );
+        for text in transform_readout(entity, state_idx) {
+            line(&mut mesh, text, &mut iy);
+        }
         // Which object the step buttons drive right now: the active state when
         // the entity owns states, the entity itself otherwise.
         line(
@@ -3479,6 +3475,100 @@ pub fn build_inventory_hud(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// El readout de la derecha tiene que imprimir el mismo transform que
+    /// mueven los pasos: el del estado activo si la entidad tiene estados, el
+    /// de la entidad si no. Antes lo leía de `entity` a secas, así que en
+    /// cuanto una entidad tenía estados el readout y las barras marcaban
+    /// distinto, y solo se notaba con estados — sin ellos las dos fuentes son
+    /// el mismo array y el fallo es invisible.
+    ///
+    /// Se fija sobre el texto porque es lo que se ve. La entidad tiene los
+    /// cuatro canales muy distintos de los de sus estados, para que un lector
+    /// que vuelva a la entidad falle en los cuatro a la vez y no solo en el eje
+    /// que el autor movió por casualidad.
+    #[test]
+    fn transform_readout_prints_the_active_state_not_the_entity() {
+        use crate::editor::{EditorEntity, EditorEntityState};
+
+        let mut e = EditorEntity::new("prop", [8.0, 30.0, 24.0]);
+        e.rotation = [0.0, 90.0, 0.0];
+        e.scale = [1.0, 1.0, 1.0];
+        e.skew = [0.0, 0.0, 0.0];
+        e.size = [1.5, 2.0, 1.0];
+
+        // Sin estados: los cuatro canales salen de la entidad.
+        let plain = transform_readout(&e, 0);
+        assert!(plain[0].contains("8.0 30.0 24.0"), "pos: {}", plain[0]);
+        assert!(plain[1].contains("0 90 0"), "rot: {}", plain[1]);
+        assert!(plain[2].contains("1.00 1.00 1.00"), "esc: {}", plain[2]);
+        assert!(plain[3].contains("zes 0.00"), "zes: {}", plain[3]);
+        // `caja` viene de la entidad y no del estado, y aquí coinciden.
+        assert!(plain[3].contains("caja 1.5"), "caja: {}", plain[3]);
+
+        // Con estados: el readout sigue al activo, no al 0 ni a la entidad.
+        e.states.push(EditorEntityState {
+            name: "a".into(),
+            position: [1.0, 2.0, 3.0],
+            rotation: [10.0, 20.0, 30.0],
+            scale: [0.5, 0.5, 0.5],
+            skew: [0.0, 0.0, 0.25],
+            ..Default::default()
+        });
+        e.states.push(EditorEntityState {
+            name: "b".into(),
+            position: [-4.0, 50.0, 6.0],
+            rotation: [40.0, 50.0, 60.0],
+            scale: [2.0, 2.0, 2.0],
+            skew: [0.0, 0.0, -1.5],
+            ..Default::default()
+        });
+
+        let first = transform_readout(&e, 0);
+        assert!(first[0].contains("1.0 2.0 3.0"), "pos estado 0: {}", first[0]);
+        assert!(first[1].contains("10 20 30"), "rot estado 0: {}", first[1]);
+        assert!(first[2].contains("0.50 0.50 0.50"), "esc: {}", first[2]);
+        assert!(first[3].contains("zes 0.25"), "zes: {}", first[3]);
+
+        let second = transform_readout(&e, 1);
+        assert!(second[0].contains("-4.0 50.0 6.0"), "pos estado 1: {}", second[0]);
+        assert!(second[1].contains("40 50 60"), "rot estado 1: {}", second[1]);
+        assert!(second[2].contains("2.00 2.00 2.00"), "esc: {}", second[2]);
+        assert!(second[3].contains("zes -1.50"), "zes: {}", second[3]);
+
+        // Ninguna de las dos líneas puede seguir leyendo la entidad: sus
+        // valores son los de arriba, y los de la entidad son otros muy distintos.
+        for (i, line) in [first[0].clone(), second[0].clone()].into_iter().enumerate() {
+            assert!(
+                !line.contains("8.0 30.0 24.0"),
+                "la línea {i} volvió a la entidad: {line}"
+            );
+        }
+        // `caja` sí se queda en la entidad, en las dos lecturas.
+        assert!(first[3].contains("caja 1.5") && second[3].contains("caja 1.5"));
+    }
+
+    /// El caso anterior se ve igual si el readout leyera de la entidad,
+    /// siempre que la entidad no tenga estados. Este lo dice al revés: con
+    /// estados, la entidad y el readout tienen que diferir. Si `transform_readout`
+    /// volviera a la entidad, las dos cadenas comparadas aquí serían iguales.
+    #[test]
+    fn transform_readout_diverges_from_the_entity_once_states_exist() {
+        use crate::editor::{EditorEntity, EditorEntityState};
+
+        let mut e = EditorEntity::new("prop", [8.0, 30.0, 24.0]);
+        let before = transform_readout(&e, 0);
+        e.states.push(EditorEntityState {
+            name: "a".into(),
+            position: [1.0, 2.0, 3.0],
+            ..Default::default()
+        });
+        let after = transform_readout(&e, 0);
+        assert_ne!(
+            before[0], after[0],
+            "el readout no cambió al añadir un estado: {before:?} vs {after:?}"
+        );
+    }
 
     #[test]
     fn atlas_nonempty() {
