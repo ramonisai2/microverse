@@ -1,6 +1,7 @@
 //! Shared voxel entity models (editor JSON → in-game mesh).
 use crate::hero_pose::{body_part_from_name, BodyPart, HeroPivots, ELBOW_SPLIT_Y, KNEE_SPLIT_Y};
 use glam::Vec3;
+use indexmap::IndexMap;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -106,7 +107,9 @@ struct EntityFileParts {
     palette: String,
     #[serde(default)]
     foot_y: Option<i32>,
-    parts: FxHashMap<String, PartSerde>,
+    /// File-ordered on purpose: the bake walks parts in this order, so the
+    /// last part in the file wins any cell or pivot two parts contend for.
+    parts: IndexMap<String, PartSerde>,
 }
 
 fn default_hero_id() -> String {
@@ -315,8 +318,12 @@ impl EntityModel {
 
 /// Bake editor part-local voxels into design-space cells (rest pose).
 /// Also returns per-cell limb tags and world-space joint pivots (group origins).
+///
+/// `parts` keeps file order (`IndexMap`) and both tie-breaks below walk it, so
+/// one rule covers cells and pivots: when two parts contend, the LAST part in
+/// the file wins, silently. Overlap never errors and never panics.
 fn bake_parts_to_design(
-    parts: &FxHashMap<String, PartSerde>,
+    parts: &IndexMap<String, PartSerde>,
 ) -> (
     Vec<EntityVoxel>,
     FxHashMap<(i32, i32, i32), BodyPart>,
@@ -363,8 +370,14 @@ fn bake_parts_to_design(
     }
 
     let mut pivots = HeroPivots::default_biped();
-    for (name, &o) in &origin {
-        if let Some(part) = body_part_from_name(name) {
+    // Walk `parts` (file order), not `origin`: `origin` is filled parent-first
+    // by the resolve loop above, so its order is resolution order, not file
+    // order. Iterating it would resolve pivot ties on a different rule than
+    // the cell bake below. Two names can map to the same `BodyPart` through
+    // the aliases in `body_part_from_name` (`lArm` / `l_arm` / `leftArm`), and
+    // the last one in the file wins, same as a cell.
+    for name in parts.keys() {
+        if let (Some(part), Some(&o)) = (body_part_from_name(name), origin.get(name)) {
             pivots.set(part, o);
         }
     }
@@ -457,6 +470,9 @@ fn bake_parts_to_design(
                 }
                 other => other,
             };
+            // `parts` is an `IndexMap`, so this loop walks the file's own part
+            // order. Overlap resolves by paint order: the LAST part in the file
+            // wins the cell, for colour and limb tag alike. It never errors.
             seen.insert((wx, wy, wz), c);
             part_of.insert((wx, wy, wz), body);
         }
@@ -772,6 +788,73 @@ mod tests {
         assert!((m.pivots.torso.y - 16.0).abs() < 0.01);
         assert!((m.pivots.l_arm.x + 6.5).abs() < 0.01);
         assert!((m.pivots.l_arm.y - 18.0).abs() < 0.01);
+    }
+
+    /// Overlap rule: the LAST part in the file wins the cell, for colour and
+    /// limb tag alike, and never errors. Both `torso` and `lArm` place a voxel
+    /// on design cell (0, 20, 0); `lArm` is written last, so it must win both.
+    #[test]
+    fn overlapping_parts_resolve_to_the_last_part_in_the_file() {
+        let json = r#"{
+            "id": "hero",
+            "palette": "classic",
+            "parts": {
+                "torso": {
+                    "parent": null,
+                    "offset": { "x": 0, "y": 20, "z": 0 },
+                    "transform": { "pos": { "x": 0, "y": 0, "z": 0 }, "scale": { "x": 1, "y": 1, "z": 1 } },
+                    "voxels": [ { "x": 0, "y": 0, "z": 0, "c": 3 } ]
+                },
+                "lArm": {
+                    "parent": "torso",
+                    "offset": { "x": -6, "y": 3, "z": 0 },
+                    "transform": { "pos": { "x": 0, "y": -3, "z": 0 }, "scale": { "x": 1, "y": 1, "z": 1 } },
+                    "voxels": [ { "x": 6, "y": 0, "z": 0, "c": 0 } ]
+                }
+            }
+        }"#;
+        let m = EntityModel::from_json_str(json).expect("parts");
+        // One cell, not two: the loser is dropped, not merged.
+        assert_eq!(m.cells.len(), 1);
+        assert_eq!(m.part_at(0, 20, 0), BodyPart::LArm, "la última parte gana");
+        assert_eq!(*m.cells.get(&(0, 20, 0)).unwrap(), 0, "gana su color");
+    }
+
+    /// Same rule for pivots, not just cells. `leftArm` is an alias of `lArm`
+    /// (`body_part_from_name`), so both name `LArm` and contend for one pivot.
+    /// Whichever key comes last in the file owns it, so swapping the two keys
+    /// swaps the pivot — that is what makes this a file-order rule and not a
+    /// hash accident.
+    #[test]
+    fn aliased_part_names_resolve_the_pivot_by_file_order() {
+        let bake = |parts: &str| {
+            let json = format!(
+                r#"{{
+                    "id": "hero",
+                    "palette": "classic",
+                    "parts": {parts}
+                }}"#
+            );
+            EntityModel::from_json_str(&json).expect("parts").pivots.l_arm
+        };
+        let arm = r#""lArm": {
+            "parent": null,
+            "offset": { "x": -6, "y": 23, "z": 0 },
+            "transform": { "pos": { "x": 0, "y": 0, "z": 0 }, "scale": { "x": 1, "y": 1, "z": 1 } },
+            "voxels": [ { "x": 0, "y": 0, "z": 0, "c": 3 } ] }"#;
+        let alias = r#""leftArm": {
+            "parent": null,
+            "offset": { "x": -9, "y": 11, "z": 0 },
+            "transform": { "pos": { "x": 0, "y": 0, "z": 0 }, "scale": { "x": 1, "y": 1, "z": 1 } },
+            "voxels": [ { "x": 0, "y": 0, "z": 5, "c": 0 } ] }"#;
+        let arm_at = Vec3::new(-6.0, 23.0, 0.0);
+        let alias_at = Vec3::new(-9.0, 11.0, 0.0);
+        // Each part alone owns the pivot, so neither origin is a fallback.
+        assert_eq!(bake(&format!("{{ {arm} }}")), arm_at);
+        assert_eq!(bake(&format!("{{ {alias} }}")), alias_at);
+        // Together they contend, and the file decides: last key wins.
+        assert_eq!(bake(&format!("{{ {arm}, {alias} }}")), alias_at);
+        assert_eq!(bake(&format!("{{ {alias}, {arm} }}")), arm_at);
     }
 
     /// El cargador genérico del editor: ruta completa, nombre corto (que es lo
